@@ -1,0 +1,28 @@
+# Build directories
+build/
+out/
+bin/
+
+# Visual Studio / IDE
+.vs/
+.vscode/
+*.user
+*.suo
+
+# Compiled objects & libraries
+*.obj
+*.lib
+*.pdb
+*.dll
+*.exe
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+Makefile
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+
+# Test databases
+test_l3kvg_bench_db_*
