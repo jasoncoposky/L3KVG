@@ -11,6 +11,7 @@ add_library(l3kvg_engine STATIC
     src/Engine.cpp
     src/Node.cpp
     src/Query.cpp
+    src/Cypher.cpp
 )
 
 target_include_directories(l3kvg_engine PUBLIC
@@ -35,6 +36,13 @@ target_link_libraries(test_l3kvg PRIVATE l3kvg_engine gtest_main Threads::Thread
 
 add_executable(test_fluent_api tests/test_fluent_api.cpp)
 target_link_libraries(test_fluent_api PRIVATE l3kvg_engine gtest_main Threads::Threads)
+
+add_executable(test_cypher tests/test_cypher.cpp)
+target_link_libraries(test_cypher PRIVATE l3kvg_engine gtest_main Threads::Threads)
+
+add_test(NAME test_engine COMMAND test_l3kvg)
+add_test(NAME test_fluent COMMAND test_fluent_api)
+add_test(NAME test_cypher_ast COMMAND test_cypher)
 
 add_executable(bench_l3kvg tests/bench_l3kvg.cpp)
 target_link_libraries(bench_l3kvg PRIVATE l3kvg_engine Threads::Threads)

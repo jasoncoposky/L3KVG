@@ -26,9 +26,31 @@ std::shared_ptr<Node> Engine::get_node(std::string_view uuid) {
   auto node = std::make_shared<Node>(this, suuid);
   {
     std::lock_guard<std::mutex> lock(cache_mutex_);
+    if (node_cache_.size() > 10000) {
+      node_cache_.clear(); // Hard eviction bound
+    }
     node_cache_[suuid] = node;
   }
+  metrics_.cache_misses.fetch_add(1, std::memory_order_relaxed);
   return node;
+}
+
+void Engine::swizzle_node(std::string_view uuid, std::shared_ptr<Node> ptr) {
+  std::string suuid(uuid);
+  std::lock_guard<std::mutex> lock(cache_mutex_);
+  node_cache_[suuid] = ptr;
+  metrics_.cache_hits.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::shared_ptr<Node> Engine::get_swizzled(std::string_view uuid) {
+  std::string suuid(uuid);
+  std::lock_guard<std::mutex> lock(cache_mutex_);
+  if (auto it = node_cache_.find(suuid); it != node_cache_.end()) {
+    metrics_.cache_hits.fetch_add(1, std::memory_order_relaxed);
+    return it->second;
+  }
+  metrics_.cache_misses.fetch_add(1, std::memory_order_relaxed);
+  return nullptr;
 }
 
 void Engine::put_node(std::string_view uuid, const std::string &json_payload) {

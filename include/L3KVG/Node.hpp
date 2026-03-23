@@ -17,10 +17,23 @@ public:
 
   void ensure_loaded();
 
+  bool has_attribute(const std::string &key);
+
+  // Zero-copy Raw Attribute Access
+  std::string_view get_raw_view(std::string_view key);
+
+  // Custom Edge Label Bloom Filter
+  bool might_have_edge(std::string_view label) const;
+  void register_edge_bloom(std::string_view label);
+
+  // Memory-Resident Pointer Swizzling (Returns instant pointer resolution)
+  std::vector<std::shared_ptr<Node>>
+  get_hot_neighbors(std::string_view label, double min_weight = -999999.0);
+
   template <typename T> T get_attribute(std::string_view key);
 
   std::vector<std::string> get_neighbors(std::string_view label,
-                                         double min_weight = 0.0);
+                                         double min_weight = -999999.0);
 
   const std::string &get_uuid() const { return uuid_; }
 
@@ -29,6 +42,7 @@ private:
   std::string uuid_;
   std::optional<lite3cpp::Buffer> payload_;
   bool loaded_{false};
+  uint64_t bloom_filter_{0};
 };
 
 template <typename T> T Node::get_attribute(std::string_view key) {
