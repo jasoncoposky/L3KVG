@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="l3kvg_logo.jpg" alt="L3KVG Logo" width="300" />
+</p>
+
 # L3KVG: High-Performance Embedded Graph Engine
 
 L3KVG is a C++20 embedded property graph engine built directly on top of the **L3KV** actor-model key-value store, leveraging **lite3-cpp** for zero-copy native BSON-like JSON document resolution over PMR (Polymorphic Memory Resources).
@@ -40,3 +44,22 @@ auto results = engine->query()
     .return_({"name"})
     .execute();
 ```
+
+## SRE Metrics Dashboard & Native Cypher Graph
+
+The L3KVG Engine includes an embedded C++ `httplib` server serving directly over internal memory spaces tracking engine cache retention algorithms and parsing Cypher AST topologies. 
+
+**Running the SRE Visualizer:**
+
+1. **Start the API Server:**
+   ```bash
+   cmake --build build --config Release --target l3kvg_server
+   ./build/Release/l3kvg_server.exe
+   ```
+2. **Start the React Visualizer:**
+   ```bash
+   cd dashboard
+   npm install
+   npm run dev
+   ```
+   Navigate to `http://localhost:5173`. The application leverages Google Material Design 3 UI and strict D3 mapping algorithms to plot Cypher queries (`/api/query`) visibly directly out of the L3KV Graph Engine embedded runtime.

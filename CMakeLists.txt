@@ -44,5 +44,11 @@ add_test(NAME test_engine COMMAND test_l3kvg)
 add_test(NAME test_fluent COMMAND test_fluent_api)
 add_test(NAME test_cypher_ast COMMAND test_cypher)
 
+add_executable(l3kvg_server src/server/main.cpp)
+target_link_libraries(l3kvg_server PRIVATE l3kvg_engine Threads::Threads)
+if(WIN32)
+    target_link_libraries(l3kvg_server PRIVATE ws2_32 wsock32 crypt32)
+endif()
+
 add_executable(bench_l3kvg tests/bench_l3kvg.cpp)
 target_link_libraries(bench_l3kvg PRIVATE l3kvg_engine Threads::Threads)
