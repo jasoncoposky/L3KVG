@@ -1,6 +1,8 @@
 #include "L3KVG/Node.hpp"
 #include "L3KVG/Engine.hpp"
+#include "L3KVG/RemoteL3KVClient.hpp"
 #include "engine/store.hpp"
+#include <iostream>
 
 namespace l3kvg {
 
@@ -11,18 +13,38 @@ void Node::ensure_loaded() {
   if (loaded_)
     return;
 
+  auto& resolver = engine_->get_resolver();
   std::string key = "n:{" + uuid_ + "}";
-  auto buf = engine_->get_store()->get(key);
 
-  if (buf.size() > 0) {
-    payload_ = std::move(buf);
-
-    if (payload_->get_type(0, "bloom") == lite3cpp::Type::Int64) {
-      bloom_filter_ = payload_->get_i64(0, "bloom");
-    } else {
-      bloom_filter_ =
-          0xFFFFFFFFFFFFFFFF; // Missing filter implies everything might exist
-    }
+  if (!resolver.is_local(uuid_)) {
+      lite3::NodeID owner = resolver.get_node_owner(uuid_);
+      auto& client = engine_->get_remote_client();
+      try {
+          std::string raw_data = client.get_node_payload_async(owner, uuid_).get();
+          if (!raw_data.empty()) {
+              std::cerr << "[Node::ensure_loaded] DEBUG: Remote data received for " << uuid_ << ": " << raw_data << "\n";
+              payload_ = lite3cpp::lite3_json::from_json_string(raw_data);
+              std::cerr << "[Node::ensure_loaded] DEBUG: Payload size after hydration: " << (payload_ ? payload_->size() : 0) << "\n";
+              
+              if (payload_->get_type(0, "bloom") == lite3cpp::Type::Int64) {
+                  bloom_filter_ = payload_->get_i64(0, "bloom");
+              } else {
+                  bloom_filter_ = 0xFFFFFFFFFFFFFFFF;
+              }
+          }
+      } catch (const std::exception& e) {
+          std::cerr << "[Node::ensure_loaded] Remote Fetch Failed: " << e.what() << "\n";
+      }
+  } else {
+      auto buf = engine_->get_store()->get(key);
+      if (buf.size() > 0) {
+          payload_ = std::move(buf);
+          if (payload_->get_type(0, "bloom") == lite3cpp::Type::Int64) {
+              bloom_filter_ = payload_->get_i64(0, "bloom");
+          } else {
+              bloom_filter_ = 0xFFFFFFFFFFFFFFFF;
+          }
+      }
   }
   loaded_ = true;
 }
@@ -56,6 +78,18 @@ std::vector<std::string> Node::get_neighbors(std::string_view label,
                                              double min_weight) {
   if (!might_have_edge(label)) {
     return {};
+  }
+
+  auto& resolver = engine_->get_resolver();
+  if (!resolver.is_local(uuid_)) {
+    lite3::NodeID owner = resolver.get_node_owner(uuid_);
+    auto& client = engine_->get_remote_client();
+    try {
+      return client.get_neighbors_async(owner, uuid_, std::string(label), min_weight).get();
+    } catch (const std::exception& e) {
+      std::cerr << "[Node::get_neighbors] Remote RPC Failed: " << e.what() << "\n";
+      return {};
+    }
   }
 
   std::vector<std::string> neighbors;

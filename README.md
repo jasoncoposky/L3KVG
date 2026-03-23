@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="l3kvg_logo.jpg" alt="L3KVG Logo" width="300" />
+  <img src="l3kvg_logo.jpg" alt="L3KVG Logo" width="100%" />
 </p>
 
 # L3KVG: High-Performance Embedded Graph Engine
@@ -12,12 +12,22 @@ L3KVG is a C++20 embedded property graph engine built directly on top of the **L
 - **Fluent C++ API:** A Cypher-inspired fluent builder API natively available directly in C++.
 - **Zero-Copy Attributes:** Node and Edge properties are represented as `lite3::Buffer` views, enforcing lazy evaluation. Attributes are only dynamically allocated and resolved exactly when projected.
 - **Lock-Free Concurrency:** Fully concurrent multi-threaded architecture leveraging L3KV's internal 64-way sharded actor-model message queues, bypassing global serialization locks.
+- **Horizontal Scaling**: Native support for sharded graph distribution across a cluster using consistent hashing and HLC-synchronized distributed writes.
+
+## Horizontal Scaling & Distribution
+
+L3KVG Evolution 2 transitions the engine from local-only to a distributed graph fabric:
+
+- **Cluster Mapping**: Utilizes `ConsistentHash` to deterministically shard nodes across physical peers.
+- **Transparent RPC**: `RemoteL3KVClient` automatically forwards property lookups and neighbor traversals to the owner node via high-performance HTTP/1.1.
+- **Atomic Edge Coordination**: The `EdgeCoordinator` implements a dual-shard write protocol with Hybrid Logical Clocks (HLC), ensuring causal consistency for edges spanning multiple physical nodes.
+- **Auto-Routing**: `Engine::put_node` automatically routes write operations to the correct shard owner in the cluster.
 
 ## Architecture & Performance
 
 To meet strict SRE guidelines (sub-500µs single hop traversal, >10,000 ops/sec writing), L3KVG implements the following foundational patterns:
 
-- **Redis-style Hash Tagging (`{id}`)**: By embedding routing tags directly in edge keys (e.g. `e:out:{uuid}:label:weight:dst`), all outbound and inbound edges form contiguous edge blocks residing strictly on the **same hardware thread/shard** as their parent graph node. 
+- **Redis-style Hash Tagging (`{id}`)**: By embedding routing tags directly in edge keys (e.g. `e:out:{uuid}:label:weight:dst`), all outbound and inbound edges form contiguous edge blocks residing strictly on the **same hardware thread/shard** as their parent graph node.
 - **Actor-Model Routines**: `add_edge` and adjacency traversals encapsulate execution closures and pass them to bounded underlying core routines. This removes the necessity of thread-unsafe maps, achieving safe parallel traversal isolation.
 - **Spin-Lock De-jitter**: By inserting spin-cycles preceding task yielding upon empty queues, L3KVG bypasses OS-level thread rescheduling penalties (~1-15ms Windows Jitter), accelerating node-expansion 50-edge fan-outs down to **~140µs**.
 

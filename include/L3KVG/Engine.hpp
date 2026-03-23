@@ -7,6 +7,10 @@
 #include <string_view>
 #include <unordered_map>
 
+#include "L3KVG/ClusterResolver.hpp"
+#include "L3KVG/RemoteL3KVClient.hpp"
+#include "L3KVG/EdgeCoordinator.hpp"
+
 namespace l3kv {
 class Engine;
 }
@@ -31,7 +35,7 @@ struct SREMetrics {
 
 class Engine {
 public:
-  Engine(const std::string &db_path, uint32_t node_id = 1);
+  Engine(const std::string &db_path, uint32_t node_id = 1, std::shared_ptr<lite3::ConsistentHash> ring = nullptr);
   ~Engine();
 
   Engine(const Engine &) = delete;
@@ -55,9 +59,16 @@ public:
   std::shared_ptr<Node> get_swizzled(std::string_view uuid);
 
   l3kv::Engine *get_store() const { return store_.get(); }
+  
+  ClusterResolver& get_resolver() { return resolver_; }
+  RemoteL3KVClient& get_remote_client() { return remote_client_; }
+  EdgeCoordinator& get_edge_coordinator() { return *edge_coordinator_; }
 
 private:
   std::unique_ptr<l3kv::Engine> store_;
+  ClusterResolver resolver_;
+  RemoteL3KVClient remote_client_;
+  std::unique_ptr<EdgeCoordinator> edge_coordinator_;
   std::mutex cache_mutex_;
   std::unordered_map<std::string, std::shared_ptr<Node>> node_cache_;
   SREMetrics metrics_;
