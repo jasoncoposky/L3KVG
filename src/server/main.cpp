@@ -1,37 +1,97 @@
-#include "L3KVG/Cypher.hpp"
-#include "L3KVG/Engine.hpp"
-#include "httplib.h"
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <BaseTsd.h>
+
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <string>
 #include <thread>
+#include <vector>
 
-int main() {
+#include <nlohmann/json.hpp>
+#include "httplib.h"
+
+#include "L3KVG/Cypher.hpp"
+#include "L3KVG/Engine.hpp"
+#include "L3KVG/Node.hpp"
+#include "L3KVG/Query.hpp"
+#include "engine/store.hpp"
+#include "buffer.hpp"
+
+using json = nlohmann::json;
+
+struct PeerConfig {
+  uint32_t id;
+  std::string host;
+  int port;
+};
+
+struct Config {
+  std::string address = "0.0.0.0";
+  int port = 8080;
+  uint32_t node_id = 1;
   std::string db_path = "prod_l3kvg_db";
-  // We do NOT clear the DB here if we want persistence, but for a fresh start
-  // we can: std::filesystem::remove_all(db_path);
-  auto engine = std::make_unique<l3kvg::Engine>(db_path, 4);
+  std::vector<PeerConfig> peers;
+};
 
-  // Initial Demo Seed
-  engine->put_node("npc_1",
-                   R"({"id": "npc_1", "type": "npc", "name": "Aragorn"})");
-  engine->put_node(
-      "npc_2",
-      R"({"id": "npc_2", "type": "npc", "name": "Legolas", "faction": "Elves"})");
-  engine->put_node(
-      "npc_3",
-      R"({"id": "npc_3", "type": "npc", "name": "Gimli", "faction": "Dwarves"})");
+Config load_config(const std::string &path) {
+  Config cfg;
+  std::ifstream f(path);
+  if (f.is_open()) {
+    try {
+      json j;
+      f >> j;
+      cfg.address = j.value("address", cfg.address);
+      cfg.port = j.value("port", cfg.port);
+      cfg.node_id = j.value("node_id", cfg.node_id);
+      cfg.db_path = j.value("db_path", cfg.db_path);
+      if (j.contains("peers")) {
+        for (auto &p : j["peers"]) {
+          cfg.peers.push_back({p.value("id", 0u), p.value("host", "127.0.0.1"),
+                               p.value("port", 8080)});
+        }
+      }
+    } catch (...) {
+      std::cerr << "Failed to parse config, using defaults.\n";
+    }
+  }
+  return cfg;
+}
 
-  engine->add_edge("npc_1", "loyalty", 1.0, "npc_2");
-  engine->add_edge("npc_1", "loyalty", 0.9, "npc_3");
+int main(int argc, char *argv[]) {
+  std::string config_path = "config.json";
+  if (argc > 1) {
+    config_path = argv[1];
+  }
+
+  Config cfg = load_config(config_path);
+
+  auto ring = std::make_shared<lite3::ConsistentHash>();
+  ring->add_node(cfg.node_id);
+  for (const auto &p : cfg.peers) {
+    ring->add_node(p.id);
+  }
+
+  auto engine = std::make_unique<l3kvg::Engine>(cfg.db_path, cfg.node_id, ring);
+
+  for (const auto &p : cfg.peers) {
+    engine->get_remote_client().add_peer(
+        p.id, "http://" + p.host + ":" + std::to_string(p.port));
+  }
 
   l3kvg::CypherParser parser(engine.get());
-
   httplib::Server svr;
 
-  // CORS handler via middleware
   svr.set_post_routing_handler([](const auto &req, auto &res) {
     res.set_header("Access-Control-Allow-Origin", "*");
     res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
@@ -39,73 +99,94 @@ int main() {
   });
 
   svr.Options(".*", [](const httplib::Request &, httplib::Response &res) {
-    res.set_header("Access-Control-Allow-Origin", "*");
-    res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-    res.set_header("Access-Control-Allow-Headers", "Content-Type");
     res.status = 200;
   });
 
-  // Endpoint 1: Metrics
-  svr.Get("/api/metrics", [&](const httplib::Request &,
-                              httplib::Response &res) {
-    auto &metrics = engine->get_metrics();
-    std::string json = "{"
-                       "\"hop_latency_us\": " +
-                       std::to_string(metrics.hop_latency_us.load()) +
-                       ","
-                       "\"serialization_time_us\": " +
-                       std::to_string(metrics.serialization_time_us.load()) +
-                       ","
-                       "\"cache_hits\": " +
-                       std::to_string(metrics.cache_hits.load()) +
-                       ","
-                       "\"cache_misses\": " +
-                       std::to_string(metrics.cache_misses.load()) + "}";
-    res.set_content(json, "application/json");
+  svr.Get("/api/metrics", [&](const httplib::Request &, httplib::Response &res) {
+    auto &m = engine->get_metrics();
+    json j_metrics = {{"hop_latency_us", static_cast<uint64_t>(m.hop_latency_us.load())},
+              {"serialization_time_us", static_cast<uint64_t>(m.serialization_time_us.load())},
+              {"cache_hits", static_cast<uint64_t>(m.cache_hits.load())},
+              {"cache_misses", static_cast<uint64_t>(m.cache_misses.load())}};
+    res.set_content(j_metrics.dump(), "application/json");
   });
 
-  // Endpoint 2: Cypher Query
-  svr.Post(
-      "/api/query", [&](const httplib::Request &req, httplib::Response &res) {
-        try {
-          auto start = std::chrono::high_resolution_clock::now();
-          auto rows = parser.execute(req.body);
-          auto end = std::chrono::high_resolution_clock::now();
+  svr.Post("/api/query", [&](const httplib::Request &req, httplib::Response &res) {
+    try {
+      auto start = std::chrono::high_resolution_clock::now();
+      auto rows = parser.execute(req.body);
+      auto end = std::chrono::high_resolution_clock::now();
+      auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
+      engine->get_metrics().hop_latency_us.store(static_cast<uint64_t>(duration / (rows.empty() ? 1 : rows.size())));
 
-          // Log latency in engine metrics
-          auto duration =
-              std::chrono::duration_cast<std::chrono::microseconds>(end - start)
-                  .count();
-          // Just arbitrarily attributing to hop latency for demo purpose if
-          // there's no hops
-          auto &metrics = engine->get_metrics();
-          metrics.hop_latency_us.store(duration /
-                                       (rows.size() == 0 ? 1 : rows.size()));
+      json j_rows = json::array();
+      for (const auto &row : rows) {
+        json r = json::object();
+        for (const auto &[k, v] : row.fields) r[k] = v;
+        j_rows.push_back(r);
+      }
+      res.set_content(j_rows.dump(), "application/json");
+    } catch (const std::exception &e) {
+      res.status = 400;
+      res.set_content(json{{"error", e.what()}}.dump(), "application/json");
+    }
+  });
 
-          std::string json = "[";
-          for (size_t i = 0; i < rows.size(); ++i) {
-            json += "{";
-            size_t j = 0;
-            for (const auto &[k, v] : rows[i].fields) {
-              json += "\"" + k + "\": \"" + v + "\"";
-              if (j++ < rows[i].fields.size() - 1)
-                json += ",";
-            }
-            json += "}";
-            if (i < rows.size() - 1)
-              json += ",";
-          }
-          json += "]";
-          res.set_content(json, "application/json");
-        } catch (const std::exception &e) {
-          std::string err = R"({"error": ")" + std::string(e.what()) + R"("})";
-          res.status = 400;
-          res.set_content(err, "application/json");
+  svr.Get("/api/internal/node/:uuid", [&](const httplib::Request &req, httplib::Response &res) {
+    std::string uuid = req.path_params.at("uuid");
+    lite3cpp::Buffer buf = engine->get_store()->get(uuid);
+    if (buf.size() > 0) {
+      res.set_content(std::string(reinterpret_cast<const char *>(buf.data()), buf.size()), "application/octet-stream");
+    } else {
+      res.status = 404;
+    }
+  });
+
+  svr.Post("/api/internal/nodes/batch", [&](const httplib::Request &req, httplib::Response &res) {
+    try {
+      json j_batch_req = json::parse(req.body);
+      std::vector<std::string> ids = j_batch_req.at("uuids").get<std::vector<std::string>>();
+      json j_batch_resp = json::object();
+      for (const auto &id : ids) {
+        lite3cpp::Buffer b = engine->get_store()->get(id);
+        if (b.size() > 0) {
+          j_batch_resp[id] = std::string(reinterpret_cast<const char *>(b.data()), b.size());
         }
-      });
+      }
+      res.set_content(j_batch_resp.dump(), "application/json");
+    } catch (...) { res.status = 400; }
+  });
 
-  std::cout << "L3KVG Embedded Engine API running on http://localhost:8080..."
-            << std::endl;
-  svr.listen("0.0.0.0", 8080);
+  svr.Post("/api/internal/neighbors", [&](const httplib::Request &req, httplib::Response &res) {
+    try {
+      json j_neigh_req = json::parse(req.body);
+      std::string t = j_neigh_req.at("target").get<std::string>();
+      std::string l = j_neigh_req.at("label").get<std::string>();
+      double w = j_neigh_req.value("min_weight", 0.0);
+      auto n = engine->get_node(t);
+      std::vector<std::string> neighbors = n->get_neighbors(l, w);
+      json j_neigh_resp = neighbors;
+      res.set_content(j_neigh_resp.dump(), "application/json");
+    } catch (...) { res.status = 400; }
+  });
+
+  svr.Post("/api/internal/put_node", [&](const httplib::Request &req, httplib::Response &res) {
+    try {
+      json j_pn = json::parse(req.body);
+      engine->get_store()->put(j_pn.at("target").get<std::string>(), j_pn.at("payload").dump());
+      res.status = 200;
+    } catch (...) { res.status = 400; }
+  });
+
+  svr.Post("/api/internal/put_edge", [&](const httplib::Request &req, httplib::Response &res) {
+    try {
+      json j_pe = json::parse(req.body);
+      engine->get_store()->put(j_pe.at("key").get<std::string>(), j_pe.at("payload").dump());
+      res.status = 200;
+    } catch (...) { res.status = 400; }
+  });
+
+  std::cout << "L3KVG Server [" << cfg.node_id << "] listening on " << cfg.address << ":" << cfg.port << std::endl;
+  svr.listen(cfg.address.c_str(), cfg.port);
   return 0;
 }

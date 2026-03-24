@@ -20,6 +20,8 @@ add_library(l3kvg_engine STATIC
 target_include_directories(l3kvg_engine PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     "${CMAKE_CURRENT_SOURCE_DIR}/../lib/boost_1_89_0"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../L3KV/src"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../lib/liblite3client/external"
 )
 
 target_link_libraries(l3kvg_engine PUBLIC
@@ -75,3 +77,6 @@ endif()
 
 add_executable(bench_l3kvg tests/bench_l3kvg.cpp)
 target_link_libraries(bench_l3kvg PRIVATE l3kvg_engine Threads::Threads)
+
+add_executable(bench_distributed tests/bench_distributed.cpp)
+target_link_libraries(bench_distributed PRIVATE l3kvg_engine Threads::Threads ws2_32 wsock32 crypt32)
