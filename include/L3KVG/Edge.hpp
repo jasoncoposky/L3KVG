@@ -16,13 +16,9 @@ class Engine;
 
 class Edge {
 public:
-  Edge(Engine *engine, std::string src, std::string label, double weight, std::string dst, std::string payload_raw = "")
+  Edge(Engine *engine, std::string src, std::string label, double weight, std::string dst, std::optional<lite3cpp::Buffer> payload = std::nullopt)
       : engine_(engine), src_(std::move(src)), label_(std::move(label)), 
-        weight_(weight), dst_(std::move(dst)) {
-      if (!payload_raw.empty()) {
-          payload_ = lite3cpp::lite3_json::from_json_string(payload_raw);
-      }
-  }
+        weight_(weight), dst_(std::move(dst)), payload_(std::move(payload)) {}
 
   const std::string& get_src() const { return src_; }
   const std::string& get_label() const { return label_; }

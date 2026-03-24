@@ -142,10 +142,6 @@ std::vector<std::shared_ptr<Edge>> Node::get_edges(std::string_view label,
       continue;
     
     lite3cpp::Buffer buf = store->get(key); // Fetch property payload
-    std::string value;
-    if (buf.size() > 0) {
-        value = lite3cpp::lite3_json::to_json_string(buf, 0);
-    }
     
     // Parse key: e:out:{src}:label:weight:dst
     // We already know src (uuid_), label, weight (from key), and dst (from key)
@@ -162,7 +158,8 @@ std::vector<std::shared_ptr<Edge>> Node::get_edges(std::string_view label,
             weight = std::stod(w_str);
         }
         
-        edges.push_back(std::make_shared<Edge>(engine_, uuid_, std::string(label), weight, dst_uuid, value));
+        edges.push_back(std::make_shared<Edge>(engine_, uuid_, std::string(label), weight, dst_uuid, 
+                                               buf.size() > 0 ? std::make_optional(std::move(buf)) : std::nullopt));
     }
   }
   return edges;
