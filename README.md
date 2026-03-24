@@ -22,6 +22,15 @@ L3KVG Evolution 2 transitions the engine from local-only to a distributed graph 
 - **Transparent RPC**: `RemoteL3KVClient` automatically forwards property lookups and neighbor traversals to the owner node via high-performance HTTP/1.1.
 - **Atomic Edge Coordination**: The `EdgeCoordinator` implements a dual-shard write protocol with Hybrid Logical Clocks (HLC), ensuring causal consistency for edges spanning multiple physical nodes.
 - **Auto-Routing**: `Engine::put_node` automatically routes write operations to the correct shard owner in the cluster.
+- **Structured Edge Metadata**: Evolutionary support for rich property objects on edges, maintained with HLC consistency and stored in zero-copy BSON buffers.
+
+## Edge Properties & Structured Metadata
+
+L3KVG Evolution 3 introduces support for structured edge metadata. Each edge can now carry a full JSON payload. User-defined properties are automatically nested under a `props` key to separate them from system metadata (e.g., timestamps):
+
+- **Atomic Hydration**: Edge properties are hydrated automatically from the distributed store during `get_edges()` calls.
+- **Type-Safe Access**: Retrieve properties using the `get_attribute<T>(key)` template method on the `Edge` object.
+- **Zero-Collision Mapping**: The engine ensures that user properties do not overwrite system-level telemetry like the logical clock.
 
 ## Architecture & Performance
 
@@ -43,8 +52,8 @@ auto engine = std::make_unique<l3kvg::Engine>("db_path_test", 1);
 engine->put_node("npc_1", R"({"name": "Thief", "type": "npc"})");
 engine->put_node("npc_2", R"({"name": "Guard", "type": "npc"})");
 
-// Link Edges
-engine->add_edge("npc_1", "knows", 1.0, "npc_2");
+// Link Edges with properties
+engine->add_edge("npc_1", "knows", 1.0, "npc_2", R"({"since": 2021, "status": "allied"})");
 
 // Fluent Traversal Pipeline
 auto results = engine->query()
@@ -53,6 +62,13 @@ auto results = engine->query()
     .out("knows")
     .return_({"name"})
     .execute();
+
+// Direct Attribute Access
+auto edges = node->get_edges("knows", l3kvg::Direction::OUT);
+for (auto& edge : edges) {
+    int year = edge->get_attribute<int>("since");
+    std::string status = edge->get_attribute<std::string>("status");
+}
 ```
 
 ## SRE Metrics Dashboard & Native Cypher Graph
