@@ -49,7 +49,8 @@ public:
   static std::string format_weight(double weight);
 
   void add_edge(std::string_view src_uuid, std::string_view label,
-                double weight, std::string_view dst_uuid);
+                double weight, std::string_view dst_uuid, 
+                const std::string &payload = "");
 
   // Mechanical Sympathy & HPC APIs
   SREMetrics &get_metrics() { return metrics_; }

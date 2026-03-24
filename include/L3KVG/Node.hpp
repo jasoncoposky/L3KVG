@@ -1,9 +1,9 @@
 #pragma once
 
-#include "buffer.hpp"
 #include <memory>
 #include <optional>
 #include <string>
+#include "L3KVG/Edge.hpp"
 #include <string_view>
 #include <vector>
 
@@ -34,6 +34,9 @@ public:
 
   std::vector<std::string> get_neighbors(std::string_view label,
                                          double min_weight = -999999.0);
+
+  std::vector<std::shared_ptr<Edge>> get_edges(std::string_view label,
+                                               double min_weight = -999999.0);
 
   const std::string &get_uuid() const { return uuid_; }
 

@@ -83,8 +83,9 @@ std::string Engine::format_weight(double weight) {
 }
 
 void Engine::add_edge(std::string_view src_uuid, std::string_view label,
-                      double weight, std::string_view dst_uuid) {
-  edge_coordinator_->atomic_put_edge(std::string(src_uuid), std::string(label), weight, std::string(dst_uuid));
+                      double weight, std::string_view dst_uuid,
+                      const std::string &payload) {
+  edge_coordinator_->atomic_put_edge(std::string(src_uuid), std::string(label), weight, std::string(dst_uuid), payload);
 }
 
 } // namespace l3kvg

@@ -55,6 +55,9 @@ target_link_libraries(test_edge_coordinator PRIVATE l3kvg_engine gtest_main Thre
 add_executable(test_async_traversal tests/test_async_traversal.cpp)
 target_link_libraries(test_async_traversal PRIVATE l3kvg_engine gtest_main Threads::Threads ws2_32)
 
+add_executable(test_edge_properties tests/test_edge_properties.cpp)
+target_link_libraries(test_edge_properties PRIVATE l3kvg_engine gtest_main Threads::Threads ws2_32)
+
 add_test(NAME test_engine COMMAND test_l3kvg)
 add_test(NAME test_fluent COMMAND test_fluent_api)
 add_test(NAME test_cypher_ast COMMAND test_cypher)
@@ -62,6 +65,7 @@ add_test(NAME test_cluster COMMAND test_cluster_resolver)
 add_test(NAME test_remote COMMAND test_remote_client)
 add_test(NAME test_coordinator COMMAND test_edge_coordinator)
 add_test(NAME test_async COMMAND test_async_traversal)
+add_test(NAME test_edge_props COMMAND test_edge_properties)
 
 add_executable(l3kvg_server src/server/main.cpp)
 target_link_libraries(l3kvg_server PRIVATE l3kvg_engine Threads::Threads)

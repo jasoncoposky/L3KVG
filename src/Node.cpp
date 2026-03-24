@@ -2,7 +2,6 @@
 #include "L3KVG/Engine.hpp"
 #include "L3KVG/RemoteL3KVClient.hpp"
 #include "engine/store.hpp"
-#include <iostream>
 
 namespace l3kvg {
 
@@ -111,6 +110,62 @@ std::vector<std::string> Node::get_neighbors(std::string_view label,
     }
   }
   return neighbors;
+}
+
+std::vector<std::shared_ptr<Edge>> Node::get_edges(std::string_view label,
+                                                  double min_weight) {
+  if (!might_have_edge(label)) {
+    return {};
+  }
+
+  auto& resolver = engine_->get_resolver();
+  if (!resolver.is_local(uuid_)) {
+    // Phase 5 Pending: Remote get_edges RPC
+    // For now, we fall back to get_neighbors (UUIDs only) or empty
+    return {};
+  }
+
+  std::vector<std::shared_ptr<Edge>> edges;
+  std::string prefix = "e:out:{" + uuid_ + "}:" + std::string(label) + ":";
+
+  std::string min_w_str = Engine::format_weight(min_weight);
+  std::string start_key = prefix + min_w_str;
+
+  auto *store = engine_->get_store();
+  size_t target_shard = store->get_routing_shard(prefix);
+
+  // We need a method in l3kv::Engine that returns pairs of {key, value}
+  // Let's assume get_prefix_entries exists or iterate through keys and get values.
+  auto chunk = store->get_prefix_keys(prefix, target_shard, start_key, 1000);
+  for (const auto &key : chunk) {
+    if (key.ends_with(":meta"))
+      continue;
+    
+    lite3cpp::Buffer buf = store->get(key); // Fetch property payload
+    std::string value;
+    if (buf.size() > 0) {
+        value = lite3cpp::lite3_json::to_json_string(buf, 0);
+    }
+    
+    // Parse key: e:out:{src}:label:weight:dst
+    // We already know src (uuid_), label, weight (from key), and dst (from key)
+    
+    size_t last_colon = key.find_last_of(':');
+    if (last_colon != std::string::npos) {
+        std::string dst_uuid = key.substr(last_colon + 1);
+        
+        // Extract weight from key
+        size_t weight_colon = key.find_last_of(':', last_colon - 1);
+        double weight = 0.0;
+        if (weight_colon != std::string::npos) {
+            std::string w_str = key.substr(weight_colon + 1, last_colon - weight_colon - 1);
+            weight = std::stod(w_str);
+        }
+        
+        edges.push_back(std::make_shared<Edge>(engine_, uuid_, std::string(label), weight, dst_uuid, value));
+    }
+  }
+  return edges;
 }
 
 std::vector<std::shared_ptr<Node>>

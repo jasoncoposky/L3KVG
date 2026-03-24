@@ -57,7 +57,7 @@ class EdgeCoordinator {
 public:
     EdgeCoordinator(l3kv::Engine* store, ClusterResolver& resolver, RemoteL3KVClient& remote_client, uint32_t node_id);
 
-    void atomic_put_edge(const std::string& src_uuid, const std::string& label, double weight, const std::string& dst_uuid);
+    void atomic_put_edge(const std::string& src_uuid, const std::string& label, double weight, const std::string& dst_uuid, const std::string& payload = "");
 
 private:
     l3kv::Engine* store_;

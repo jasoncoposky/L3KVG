@@ -1,16 +1,21 @@
 #include "L3KVG/EdgeCoordinator.hpp"
 #include "engine/store.hpp"
 #include "L3KVG/Engine.hpp" 
-#include <iostream>
 
 namespace l3kvg {
 
 EdgeCoordinator::EdgeCoordinator(l3kv::Engine* store, ClusterResolver& resolver, RemoteL3KVClient& remote_client, uint32_t node_id)
     : store_(store), resolver_(resolver), remote_client_(remote_client), hlc_(node_id) {}
 
-void EdgeCoordinator::atomic_put_edge(const std::string& src_uuid, const std::string& label, double weight, const std::string& dst_uuid) {
+void EdgeCoordinator::atomic_put_edge(const std::string& src_uuid, const std::string& label, double weight, const std::string& dst_uuid, const std::string& payload) {
     auto ts = hlc_.now();
-    std::string ts_json = "{\"ts\": " + ts.to_json_string() + "}";
+    std::string final_payload;
+    if (payload.empty()) {
+        final_payload = "{\"ts\": " + ts.to_json_string() + "}";
+    } else {
+        final_payload = "{\"ts\": " + ts.to_json_string() + ", \"props\": " + payload + "}";
+    }
+    // std::cerr << "[EdgeCoordinator] DEBUG: final_payload=" << final_payload << "\n";
 
     std::string w_str = Engine::format_weight(weight);
 
@@ -23,22 +28,22 @@ void EdgeCoordinator::atomic_put_edge(const std::string& src_uuid, const std::st
 
     std::future<bool> out_future;
     if (src_owner == local_id) {
-        out_future = std::async(std::launch::deferred, [this, out_key, ts_json]() {
-            store_->put(out_key, ts_json);
+        out_future = std::async(std::launch::deferred, [this, out_key, final_payload]() {
+            store_->put(out_key, final_payload);
             return true;
         });
     } else {
-        out_future = remote_client_.put_edge_async(src_owner, out_key, ts_json);
+        out_future = remote_client_.put_edge_async(src_owner, out_key, final_payload);
     }
 
     std::future<bool> in_future;
     if (dst_owner == local_id) {
-        in_future = std::async(std::launch::deferred, [this, in_key, ts_json]() {
-            store_->put(in_key, ts_json);
+        in_future = std::async(std::launch::deferred, [this, in_key, final_payload]() {
+            store_->put(in_key, final_payload);
             return true;
         });
     } else {
-        in_future = remote_client_.put_edge_async(dst_owner, in_key, ts_json);
+        in_future = remote_client_.put_edge_async(dst_owner, in_key, final_payload);
     }
 
     try {
