@@ -9,11 +9,15 @@ Node::Node(Engine *engine, std::string uuid)
     : engine_(engine), uuid_(std::move(uuid)) {}
 
 void Node::ensure_loaded() {
-  if (loaded_)
+  if (loaded_.load(std::memory_order_acquire))
+    return;
+
+  std::lock_guard<std::mutex> lock(loading_mutex_);
+  if (loaded_.load(std::memory_order_relaxed))
     return;
 
   auto& resolver = engine_->get_resolver();
-  std::string key = "n:{" + uuid_ + "}";
+  std::string_view key = KeyBuilder::node_key(uuid_);
 
   if (!resolver.is_local(uuid_)) {
       lite3::NodeID owner = resolver.get_node_owner(uuid_);
@@ -21,9 +25,7 @@ void Node::ensure_loaded() {
       try {
           std::string raw_data = client.get_node_payload_async(owner, uuid_).get();
           if (!raw_data.empty()) {
-              std::cerr << "[Node::ensure_loaded] DEBUG: Remote data received for " << uuid_ << ": " << raw_data << "\n";
               payload_ = lite3cpp::lite3_json::from_json_string(raw_data);
-              std::cerr << "[Node::ensure_loaded] DEBUG: Payload size after hydration: " << (payload_ ? payload_->size() : 0) << "\n";
               
               if (payload_->get_type(0, "bloom") == lite3cpp::Type::Int64) {
                   bloom_filter_ = payload_->get_i64(0, "bloom");
@@ -35,7 +37,7 @@ void Node::ensure_loaded() {
           std::cerr << "[Node::ensure_loaded] Remote Fetch Failed: " << e.what() << "\n";
       }
   } else {
-      auto buf = engine_->get_store()->get(key);
+      auto buf = engine_->get_store()->get(std::string(key));
       if (buf.size() > 0) {
           payload_ = std::move(buf);
           if (payload_->get_type(0, "bloom") == lite3cpp::Type::Int64) {
@@ -45,7 +47,17 @@ void Node::ensure_loaded() {
           }
       }
   }
-  loaded_ = true;
+  loaded_.store(true, std::memory_order_release);
+}
+
+std::string_view Node::get_attribute_view(std::string_view key) {
+  ensure_loaded();
+  if (!payload_ || payload_->size() == 0)
+    return {};
+  if (payload_->get_type(0, key) == lite3cpp::Type::String) {
+    return payload_->get_str(0, key);
+  }
+  return {};
 }
 
 std::string_view Node::get_raw_view(std::string_view key) {
@@ -92,15 +104,18 @@ std::vector<std::string> Node::get_neighbors(std::string_view label,
   }
 
   std::vector<std::string> neighbors;
-  std::string prefix = "e:out:{" + uuid_ + "}:" + std::string(label) + ":";
-
-  std::string min_w_str = Engine::format_weight(min_weight);
-  std::string start_key = prefix + min_w_str;
+  std::string_view prefix = KeyBuilder::edge_prefix(uuid_, label);
+  std::string_view min_w_str = KeyBuilder::format_weight(min_weight);
+  
+  std::string start_key;
+  start_key.reserve(prefix.size() + min_w_str.size());
+  start_key.append(prefix);
+  start_key.append(min_w_str);
 
   auto *store = engine_->get_store();
-  size_t target_shard = store->get_routing_shard(prefix);
+  size_t target_shard = store->get_routing_shard(std::string(prefix));
 
-  auto chunk = store->get_prefix_keys(prefix, target_shard, start_key, 1000);
+  auto chunk = store->get_prefix_keys(std::string(prefix), target_shard, start_key, 1000);
   for (const auto &key : chunk) {
     if (key.ends_with(":meta"))
       continue;
@@ -126,17 +141,20 @@ std::vector<std::shared_ptr<Edge>> Node::get_edges(std::string_view label,
   }
 
   std::vector<std::shared_ptr<Edge>> edges;
-  std::string prefix = "e:out:{" + uuid_ + "}:" + std::string(label) + ":";
-
-  std::string min_w_str = Engine::format_weight(min_weight);
-  std::string start_key = prefix + min_w_str;
+  std::string_view prefix = KeyBuilder::edge_prefix(uuid_, label);
+  std::string_view min_w_str = KeyBuilder::format_weight(min_weight);
+  
+  std::string start_key;
+  start_key.reserve(prefix.size() + min_w_str.size());
+  start_key.append(prefix);
+  start_key.append(min_w_str);
 
   auto *store = engine_->get_store();
-  size_t target_shard = store->get_routing_shard(prefix);
+  size_t target_shard = store->get_routing_shard(std::string(prefix));
 
   // We need a method in l3kv::Engine that returns pairs of {key, value}
   // Let's assume get_prefix_entries exists or iterate through keys and get values.
-  auto chunk = store->get_prefix_keys(prefix, target_shard, start_key, 1000);
+  auto chunk = store->get_prefix_keys(std::string(prefix), target_shard, start_key, 1000);
   for (const auto &key : chunk) {
     if (key.ends_with(":meta"))
       continue;

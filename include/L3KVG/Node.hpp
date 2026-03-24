@@ -1,11 +1,14 @@
 #pragma once
 
+#include <mutex>
+#include <atomic>
 #include <memory>
 #include <optional>
 #include <string>
-#include "L3KVG/Edge.hpp"
 #include <string_view>
 #include <vector>
+#include "L3KVG/Edge.hpp"
+#include "L3KVG/KeyBuilder.hpp"
 
 namespace l3kvg {
 
@@ -21,6 +24,7 @@ public:
 
   // Zero-copy Raw Attribute Access
   std::string_view get_raw_view(std::string_view key);
+  std::string_view get_attribute_view(std::string_view key);
 
   // Custom Edge Label Bloom Filter
   bool might_have_edge(std::string_view label) const;
@@ -44,7 +48,8 @@ private:
   Engine *engine_;
   std::string uuid_;
   std::optional<lite3cpp::Buffer> payload_;
-  bool loaded_{false};
+  std::atomic<bool> loaded_{false};
+  std::mutex loading_mutex_;
   uint64_t bloom_filter_{0};
 };
 

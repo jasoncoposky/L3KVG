@@ -44,6 +44,7 @@ public:
   Query query();
 
   std::shared_ptr<Node> get_node(std::string_view uuid);
+  std::vector<std::shared_ptr<Node>> fetch_nodes(const std::vector<std::string>& uuids);
   void put_node(std::string_view uuid, const std::string &json_payload);
 
   static std::string format_weight(double weight);

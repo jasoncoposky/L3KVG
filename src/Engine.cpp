@@ -56,30 +56,34 @@ std::shared_ptr<Node> Engine::get_swizzled(std::string_view uuid) {
   return nullptr;
 }
 
+std::vector<std::shared_ptr<Node>> Engine::fetch_nodes(const std::vector<std::string>& uuids) {
+  std::vector<std::shared_ptr<Node>> result;
+  result.reserve(uuids.size());
+  for (const auto& uuid : uuids) {
+    result.push_back(get_node(uuid));
+  }
+  // Potential optimization: trigger parallel ensure_loaded() calls here
+  return result;
+}
+
 void Engine::put_node(std::string_view uuid, const std::string &json_payload) {
-  std::string suuid(uuid);
-  lite3::NodeID owner = resolver_.get_node_owner(suuid);
+  lite3::NodeID owner = resolver_.get_node_owner(std::string(uuid));
   
   if (owner != resolver_.get_local_node_id()) {
     try {
-        remote_client_.put_node_async(owner, suuid, json_payload).get();
+        remote_client_.put_node_async(owner, std::string(uuid), json_payload).get();
         return;
     } catch (const std::exception& e) {
         std::cerr << "[Engine::put_node] Remote RPC Failed: " << e.what() << "\n";
-        // Fallback to local write if RPC fails? In a real system we might retry or error.
-        // For this MVP, we will attempt local write as a safety net.
     }
   }
 
-  std::string key = "n:{" + suuid + "}";
-  store_->put(key, json_payload);
+  std::string_view key = KeyBuilder::node_key(uuid);
+  store_->put(std::string(key), json_payload);
 }
 
 std::string Engine::format_weight(double weight) {
-  std::ostringstream ss;
-  ss << std::setw(8) << std::setfill('0') << std::fixed << std::setprecision(4)
-     << weight;
-  return ss.str();
+  return std::string(KeyBuilder::format_weight(weight));
 }
 
 void Engine::add_edge(std::string_view src_uuid, std::string_view label,
