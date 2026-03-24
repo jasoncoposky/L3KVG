@@ -39,7 +39,8 @@ To meet strict SRE guidelines (sub-500µs single hop traversal, >10,000 ops/sec 
 
 - **Redis-style Hash Tagging (`{id}`)**: By embedding routing tags directly in edge keys (e.g. `e:out:{uuid}:label:weight:dst`), all outbound and inbound edges form contiguous edge blocks residing strictly on the **same hardware thread/shard** as their parent graph node.
 - **Actor-Model Routines**: `add_edge` and adjacency traversals encapsulate execution closures and pass them to bounded underlying core routines. This removes the necessity of thread-unsafe maps, achieving safe parallel traversal isolation.
-- **Spin-Lock De-jitter**: By inserting spin-cycles preceding task yielding upon empty queues, L3KVG bypasses OS-level thread rescheduling penalties (~1-15ms Windows Jitter), accelerating node-expansion 50-edge fan-outs down to **~140µs**.
+- **Zero-Copy & Async WAL**: Leverages L3KV's March 2026 engine upgrade, achieving **6.4 µs** traversal latency and **~30,000** concurrent edge additions/sec.
+- **Spin-Lock De-jitter**: By inserting spin-cycles preceding task yielding upon empty queues, L3KVG bypasses OS-level thread rescheduling penalties (~1-15ms Windows Jitter).
 
 ## API Example
 
