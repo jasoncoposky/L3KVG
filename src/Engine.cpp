@@ -57,12 +57,42 @@ std::shared_ptr<Node> Engine::get_swizzled(std::string_view uuid) {
 }
 
 std::vector<std::shared_ptr<Node>> Engine::fetch_nodes(const std::vector<std::string>& uuids) {
+  std::unordered_map<lite3::NodeID, std::vector<std::string>> remote_requests;
   std::vector<std::shared_ptr<Node>> result;
   result.reserve(uuids.size());
+
   for (const auto& uuid : uuids) {
-    result.push_back(get_node(uuid));
+    auto node = get_node(uuid);
+    if (node && !node->is_loaded()) {
+      lite3::NodeID owner = resolver_.get_node_owner(uuid);
+      if (owner != resolver_.get_local_node_id()) {
+        remote_requests[owner].push_back(uuid);
+      }
+    }
+    result.push_back(node);
   }
-  // Potential optimization: trigger parallel ensure_loaded() calls here
+
+  if (remote_requests.empty()) return result;
+
+  std::vector<std::pair<lite3::NodeID, std::future<std::unordered_map<std::string, std::string>>>> futures;
+  for (auto& [owner, batch] : remote_requests) {
+    futures.push_back({owner, remote_client_.get_nodes_batch_async(owner, batch)});
+  }
+
+  for (auto& pair : futures) {
+    try {
+      auto batch_results = pair.second.get();
+      for (auto& [uuid, payload] : batch_results) {
+        auto node = get_node(uuid);
+        if (node) {
+            node->hydrate(payload);
+        }
+      }
+    } catch (const std::exception& e) {
+      std::cerr << "[Engine::fetch_nodes] Batch RPC to node " << pair.first << " failed: " << e.what() << "\n";
+    }
+  }
+
   return result;
 }
 

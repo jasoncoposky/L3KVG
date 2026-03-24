@@ -17,8 +17,9 @@ class Engine;
 class Node {
 public:
   Node(Engine *engine, std::string uuid);
-
   void ensure_loaded();
+  bool is_loaded() const { return loaded_.load(std::memory_order_acquire); }
+  void hydrate(const std::string &data);
 
   bool has_attribute(const std::string &key);
 
@@ -47,7 +48,11 @@ public:
 private:
   Engine *engine_;
   std::string uuid_;
+  
+  // High Performance Proxy: payload_ owns the memory for all zero-copy views.
+  // Pointer stability is guaranteed as long as this Node object is alive.
   std::optional<lite3cpp::Buffer> payload_;
+  
   std::atomic<bool> loaded_{false};
   std::mutex loading_mutex_;
   uint64_t bloom_filter_{0};

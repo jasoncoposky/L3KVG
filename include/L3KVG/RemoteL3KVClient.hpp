@@ -32,6 +32,12 @@ public:
         const std::string& target_node_id
     );
 
+    // Batch Fetch: Reduces network roundtrips by coalescing requests to the same peer.
+    std::future<std::unordered_map<std::string, std::string>> get_nodes_batch_async(
+        lite3::NodeID owner_id,
+        const std::vector<std::string>& node_uuids
+    );
+
     std::future<bool> put_node_async(
         lite3::NodeID owner_id,
         const std::string& target_node_id, 

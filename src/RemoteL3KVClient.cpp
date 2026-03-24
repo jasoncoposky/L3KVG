@@ -118,6 +118,67 @@ std::future<std::string> RemoteL3KVClient::get_node_payload_async(
     });
 }
 
+std::future<std::unordered_map<std::string, std::string>> RemoteL3KVClient::get_nodes_batch_async(
+    lite3::NodeID owner_id,
+    const std::vector<std::string>& node_uuids
+) {
+    auto it = peer_endpoints_.find(owner_id);
+    if (it == peer_endpoints_.end()) {
+        return std::async(std::launch::async, [owner_id]() -> std::unordered_map<std::string, std::string> {
+            throw std::runtime_error("Unknown peer ID for batch_get: " + std::to_string(owner_id));
+        });
+    }
+    std::string host_port = it->second;
+
+    return std::async(std::launch::async, [host_port, node_uuids]() {
+        httplib::Client cli(host_port);
+        
+        // Build batch request body: {"uuids": ["id1", "id2", ...]}
+        std::string req_body = "{\"uuids\": [";
+        for (size_t i = 0; i < node_uuids.size(); ++i) {
+            req_body += "\"" + node_uuids[i] + "\"";
+            if (i < node_uuids.size() - 1) req_body += ", ";
+        }
+        req_body += "]}";
+
+        std::unordered_map<std::string, std::string> results;
+        if (auto res = cli.Post("/api/internal/nodes/batch", req_body, "application/json")) {
+            if (res->status == 200) {
+                // Primitive JSON parsing for the map: {"id1": "payload1", "id2": "payload2"}
+                std::string body = res->body;
+                // Simple parser assuming well-formatted JSON from internal peer
+                size_t pos = body.find('{');
+                if (pos != std::string::npos) {
+                    pos++;
+                    while (pos < body.size()) {
+                        size_t q1 = body.find('"', pos);
+                        if (q1 == std::string::npos) break;
+                        size_t q2 = body.find('"', q1 + 1);
+                        if (q2 == std::string::npos) break;
+                        std::string key = body.substr(q1 + 1, q2 - q1 - 1);
+                        
+                        size_t colon = body.find(':', q2 + 1);
+                        if (colon == std::string::npos) break;
+                        
+                        size_t val_start = body.find('"', colon + 1);
+                        if (val_start == std::string::npos) break;
+                        size_t val_end = body.find('"', val_start + 1);
+                        if (val_end == std::string::npos) break;
+                        
+                        results[key] = body.substr(val_start + 1, val_end - val_start - 1);
+                        pos = val_end + 1;
+                    }
+                }
+                return results;
+            } else {
+                throw std::runtime_error("Peer returned status " + std::to_string(res->status) + " for batch_get");
+            }
+        } else {
+            throw std::runtime_error("Failed to connect to peer at " + host_port + " for batch_get");
+        }
+    });
+}
+
 std::future<bool> RemoteL3KVClient::put_node_async(
     lite3::NodeID owner_id,
     const std::string& target_node_id,

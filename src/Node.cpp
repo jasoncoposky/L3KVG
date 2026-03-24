@@ -199,6 +199,23 @@ Node::get_hot_neighbors(std::string_view label, double min_weight) {
   return hot_nodes;
 }
 
+void Node::hydrate(const std::string &data) {
+  std::lock_guard<std::mutex> lock(loading_mutex_);
+  if (loaded_.load(std::memory_order_relaxed)) return;
+  
+  if (data.empty()) {
+    payload_ = lite3cpp::Buffer(1024);
+    payload_->init_object();
+  } else {
+    try {
+        payload_ = lite3cpp::lite3_json::from_json_string(data);
+    } catch (...) {
+        payload_ = lite3cpp::Buffer(std::vector<uint8_t>(data.begin(), data.end()));
+    }
+  }
+  loaded_.store(true, std::memory_order_release);
+}
+
 bool Node::has_attribute(const std::string &key) {
   ensure_loaded();
   if (!payload_ || payload_->size() == 0)
