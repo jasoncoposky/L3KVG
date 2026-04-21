@@ -1,6 +1,7 @@
 #include "L3KVG/Engine.hpp"
 #include "L3KVG/Node.hpp"
 #include "L3KVG/Query.hpp"
+#include "L3KVG/KeyBuilder.hpp"
 #include "engine/store.hpp"
 #include <iomanip>
 #include <sstream>
@@ -12,27 +13,45 @@ Engine::Engine(const std::string &db_path, uint32_t node_id, std::shared_ptr<lit
     : resolver_(std::move(ring), node_id) {
   store_ = std::make_unique<l3kv::Engine>(db_path, node_id);
   edge_coordinator_ = std::make_unique<EdgeCoordinator>(store_.get(), resolver_, remote_client_, node_id);
+  
+  for (size_t i = 0; i < CACHE_SHARDS; ++i) {
+    cache_shards_.push_back(std::make_unique<CacheShard>());
+  }
 }
 
 Engine::~Engine() = default;
+
+size_t Engine::get_cache_shard(std::string_view uuid) {
+    return std::hash<std::string_view>{}(uuid) % CACHE_SHARDS;
+}
 
 Query Engine::query() { return Query(this); }
 
 std::shared_ptr<Node> Engine::get_node(std::string_view uuid) {
   std::string suuid(uuid);
+  size_t h = get_cache_shard(uuid);
+  auto& shard = *cache_shards_[h];
+
   {
-    std::lock_guard<std::mutex> lock(cache_mutex_);
-    if (auto it = node_cache_.find(suuid); it != node_cache_.end()) {
+    std::lock_guard<std::mutex> lock(shard.mutex);
+    if (auto it = shard.map.find(suuid); it != shard.map.end()) {
+      // LRU update
+      shard.lru.remove(suuid);
+      shard.lru.push_front(suuid);
       return it->second;
     }
   }
+
   auto node = std::make_shared<Node>(this, suuid);
   {
-    std::lock_guard<std::mutex> lock(cache_mutex_);
-    if (node_cache_.size() > 10000) {
-      node_cache_.clear(); // Hard eviction bound
+    std::lock_guard<std::mutex> lock(shard.mutex);
+    if (shard.map.size() >= CacheShard::MAX_SHARD_SIZE) {
+        std::string victim = shard.lru.back();
+        shard.map.erase(victim);
+        shard.lru.pop_back();
     }
-    node_cache_[suuid] = node;
+    shard.map[suuid] = node;
+    shard.lru.push_front(suuid);
   }
   metrics_.cache_misses.fetch_add(1, std::memory_order_relaxed);
   return node;
@@ -40,15 +59,31 @@ std::shared_ptr<Node> Engine::get_node(std::string_view uuid) {
 
 void Engine::swizzle_node(std::string_view uuid, std::shared_ptr<Node> ptr) {
   std::string suuid(uuid);
-  std::lock_guard<std::mutex> lock(cache_mutex_);
-  node_cache_[suuid] = ptr;
+  size_t h = get_cache_shard(uuid);
+  auto& shard = *cache_shards_[h];
+
+  std::lock_guard<std::mutex> lock(shard.mutex);
+  if (shard.map.contains(suuid)) {
+      shard.lru.remove(suuid);
+  } else if (shard.map.size() >= CacheShard::MAX_SHARD_SIZE) {
+      std::string victim = shard.lru.back();
+      shard.map.erase(victim);
+      shard.lru.pop_back();
+  }
+  shard.map[suuid] = ptr;
+  shard.lru.push_front(suuid);
   metrics_.cache_hits.fetch_add(1, std::memory_order_relaxed);
 }
 
 std::shared_ptr<Node> Engine::get_swizzled(std::string_view uuid) {
   std::string suuid(uuid);
-  std::lock_guard<std::mutex> lock(cache_mutex_);
-  if (auto it = node_cache_.find(suuid); it != node_cache_.end()) {
+  size_t h = get_cache_shard(uuid);
+  auto& shard = *cache_shards_[h];
+
+  std::lock_guard<std::mutex> lock(shard.mutex);
+  if (auto it = shard.map.find(suuid); it != shard.map.end()) {
+    shard.lru.remove(suuid);
+    shard.lru.push_front(suuid);
     metrics_.cache_hits.fetch_add(1, std::memory_order_relaxed);
     return it->second;
   }
@@ -64,9 +99,16 @@ std::vector<std::shared_ptr<Node>> Engine::fetch_nodes(const std::vector<std::st
   for (const auto& uuid : uuids) {
     auto node = get_node(uuid);
     if (node && !node->is_loaded()) {
-      lite3::NodeID owner = resolver_.get_node_owner(uuid);
-      if (owner != resolver_.get_local_node_id()) {
-        remote_requests[owner].push_back(uuid);
+      // Locality of Reference: Try local store even if we are not the primary owner.
+      std::string key = std::string(KeyBuilder::node_key(uuid));
+      auto buf = store_->get(key);
+      if (buf.size() > 0) {
+          node->hydrate(std::string(reinterpret_cast<const char*>(buf.data()), buf.size()));
+      } else {
+          lite3::NodeID owner = resolver_.get_node_owner(uuid);
+          if (owner != resolver_.get_local_node_id()) {
+            remote_requests[owner].push_back(uuid);
+          }
       }
     }
     result.push_back(node);
@@ -101,15 +143,15 @@ void Engine::put_node(std::string_view uuid, const std::string &json_payload) {
   
   if (owner != resolver_.get_local_node_id()) {
     try {
-        remote_client_.put_node_async(owner, std::string(uuid), json_payload).get();
+        remote_client_.put_node_async(owner, std::string(uuid), json_payload);
         return;
     } catch (const std::exception& e) {
         std::cerr << "[Engine::put_node] Remote RPC Failed: " << e.what() << "\n";
     }
   }
 
-  std::string_view key = KeyBuilder::node_key(uuid);
-  store_->put(std::string(key), json_payload);
+  std::string key = std::string(KeyBuilder::node_key(uuid));
+  store_->put(key, json_payload);
 }
 
 std::string Engine::format_weight(double weight) {

@@ -11,6 +11,9 @@
 #include "L3KVG/RemoteL3KVClient.hpp"
 #include "L3KVG/EdgeCoordinator.hpp"
 
+#include <list>
+#include <vector>
+
 namespace l3kv {
 class Engine;
 }
@@ -67,12 +70,23 @@ public:
   EdgeCoordinator& get_edge_coordinator() { return *edge_coordinator_; }
 
 private:
+  struct CacheShard {
+    std::mutex mutex;
+    std::unordered_map<std::string, std::shared_ptr<Node>> map;
+    std::list<std::string> lru;
+    static constexpr size_t MAX_SHARD_SIZE = 2000;
+  };
+
+  size_t get_cache_shard(std::string_view uuid);
+
   std::unique_ptr<l3kv::Engine> store_;
   ClusterResolver resolver_;
   RemoteL3KVClient remote_client_;
   std::unique_ptr<EdgeCoordinator> edge_coordinator_;
-  std::mutex cache_mutex_;
-  std::unordered_map<std::string, std::shared_ptr<Node>> node_cache_;
+  
+  std::vector<std::unique_ptr<CacheShard>> cache_shards_;
+  static constexpr size_t CACHE_SHARDS = 8;
+  
   SREMetrics metrics_;
 };
 

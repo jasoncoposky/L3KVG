@@ -1,0 +1,10 @@
+{
+  "address": "127.0.0.1",
+  "port": 8081,
+  "node_id": 1,
+  "db_path": "prod_l3kvg_db_1",
+  "peers": [
+    {"id": 2, "host": "127.0.0.1", "port": 8082},
+    {"id": 3, "host": "127.0.0.1", "port": 8083}
+  ]
+}

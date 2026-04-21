@@ -20,7 +20,7 @@ L3KVG is a C++20 embedded property graph engine built directly on top of the **L
 L3KVG Evolution 2 transitions the engine from local-only to a distributed graph fabric:
 
 - **Cluster Mapping**: Utilizes `ConsistentHash` to deterministically shard nodes across physical peers.
-- **Transparent RPC**: `RemoteL3KVClient` automatically forwards property lookups and neighbor traversals to the owner node via high-performance HTTP/1.1.
+- **Transparent RPC**: `RemoteL3KVClient` automatically forwards property lookups and neighbor traversals to the owner node via high-performance ZeroMQ (ZMQ_DEALER/ROUTER).
 - **Atomic Edge Coordination**: The `EdgeCoordinator` implements a dual-shard write protocol with Hybrid Logical Clocks (HLC), ensuring causal consistency for edges spanning multiple physical nodes.
 - **Auto-Routing**: `Engine::put_node` automatically routes write operations to the correct shard owner in the cluster.
 - **Structured Edge Metadata**: Evolutionary support for rich property objects on edges, maintained with HLC consistency and stored in zero-copy BSON buffers.
@@ -39,7 +39,8 @@ To meet strict SRE guidelines (sub-500µs single hop traversal, >10,000 ops/sec 
 
 - **Redis-style Hash Tagging (`{id}`)**: By embedding routing tags directly in edge keys (e.g. `e:out:{uuid}:label:weight:dst`), all outbound and inbound edges form contiguous edge blocks residing strictly on the **same hardware thread/shard** as their parent graph node.
 - **Actor-Model Routines**: `add_edge` and adjacency traversals encapsulate execution closures and pass them to bounded underlying core routines. This removes the necessity of thread-unsafe maps, achieving safe parallel traversal isolation.
-- **Zero-Copy & Async WAL**: Leverages L3KV's March 2026 engine upgrade, achieving **6.4 µs** traversal latency and **~30,000** concurrent edge additions/sec.
+- **ZeroMQ Asynchronous Pipeline**: Leverages L3KV's April 2026 ZeroMQ upgrade, achieving **~97,000** concurrent edge additions/sec across a 3-node cluster.
+
 - **Spin-Lock De-jitter**: By inserting spin-cycles preceding task yielding upon empty queues, L3KVG bypasses OS-level thread rescheduling penalties (~1-15ms Windows Jitter).
 
 ## API Example

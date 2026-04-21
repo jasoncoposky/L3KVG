@@ -1,7 +1,9 @@
 #include "L3KVG/Node.hpp"
 #include "L3KVG/Engine.hpp"
 #include "L3KVG/RemoteL3KVClient.hpp"
+#include "L3KVG/KeyBuilder.hpp"
 #include "engine/store.hpp"
+#include <iostream>
 
 namespace l3kvg {
 
@@ -17,7 +19,21 @@ void Node::ensure_loaded() {
     return;
 
   auto& resolver = engine_->get_resolver();
-  std::string_view key = KeyBuilder::node_key(uuid_);
+  std::string key = std::string(KeyBuilder::node_key(uuid_));
+
+  // Locality of Reference: Check local store first even if we are not the primary owner.
+  // L3KV replication may have placed a local copy here.
+  auto buf = engine_->get_store()->get(key);
+  if (buf.size() > 0) {
+      payload_ = std::move(buf);
+      if (payload_->get_type(0, "bloom") == lite3cpp::Type::Int64) {
+          bloom_filter_ = payload_->get_i64(0, "bloom");
+      } else {
+          bloom_filter_ = 0xFFFFFFFFFFFFFFFF;
+      }
+      loaded_.store(true, std::memory_order_release);
+      return;
+  }
 
   if (!resolver.is_local(uuid_)) {
       lite3::NodeID owner = resolver.get_node_owner(uuid_);
@@ -35,16 +51,6 @@ void Node::ensure_loaded() {
           }
       } catch (const std::exception& e) {
           std::cerr << "[Node::ensure_loaded] Remote Fetch Failed: " << e.what() << "\n";
-      }
-  } else {
-      auto buf = engine_->get_store()->get(std::string(key));
-      if (buf.size() > 0) {
-          payload_ = std::move(buf);
-          if (payload_->get_type(0, "bloom") == lite3cpp::Type::Int64) {
-              bloom_filter_ = payload_->get_i64(0, "bloom");
-          } else {
-              bloom_filter_ = 0xFFFFFFFFFFFFFFFF;
-          }
       }
   }
   loaded_.store(true, std::memory_order_release);
@@ -91,18 +97,6 @@ std::vector<std::string> Node::get_neighbors(std::string_view label,
     return {};
   }
 
-  auto& resolver = engine_->get_resolver();
-  if (!resolver.is_local(uuid_)) {
-    lite3::NodeID owner = resolver.get_node_owner(uuid_);
-    auto& client = engine_->get_remote_client();
-    try {
-      return client.get_neighbors_async(owner, uuid_, std::string(label), min_weight).get();
-    } catch (const std::exception& e) {
-      std::cerr << "[Node::get_neighbors] Remote RPC Failed: " << e.what() << "\n";
-      return {};
-    }
-  }
-
   std::vector<std::string> neighbors;
   std::string_view prefix = KeyBuilder::edge_prefix(uuid_, label);
   std::string_view min_w_str = KeyBuilder::format_weight(min_weight);
@@ -115,13 +109,29 @@ std::vector<std::string> Node::get_neighbors(std::string_view label,
   auto *store = engine_->get_store();
   size_t target_shard = store->get_routing_shard(std::string(prefix));
 
+  // Locality of Reference: Check local store first.
   auto chunk = store->get_prefix_keys(std::string(prefix), target_shard, start_key, 1000);
-  for (const auto &key : chunk) {
-    if (key.ends_with(":meta"))
-      continue;
-    size_t last_colon = key.find_last_of(':');
-    if (last_colon != std::string::npos) {
-      neighbors.push_back(key.substr(last_colon + 1));
+  if (!chunk.empty()) {
+      for (const auto &key : chunk) {
+          if (key.ends_with(":meta"))
+              continue;
+          size_t last_colon = key.find_last_of(':');
+          if (last_colon != std::string::npos) {
+              neighbors.push_back(key.substr(last_colon + 1));
+          }
+      }
+      return neighbors;
+  }
+
+  auto& resolver = engine_->get_resolver();
+  if (!resolver.is_local(uuid_)) {
+    lite3::NodeID owner = resolver.get_node_owner(uuid_);
+    auto& client = engine_->get_remote_client();
+    try {
+      return client.get_neighbors_async(owner, uuid_, std::string(label), min_weight).get();
+    } catch (const std::exception& e) {
+      std::cerr << "[Node::get_neighbors] Remote RPC Failed: " << e.what() << "\n";
+      return {};
     }
   }
   return neighbors;

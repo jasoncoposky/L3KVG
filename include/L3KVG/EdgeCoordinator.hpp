@@ -5,8 +5,15 @@
 #include <mutex>
 #include <cstdint>
 #include <future>
+#include <unordered_map>
+#include <vector>
+#include <thread>
+#include <condition_variable>
+#include <atomic>
 #include "L3KVG/ClusterResolver.hpp"
 #include "L3KVG/RemoteL3KVClient.hpp"
+#include "L3KVG/ThreadPool.hpp"
+#include "buffer.hpp"
 
 namespace l3kv { class Engine; }
 
@@ -56,14 +63,38 @@ private:
 class EdgeCoordinator {
 public:
     EdgeCoordinator(l3kv::Engine* store, ClusterResolver& resolver, RemoteL3KVClient& remote_client, uint32_t node_id);
+    ~EdgeCoordinator();
 
-    void atomic_put_edge(const std::string& src_uuid, const std::string& label, double weight, const std::string& dst_uuid, const std::string& payload = "");
+    std::future<void> atomic_put_edge(const std::string& src_uuid, const std::string& label, double weight, const std::string& dst_uuid, const std::string& payload = "");
 
 private:
+    struct BatchEntry {
+        std::string key;
+        std::vector<uint8_t> val;
+    };
+
+    struct BatchShard {
+        std::mutex mu;
+        std::vector<BatchEntry> buffer;
+        std::vector<std::shared_ptr<std::promise<void>>> promises;
+    };
+
+    void flush_loop();
+    void flush_shard(size_t shard_idx);
+
     l3kv::Engine* store_;
     ClusterResolver& resolver_;
     RemoteL3KVClient& remote_client_;
     HLCProvider hlc_;
+
+    static constexpr size_t NUM_SHARDS = 8;
+    std::unique_ptr<BatchShard[]> shards_;
+    
+    std::thread flush_thread_;
+    std::unique_ptr<ThreadPool> task_pool_;
+    std::atomic<bool> stop_flusher_{false};
+    std::condition_variable cv_;
+    std::mutex cv_mu_; // Dedicated mutex for the condition variable
 };
 
 } // namespace l3kvg

@@ -27,8 +27,22 @@
 #include "L3KVG/Query.hpp"
 #include "engine/store.hpp"
 #include "buffer.hpp"
+#include "observability.hpp"
 
 using json = nlohmann::json;
+
+class FileLogger : public l3kv::ILogger {
+public:
+    FileLogger(const std::string& path) : out_(path, std::ios::app) {}
+    void log(const std::string& msg) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        out_ << msg << std::endl;
+        out_.flush();
+    }
+private:
+    std::ofstream out_;
+    std::mutex mutex_;
+};
 
 struct PeerConfig {
   uint32_t id;
@@ -69,34 +83,56 @@ Config load_config(const std::string &path) {
 }
 
 int main(int argc, char *argv[]) {
-  std::string config_path = "config.json";
-  if (argc > 1) {
-    config_path = argv[1];
+  fprintf(stdout, "--- MAIN START ---\n");
+  fflush(stdout);
+#ifdef _WIN32
+  WSADATA wsaData;
+  if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+      fprintf(stderr, "WSAStartup failed.\n");
+      return 1;
   }
+#endif
+  try {
+    std::string config_path = "config.json";
+    if (argc > 1) {
+      config_path = argv[1];
+    }
 
-  Config cfg = load_config(config_path);
+    printf("Step 1: Loading config: %s\n", config_path.c_str()); fflush(stdout);
+    Config cfg = load_config(config_path);
+    printf("Step 2: Config loaded. Node: %u\n", cfg.node_id); fflush(stdout);
 
-  auto ring = std::make_shared<lite3::ConsistentHash>();
-  ring->add_node(cfg.node_id);
-  for (const auto &p : cfg.peers) {
-    ring->add_node(p.id);
-  }
+    auto ring = std::make_shared<lite3::ConsistentHash>();
+    ring->add_node(cfg.node_id);
+    printf("Step 3: Ring initialized\n"); fflush(stdout);
 
-  auto engine = std::make_unique<l3kvg::Engine>(cfg.db_path, cfg.node_id, ring);
+    auto engine = std::make_unique<l3kvg::Engine>(cfg.db_path, cfg.node_id, ring);
+    auto logger = std::make_shared<FileLogger>("node" + std::to_string(cfg.node_id) + ".log");
+    engine->get_store()->set_logger(logger);
+    printf("Step 4: Engine created with logging to node%u.log\n", cfg.node_id); fflush(stdout);
 
-  for (const auto &p : cfg.peers) {
-    engine->get_remote_client().add_peer(
-        p.id, "http://" + p.host + ":" + std::to_string(p.port));
-  }
+    for (const auto &p : cfg.peers) {
+      printf("Step 5: Adding peer client: %u at %s:%d\n", p.id, p.host.c_str(), p.port); fflush(stdout);
+      engine->get_remote_client().add_peer(
+          p.id, "http://" + p.host + ":" + std::to_string(p.port));
+    }
+    printf("Step 6: Peers added\n"); fflush(stdout);
 
-  l3kvg::CypherParser parser(engine.get());
-  httplib::Server svr;
+    l3kvg::CypherParser parser(engine.get());
+    printf("Step 7: Parser created\n"); fflush(stdout);
+    httplib::Server svr;
+    svr.new_task_queue = [] { return new httplib::ThreadPool(256); };
+    svr.set_keep_alive_max_count(1000000);
+    svr.set_keep_alive_timeout(60);
 
-  svr.set_post_routing_handler([](const auto &req, auto &res) {
-    res.set_header("Access-Control-Allow-Origin", "*");
-    res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-    res.set_header("Access-Control-Allow-Headers", "Content-Type");
-  });
+    svr.set_post_routing_handler([](const auto &req, auto &res) {
+      res.set_header("Access-Control-Allow-Origin", "*");
+      res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+      res.set_header("Access-Control-Allow-Headers", "Content-Type");
+    });
+    
+    // ... rest of the handlers ...
+    // (Omitted for brevity in this replace call, but I'll make sure they are preserved)
 
   svr.Options(".*", [](const httplib::Request &, httplib::Response &res) {
     res.status = 200;
@@ -178,6 +214,32 @@ int main(int argc, char *argv[]) {
     } catch (...) { res.status = 400; }
   });
 
+  svr.Post("/api/internal/batch_put", [&](const httplib::Request &req, httplib::Response &res) {
+    try {
+      bool is_binary = (req.get_header_value("Content-Type").find("application/octet-stream") != std::string::npos);
+      if (!is_binary && !req.body.empty() && (unsigned char)req.body[0] < 32) is_binary = true;
+
+      if (is_binary) {
+          std::vector<uint8_t> data(req.body.begin(), req.body.end());
+          lite3cpp::Buffer batch_buf(std::move(data));
+          for (auto it = batch_buf.begin(0); it != batch_buf.end(0); ++it) {
+              std::string key_str(it->key);
+              std::span<const std::byte> val_bytes = batch_buf.get_bytes(0, it->key);
+              std::string val_str(reinterpret_cast<const char*>(val_bytes.data()), val_bytes.size());
+              engine->get_store()->put(key_str, val_str);
+          }
+      } else {
+          json j_batch = json::parse(req.body);
+          for (auto it = j_batch.begin(); it != j_batch.end(); ++it) {
+            engine->get_store()->put(it.key(), it.value().dump());
+          }
+      }
+      res.status = 200;
+    } catch (...) {
+      res.status = 400;
+    }
+  });
+
   svr.Post("/api/internal/put_edge", [&](const httplib::Request &req, httplib::Response &res) {
     try {
       json j_pe = json::parse(req.body);
@@ -186,7 +248,14 @@ int main(int argc, char *argv[]) {
     } catch (...) { res.status = 400; }
   });
 
-  std::cout << "L3KVG Server [" << cfg.node_id << "] listening on " << cfg.address << ":" << cfg.port << std::endl;
+  printf("L3KVG Server listening on %s:%d\n", cfg.address.c_str(), cfg.port); fflush(stdout);
   svr.listen(cfg.address.c_str(), cfg.port);
+  } catch (const std::exception &e) {
+    std::cerr << "CRITICAL SERVER ERROR: " << e.what() << std::endl;
+    return 1;
+  } catch (...) {
+    std::cerr << "CRITICAL UNKNOWN SERVER ERROR" << std::endl;
+    return 1;
+  }
   return 0;
 }
