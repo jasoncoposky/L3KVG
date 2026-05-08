@@ -1,5 +1,9 @@
+#ifdef _WIN32
 #include <winsock2.h>
+#endif
+#ifdef _WIN32
 #include <ws2tcpip.h>
+#endif
 #include <iostream>
 #include <fstream>
 #include <memory>
@@ -73,8 +77,10 @@ Config load_config(const std::string &path) {
 
 int main(int argc, char *argv[]) {
     std::cout << "DEBUG START\n" << std::flush;
+#ifdef _WIN32
     WSADATA wsaData;
     WSAStartup(MAKEWORD(2, 2), &wsaData);
+#endif
 
     try {
         std::string path = (argc > 1) ? argv[1] : "../../config1.json";
@@ -102,6 +108,8 @@ int main(int argc, char *argv[]) {
     } catch (const std::exception& e) {
         std::cout << "ERROR: " << e.what() << "\n" << std::flush;
     }
+#ifdef _WIN32
     WSACleanup();
+#endif
     return 0;
 }

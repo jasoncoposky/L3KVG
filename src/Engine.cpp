@@ -138,12 +138,12 @@ std::vector<std::shared_ptr<Node>> Engine::fetch_nodes(const std::vector<std::st
   return result;
 }
 
-void Engine::put_node(std::string_view uuid, const std::string &json_payload) {
-  lite3::NodeID owner = resolver_.get_node_owner(std::string(uuid));
+void Engine::put_node(std::string uuid, std::string payload) {
+  lite3::NodeID owner = resolver_.get_node_owner(uuid);
   
   if (owner != resolver_.get_local_node_id()) {
     try {
-        remote_client_.put_node_async(owner, std::string(uuid), json_payload);
+        remote_client_.put_node_async(owner, uuid, payload);
         return;
     } catch (const std::exception& e) {
         std::cerr << "[Engine::put_node] Remote RPC Failed: " << e.what() << "\n";
@@ -151,17 +151,17 @@ void Engine::put_node(std::string_view uuid, const std::string &json_payload) {
   }
 
   std::string key = std::string(KeyBuilder::node_key(uuid));
-  store_->put(key, json_payload);
+  store_->put(std::move(key), std::move(payload));
 }
 
 std::string Engine::format_weight(double weight) {
   return std::string(KeyBuilder::format_weight(weight));
 }
 
-void Engine::add_edge(std::string_view src_uuid, std::string_view label,
-                      double weight, std::string_view dst_uuid,
-                      const std::string &payload) {
-  edge_coordinator_->atomic_put_edge(std::string(src_uuid), std::string(label), weight, std::string(dst_uuid), payload);
+void Engine::add_edge(std::string src_uuid, std::string label,
+                      double weight, std::string dst_uuid,
+                      std::string payload) {
+  edge_coordinator_->atomic_put_edge(std::move(src_uuid), std::move(label), weight, std::move(dst_uuid), std::move(payload));
 }
 
 } // namespace l3kvg

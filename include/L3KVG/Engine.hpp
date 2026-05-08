@@ -48,13 +48,13 @@ public:
 
   std::shared_ptr<Node> get_node(std::string_view uuid);
   std::vector<std::shared_ptr<Node>> fetch_nodes(const std::vector<std::string>& uuids);
-  void put_node(std::string_view uuid, const std::string &json_payload);
+  void put_node(std::string uuid, std::string payload);
 
   static std::string format_weight(double weight);
 
-  void add_edge(std::string_view src_uuid, std::string_view label,
-                double weight, std::string_view dst_uuid, 
-                const std::string &payload = "");
+  void add_edge(std::string src_uuid, std::string label,
+                double weight, std::string dst_uuid, 
+                std::string payload = "");
 
   // Mechanical Sympathy & HPC APIs
   SREMetrics &get_metrics() { return metrics_; }

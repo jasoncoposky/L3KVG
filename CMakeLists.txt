@@ -35,8 +35,8 @@ target_link_libraries(l3kvg_engine PUBLIC
     lite3-cpp
     libzmq
     cppzmq
-    ws2_32
-    iphlpapi
+    $<$<BOOL:${WIN32}>:ws2_32>
+    $<$<BOOL:${WIN32}>:iphlpapi>
 )
 
 
@@ -61,16 +61,16 @@ add_executable(test_cluster_resolver tests/test_cluster_resolver.cpp)
 target_link_libraries(test_cluster_resolver PRIVATE l3kvg_engine gtest_main Threads::Threads)
 
 add_executable(test_remote_client tests/test_remote_client.cpp)
-target_link_libraries(test_remote_client PRIVATE l3kvg_engine gtest_main Threads::Threads ws2_32)
+target_link_libraries(test_remote_client PRIVATE l3kvg_engine gtest_main Threads::Threads $<$<BOOL:${WIN32}>:ws2_32>)
 
 add_executable(test_edge_coordinator tests/test_edge_coordinator.cpp)
-target_link_libraries(test_edge_coordinator PRIVATE l3kvg_engine gtest_main Threads::Threads ws2_32)
+target_link_libraries(test_edge_coordinator PRIVATE l3kvg_engine gtest_main Threads::Threads $<$<BOOL:${WIN32}>:ws2_32>)
 
 add_executable(test_async_traversal tests/test_async_traversal.cpp)
-target_link_libraries(test_async_traversal PRIVATE l3kvg_engine gtest_main Threads::Threads ws2_32)
+target_link_libraries(test_async_traversal PRIVATE l3kvg_engine gtest_main Threads::Threads $<$<BOOL:${WIN32}>:ws2_32>)
 
 add_executable(test_edge_properties tests/test_edge_properties.cpp)
-target_link_libraries(test_edge_properties PRIVATE l3kvg_engine gtest_main Threads::Threads ws2_32)
+target_link_libraries(test_edge_properties PRIVATE l3kvg_engine gtest_main Threads::Threads $<$<BOOL:${WIN32}>:ws2_32>)
 
 add_test(NAME test_engine COMMAND test_l3kvg)
 add_test(NAME test_fluent COMMAND test_fluent_api)
@@ -82,16 +82,16 @@ add_test(NAME test_async COMMAND test_async_traversal)
 add_test(NAME test_edge_props COMMAND test_edge_properties)
 
 add_executable(l3kvg_server src/server/main.cpp)
-target_link_libraries(l3kvg_server PRIVATE l3kvg_engine Threads::Threads ws2_32 wsock32 crypt32)
+target_link_libraries(l3kvg_server PRIVATE l3kvg_engine Threads::Threads $<$<BOOL:${WIN32}>:ws2_32> $<$<BOOL:${WIN32}>:wsock32> $<$<BOOL:${WIN32}>:crypt32>)
 
 add_executable(dbg_server src/server/dbg_server.cpp)
-target_link_libraries(dbg_server PRIVATE l3kvg_engine Threads::Threads ws2_32 wsock32 crypt32)
+target_link_libraries(dbg_server PRIVATE l3kvg_engine Threads::Threads $<$<BOOL:${WIN32}>:ws2_32> $<$<BOOL:${WIN32}>:wsock32> $<$<BOOL:${WIN32}>:crypt32>)
 
 add_executable(bench_l3kvg tests/bench_l3kvg.cpp)
 target_link_libraries(bench_l3kvg PRIVATE l3kvg_engine Threads::Threads)
 
 add_executable(bench_distributed tests/bench_distributed.cpp)
-target_link_libraries(bench_distributed PRIVATE l3kvg_engine Threads::Threads ws2_32 wsock32 crypt32)
+target_link_libraries(bench_distributed PRIVATE l3kvg_engine Threads::Threads $<$<BOOL:${WIN32}>:ws2_32> $<$<BOOL:${WIN32}>:wsock32> $<$<BOOL:${WIN32}>:crypt32>)
 
 add_executable(bench_unified tests/bench_unified.cpp)
-target_link_libraries(bench_unified PRIVATE l3kvg_engine Threads::Threads ws2_32 wsock32 crypt32)
+target_link_libraries(bench_unified PRIVATE l3kvg_engine Threads::Threads $<$<BOOL:${WIN32}>:ws2_32> $<$<BOOL:${WIN32}>:wsock32> $<$<BOOL:${WIN32}>:crypt32>)

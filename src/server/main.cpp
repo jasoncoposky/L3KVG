@@ -5,9 +5,15 @@
 #define NOMINMAX
 #endif
 
+#ifdef _WIN32
 #include <winsock2.h>
+#endif
+#ifdef _WIN32
 #include <ws2tcpip.h>
+#endif
+#ifdef _WIN32
 #include <BaseTsd.h>
+#endif
 
 #include <chrono>
 #include <filesystem>

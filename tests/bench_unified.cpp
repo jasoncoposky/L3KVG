@@ -5,9 +5,15 @@
 #define _WIN32_WINNT 0x0A00
 #endif
 
+#ifdef _WIN32
 #include <winsock2.h>
+#endif
+#ifdef _WIN32
 #include <ws2tcpip.h>
+#endif
+#ifdef _WIN32
 #include <BaseTsd.h>
+#endif
 
 #include <string>
 #include <vector>
