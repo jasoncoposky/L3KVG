@@ -89,7 +89,8 @@ public:
   InEdgeBuilder in(std::string_view edge_label);
 
   // Projection
-  Query &return_(std::string_view alias, std::string_view property);
+  enum class AggOp { None, Count, Sum, Avg, Min, Max };
+  Query &return_(std::string_view alias, std::string_view property, AggOp agg = AggOp::None);
 
   // Execution
   struct ResultRow {
@@ -125,6 +126,7 @@ private:
   struct ReturnStep {
     std::string alias;
     std::string property;
+    AggOp agg = AggOp::None;
   };
 
   std::optional<MatchStep> initial_match_;

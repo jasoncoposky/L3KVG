@@ -178,8 +178,8 @@ Query &Query::InEdgeBuilder::as(std::string_view dest_alias) {
   return q_;
 }
 
-Query &Query::return_(std::string_view alias, std::string_view property) {
-  projections_.push_back({std::string(alias), std::string(property)});
+Query &Query::return_(std::string_view alias, std::string_view property, AggOp agg) {
+  projections_.push_back({std::string(alias), std::string(property), agg});
   return *this;
 }
 
@@ -386,6 +386,60 @@ std::vector<Query::ResultRow> Query::execute() {
         // Re-throw to be caught by execute_query
         throw;
     }
+  }
+
+  // 4. Aggregation Post-Processing
+  bool has_aggregates = false;
+  for (const auto& p : projections_) if (p.agg != AggOp::None) { has_aggregates = true; break; }
+
+  if (has_aggregates && !results.empty()) {
+      ResultRow agg_row;
+      for (size_t col_idx = 0; col_idx < projections_.size(); ++col_idx) {
+          const auto& p = projections_[col_idx];
+          std::string col_key = std::to_string(col_idx);
+          
+          if (p.agg == AggOp::None) {
+              agg_row.fields[col_key] = results[0].fields.at(col_key);
+          } else if (p.agg == AggOp::Count) {
+              agg_row.fallback_strings.push_back(std::to_string(results.size()));
+              agg_row.fields[col_key] = agg_row.fallback_strings.back();
+          } else {
+              double val = 0;
+              bool first = true;
+              for (const auto& row : results) {
+                  double row_val = 0;
+                  try { row_val = std::stod(std::string(row.fields.at(col_key))); } catch(...) {}
+                  
+                  if (first) {
+                      val = row_val;
+                      first = false;
+                  } else {
+                      if (p.agg == AggOp::Sum || p.agg == AggOp::Avg) val += row_val;
+                      else if (p.agg == AggOp::Min) val = std::min(val, row_val);
+                      else if (p.agg == AggOp::Max) val = std::max(val, row_val);
+                  }
+              }
+              if (p.agg == AggOp::Avg) val /= results.size();
+              
+              std::stringstream ss;
+              if (val == (long long)val) ss << (long long)val;
+              else ss << std::fixed << std::setprecision(2) << val;
+              agg_row.fallback_strings.push_back(ss.str());
+              agg_row.fields[col_key] = agg_row.fallback_strings.back();
+          }
+      }
+      return {std::move(agg_row)};
+  } else if (has_aggregates && results.empty()) {
+      ResultRow agg_row;
+      for (size_t col_idx = 0; col_idx < projections_.size(); ++col_idx) {
+          if (projections_[col_idx].agg == AggOp::Count) {
+              agg_row.fallback_strings.push_back("0");
+              agg_row.fields[std::to_string(col_idx)] = agg_row.fallback_strings.back();
+          } else {
+              agg_row.fields[std::to_string(col_idx)] = "";
+          }
+      }
+      return {std::move(agg_row)};
   }
 
   return results;
