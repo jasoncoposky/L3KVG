@@ -183,6 +183,21 @@ Query &Query::return_(std::string_view alias, std::string_view property, AggOp a
   return *this;
 }
 
+Query &Query::order_by(std::string_view alias, std::string_view property, bool ascending) {
+    sorts_.push_back({std::string(alias), std::string(property), ascending});
+    return *this;
+}
+
+Query &Query::limit(size_t limit) {
+    limit_ = limit;
+    return *this;
+}
+
+Query &Query::offset(size_t offset) {
+    offset_ = offset;
+    return *this;
+}
+
 static const Query::Filter* find_first_eq_filter(const Query::FilterGroup& g, std::string_view alias, std::string_view key = "") {
     for (const auto& n : g.nodes) {
         if (auto* f = std::get_if<Query::Filter>(&n.node)) {
@@ -440,6 +455,45 @@ std::vector<Query::ResultRow> Query::execute() {
           }
       }
       return {std::move(agg_row)};
+  }
+
+  // 5. Sorting
+  if (!sorts_.empty() && !has_aggregates) {
+      std::sort(results.begin(), results.end(), [&](const ResultRow& a, const ResultRow& b) {
+          for (const auto& s : sorts_) {
+              std::string key = s.alias + "." + s.property;
+              auto it_a = a.fields.find(key);
+              auto it_b = b.fields.find(key);
+              if (it_a == a.fields.end() || it_b == b.fields.end()) continue;
+              
+              if (it_a->second == it_b->second) continue;
+              
+              // Try numeric sort
+              try {
+                  double d_a = std::stod(std::string(it_a->second));
+                  double d_b = std::stod(std::string(it_b->second));
+                  if (s.ascending) return d_a < d_b;
+                  return d_a > d_b;
+              } catch(...) {
+                  if (s.ascending) return it_a->second < it_b->second;
+                  return it_a->second > it_b->second;
+              }
+          }
+          return false;
+      });
+  }
+
+  // 6. Pagination (Slicing)
+  if (offset_.has_value() || limit_.has_value()) {
+      size_t start = offset_.value_or(0);
+      if (start >= results.size()) return {};
+      
+      size_t end = results.size();
+      if (limit_.has_value()) end = std::min(end, start + limit_.value());
+      
+      std::vector<ResultRow> sliced;
+      for (size_t i = start; i < end; ++i) sliced.push_back(std::move(results[i]));
+      return sliced;
   }
 
   return results;

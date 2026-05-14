@@ -92,6 +92,11 @@ public:
   enum class AggOp { None, Count, Sum, Avg, Min, Max };
   Query &return_(std::string_view alias, std::string_view property, AggOp agg = AggOp::None);
 
+  // Sorting & Pagination
+  Query &order_by(std::string_view alias, std::string_view property, bool ascending = true);
+  Query &limit(size_t limit);
+  Query &offset(size_t offset);
+
   // Execution
   struct ResultRow {
     std::unordered_map<std::string, std::string_view> fields;
@@ -128,12 +133,20 @@ private:
     std::string property;
     AggOp agg = AggOp::None;
   };
+  struct SortStep {
+    std::string alias;
+    std::string property;
+    bool ascending = true;
+  };
 
   std::optional<MatchStep> initial_match_;
   std::vector<Step> steps_;
   FilterGroup root_filters_;
   std::vector<FilterHas> filters_has_;
   std::vector<ReturnStep> projections_;
+  std::vector<SortStep> sorts_;
+  std::optional<size_t> limit_;
+  std::optional<size_t> offset_;
 };
 
 } // namespace l3kvg
