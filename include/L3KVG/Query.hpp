@@ -52,6 +52,8 @@ public:
   Query &where_group(std::function<void(FilterGroup&)> cb);
   Query &or_where_group(std::function<void(FilterGroup&)> cb);
 
+  FilterGroup& get_root_filters() { return root_filters_; }
+
   Query &where_has(std::string_view alias, std::string_view key,
                    std::string_view value_type);
 
