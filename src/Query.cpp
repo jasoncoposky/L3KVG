@@ -386,6 +386,27 @@ std::vector<Query::ResultRow> Query::execute() {
                     row.fields[std::to_string(col_idx)] = view;
                 }
             }
+            
+            // Also populate for Sorts if not already present
+            for (const auto& s : sorts_) {
+                if (s.alias == alias) {
+                    std::string key = alias + "." + s.property;
+                    if (row.fields.find(key) == row.fields.end()) {
+                        std::string_view view = "";
+                        try { view = node->get_attribute_view(s.property); } catch(...) {}
+                        if (view.empty()) {
+                            try {
+                                std::string val = node->get_attribute_as_string(s.property);
+                                if (!val.empty()) {
+                                    row.fallback_strings.push_back(std::move(val));
+                                    view = row.fallback_strings.back();
+                                }
+                            } catch (...) {}
+                        }
+                        row.fields[key] = view;
+                    }
+                }
+            }
         }
         
         // Ensure every projection has at least an empty entry to avoid "Key not found"
