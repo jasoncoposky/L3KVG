@@ -78,16 +78,84 @@ Query &Query::match(std::string_view node_alias) {
   return *this;
 }
 
-Query &Query::where_has(std::string_view alias, std::string_view key,
-                        std::string_view value_type) {
-  filters_has_.push_back(
-      {std::string(alias), std::string(key), std::string(value_type)});
-  return *this;
+Query::FilterGroup& Query::FilterGroup::where(std::string_view alias, std::string_view key, Query::Op op, std::string_view value) {
+    nodes.push_back({Query::Filter{std::string(alias), std::string(key), op, std::string(value)}, Query::LogicalOp::And});
+    return *this;
+}
+
+Query::FilterGroup& Query::FilterGroup::or_where(std::string_view alias, std::string_view key, Query::Op op, std::string_view value) {
+    nodes.push_back({Query::Filter{std::string(alias), std::string(key), op, std::string(value)}, Query::LogicalOp::Or});
+    return *this;
+}
+
+Query::FilterGroup& Query::FilterGroup::where_group(std::function<void(FilterGroup&)> cb) {
+    auto group = std::make_shared<FilterGroup>();
+    cb(*group);
+    nodes.push_back({group, Query::LogicalOp::And});
+    return *this;
+}
+
+Query::FilterGroup& Query::FilterGroup::or_where_group(std::function<void(FilterGroup&)> cb) {
+    auto group = std::make_shared<FilterGroup>();
+    cb(*group);
+    nodes.push_back({group, Query::LogicalOp::Or});
+    return *this;
 }
 
 Query &Query::where(std::string_view alias, std::string_view key, Op op,
                     std::string_view value) {
-  filters_.push_back({std::string(alias), std::string(key), op, std::string(value)});
+  root_filters_.where(alias, key, op, value);
+  return *this;
+}
+
+Query &Query::or_where(std::string_view alias, std::string_view key, Op op,
+                       std::string_view value) {
+  root_filters_.or_where(alias, key, op, value);
+  return *this;
+}
+
+Query &Query::where_group(std::function<void(FilterGroup&)> cb) {
+  root_filters_.where_group(cb);
+  return *this;
+}
+
+Query &Query::or_where_group(std::function<void(FilterGroup&)> cb) {
+  root_filters_.or_where_group(cb);
+  return *this;
+}
+
+static bool evaluate_group(const Query::FilterGroup& g, const std::unordered_map<std::string, std::shared_ptr<Node>>& available_nodes, std::string_view current_alias) {
+    if (g.nodes.empty()) return true;
+    
+    bool result = true;
+    for (const auto& n : g.nodes) {
+        bool val = std::visit(overloaded{
+            [&](const Query::Filter& f) {
+                auto it = available_nodes.find(f.alias);
+                if (it != available_nodes.end()) {
+                    return evaluate_filter(it->second.get(), f);
+                }
+                return true; 
+            },
+            [&](const std::shared_ptr<Query::FilterGroup>& sub) {
+                return evaluate_group(*sub, available_nodes, current_alias);
+            }
+        }, n.node);
+        
+        if (n.prepended_op == Query::LogicalOp::And) {
+            if (&n == &g.nodes.front()) result = val;
+            else result = result && val;
+        } else {
+            result = result || val;
+        }
+    }
+    return result;
+}
+
+Query &Query::where_has(std::string_view alias, std::string_view key,
+                        std::string_view value_type) {
+  filters_has_.push_back(
+      {std::string(alias), std::string(key), std::string(value_type)});
   return *this;
 }
 
@@ -115,6 +183,19 @@ Query &Query::return_(std::string_view alias, std::string_view property) {
   return *this;
 }
 
+static const Query::Filter* find_first_eq_filter(const Query::FilterGroup& g, std::string_view alias, std::string_view key = "") {
+    for (const auto& n : g.nodes) {
+        if (auto* f = std::get_if<Query::Filter>(&n.node)) {
+            if (f->alias == alias && f->op == Query::Op::Eq && (key.empty() || f->key == key)) {
+                return f;
+            }
+        } else if (auto* sub = std::get_if<std::shared_ptr<Query::FilterGroup>>(&n.node)) {
+            if (auto* res = find_first_eq_filter(**sub, alias, key)) return res;
+        }
+    }
+    return nullptr;
+}
+
 std::vector<Query::ResultRow> Query::execute() {
   std::vector<ResultRow> results;
   if (!initial_match_)
@@ -123,28 +204,28 @@ std::vector<Query::ResultRow> Query::execute() {
   std::vector<std::string> frontier;
 
   // Naive index lookup: requires `id` exact match on the root node
-  for (const auto &f : filters_) {
-    if (f.alias == initial_match_->alias && f.key == "id" && f.op == Op::Eq) {
-      L3_LOG(LOG_DEBUG, "L3KVG: Query - ID lookup for [%s]: %s", f.alias.c_str(), f.value.c_str());
-      frontier.push_back(f.value);
-      break;
-    }
+  if (auto* f = find_first_eq_filter(root_filters_, initial_match_->alias, "id")) {
+      L3_LOG(LOG_DEBUG, "L3KVG: Query - ID lookup for [%s]: %s", f->alias.c_str(), f->value.c_str());
+      frontier.push_back(f->value);
   }
 
   if (frontier.empty()) {
     // Try secondary index lookup if available (Only for Equality)
-    for (const auto &f : filters_) {
-      if (f.alias == initial_match_->alias && f.op == Op::Eq) {
-        std::string idx_key = "idx:" + f.alias + ":" + f.key + ":" + f.value;
-        L3_LOG(LOG_DEBUG, "L3KVG: Query - Secondary Index lookup: %s", idx_key.c_str());
-        auto idx_node = engine_->get_node(idx_key);
-        if (idx_node && idx_node->has_attribute("id")) {
-          std::string target_id = idx_node->get_attribute_as_string("id");
-          L3_LOG(LOG_DEBUG, "L3KVG: Query - Resolved index to ID: %s", target_id.c_str());
-          frontier.push_back(target_id);
-          break;
+    // We search the tree for ANY equality filter on the initial alias
+    for (const auto &n : root_filters_.nodes) {
+        if (auto* f = std::get_if<Filter>(&n.node)) {
+            if (f->alias == initial_match_->alias && f->op == Op::Eq) {
+                std::string idx_key = "idx:" + f->alias + ":" + f->key + ":" + f->value;
+                L3_LOG(LOG_DEBUG, "L3KVG: Query - Secondary Index lookup: %s", idx_key.c_str());
+                auto idx_node = engine_->get_node(idx_key);
+                if (idx_node && idx_node->has_attribute("id")) {
+                    std::string target_id = idx_node->get_attribute_as_string("id");
+                    L3_LOG(LOG_DEBUG, "L3KVG: Query - Resolved index to ID: %s", target_id.c_str());
+                    frontier.push_back(target_id);
+                    break;
+                }
+            }
         }
-      }
     }
   }
 
@@ -176,19 +257,15 @@ std::vector<Query::ResultRow> Query::execute() {
       for (const auto& uuid : frontier) {
           auto node = engine_->get_node(uuid);
           if (!node) continue;
-          bool all_pass = true;
-          for (const auto& f : filters_) {
-              if (f.alias == initial_match_->alias) {
-                  bool pass = evaluate_filter(node.get(), f);
-                  L3_LOG(LOG_DEBUG, "L3KVG: Query - Alias [%s] Filter [%s %d %s] on node [%s] results in: %s", 
-                         f.alias.c_str(), f.key.c_str(), (int)f.op, f.value.c_str(), uuid.c_str(), pass ? "PASS" : "FAIL");
-                  if (!pass) {
-                      all_pass = false;
-                      break;
-                  }
-              }
-          }
-          if (all_pass) filtered.push_back(uuid);
+          
+          std::unordered_map<std::string, std::shared_ptr<Node>> available;
+          available[initial_match_->alias] = node;
+          
+          bool pass = evaluate_group(root_filters_, available, initial_match_->alias);
+          L3_LOG(LOG_DEBUG, "L3KVG: Query - Alias [%s] Filter evaluation on node [%s] results in: %s", 
+                 initial_match_->alias.c_str(), uuid.c_str(), pass ? "PASS" : "FAIL");
+          
+          if (pass) filtered.push_back(uuid);
       }
       frontier = std::move(filtered);
   }
@@ -197,13 +274,13 @@ std::vector<Query::ResultRow> Query::execute() {
   
   // Process linear traversals and keep track of aliases
   struct Path {
-      std::unordered_map<std::string, std::string> alias_to_uuid;
+      std::unordered_map<std::string, std::shared_ptr<Node>> alias_to_node;
       std::string last_alias;
   };
   std::vector<Path> paths;
   for (const auto& uuid : frontier) {
       Path p;
-      p.alias_to_uuid[initial_match_->alias] = uuid;
+      p.alias_to_node[initial_match_->alias] = engine_->get_node(uuid);
       p.last_alias = initial_match_->alias;
       paths.push_back(std::move(p));
   }
@@ -214,11 +291,10 @@ std::vector<Query::ResultRow> Query::execute() {
     std::visit(overloaded{
         [&](const OutStep& s) {
             for (const auto &path : paths) {
-                auto it = path.alias_to_uuid.find(path.last_alias);
-                if (it == path.alias_to_uuid.end()) continue;
+                auto it = path.alias_to_node.find(path.last_alias);
+                if (it == path.alias_to_node.end()) continue;
 
-                auto node = engine_->get_node(it->second);
-                auto neighbors = node->get_neighbors(s.label, s.min_weight);
+                auto neighbors = it->second->get_neighbors(s.label, s.min_weight);
                 
                 L3_LOG(LOG_DEBUG, "L3KVG: Query - Traversal [%s] -> [%s] found %zu neighbors", 
                        path.last_alias.c_str(), s.target_alias.c_str(), neighbors.size());
@@ -227,19 +303,11 @@ std::vector<Query::ResultRow> Query::execute() {
                     auto neighbor_node = engine_->get_node(neighbor_uuid);
                     if (!neighbor_node) continue;
                     
-                    bool all_pass = true;
-                    for (const auto& f : filters_) {
-                        if (f.alias == s.target_alias) {
-                            if (!evaluate_filter(neighbor_node.get(), f)) {
-                                all_pass = false;
-                                break;
-                            }
-                        }
-                    }
-                    if (all_pass) {
-                        Path new_path = path;
-                        new_path.alias_to_uuid[s.target_alias] = neighbor_uuid; 
-                        new_path.last_alias = s.target_alias;
+                    Path new_path = path;
+                    new_path.alias_to_node[s.target_alias] = neighbor_node; 
+                    new_path.last_alias = s.target_alias;
+                    
+                    if (evaluate_group(root_filters_, new_path.alias_to_node, s.target_alias)) {
                         next_paths.push_back(std::move(new_path));
                     }
                 }
@@ -247,29 +315,20 @@ std::vector<Query::ResultRow> Query::execute() {
         },
         [&](const InStep& s) {
             for (const auto &path : paths) {
-                auto it = path.alias_to_uuid.find(path.last_alias);
-                if (it == path.alias_to_uuid.end()) continue;
+                auto it = path.alias_to_node.find(path.last_alias);
+                if (it == path.alias_to_node.end()) continue;
 
-                auto node = engine_->get_node(it->second);
-                auto neighbors = node->get_in_neighbors(s.label);
+                auto neighbors = it->second->get_in_neighbors(s.label);
 
                 for (const auto& neighbor_uuid : neighbors) {
                     auto neighbor_node = engine_->get_node(neighbor_uuid);
                     if (!neighbor_node) continue;
 
-                    bool all_pass = true;
-                    for (const auto& f : filters_) {
-                        if (f.alias == s.target_alias) {
-                            if (!evaluate_filter(neighbor_node.get(), f)) {
-                                all_pass = false;
-                                break;
-                            }
-                        }
-                    }
-                    if (all_pass) {
-                        Path new_path = path;
-                        new_path.alias_to_uuid[s.target_alias] = neighbor_uuid; 
-                        new_path.last_alias = s.target_alias;
+                    Path new_path = path;
+                    new_path.alias_to_node[s.target_alias] = neighbor_node; 
+                    new_path.last_alias = s.target_alias;
+                    
+                    if (evaluate_group(root_filters_, new_path.alias_to_node, s.target_alias)) {
                         next_paths.push_back(std::move(new_path));
                     }
                 }
@@ -285,9 +344,7 @@ std::vector<Query::ResultRow> Query::execute() {
     try {
         ResultRow row;
         // Pre-populate fields for all aliases in the path
-        for (const auto& [alias, uuid] : path.alias_to_uuid) {
-            auto node = engine_->get_node(uuid);
-            if (!node) continue;
+        for (const auto& [alias, node] : path.alias_to_node) {
             row.nodes.push_back(node);
             
             // Find all projections for THIS alias and populate them

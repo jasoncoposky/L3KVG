@@ -22,6 +22,7 @@ public:
 
   // Filters
   enum class Op { Eq, Ne, Gt, Ge, Lt, Le, Like };
+  enum class LogicalOp { And, Or };
 
   struct Filter {
     std::string alias;
@@ -30,7 +31,26 @@ public:
     std::string value;
   };
 
+  struct FilterGroup;
+
+  struct FilterNode {
+    std::variant<Filter, std::shared_ptr<FilterGroup>> node;
+    LogicalOp prepended_op = LogicalOp::And;
+  };
+
+  struct FilterGroup {
+    std::vector<FilterNode> nodes;
+
+    FilterGroup& where(std::string_view alias, std::string_view key, Op op, std::string_view value);
+    FilterGroup& or_where(std::string_view alias, std::string_view key, Op op, std::string_view value);
+    FilterGroup& where_group(std::function<void(FilterGroup&)> cb);
+    FilterGroup& or_where_group(std::function<void(FilterGroup&)> cb);
+  };
+
   Query &where(std::string_view alias, std::string_view key, Op op, std::string_view value);
+  Query &or_where(std::string_view alias, std::string_view key, Op op, std::string_view value);
+  Query &where_group(std::function<void(FilterGroup&)> cb);
+  Query &or_where_group(std::function<void(FilterGroup&)> cb);
 
   Query &where_has(std::string_view alias, std::string_view key,
                    std::string_view value_type);
@@ -107,7 +127,7 @@ private:
 
   std::optional<MatchStep> initial_match_;
   std::vector<Step> steps_;
-  std::vector<Filter> filters_;
+  FilterGroup root_filters_;
   std::vector<FilterHas> filters_has_;
   std::vector<ReturnStep> projections_;
 };
