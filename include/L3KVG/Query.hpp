@@ -97,6 +97,9 @@ public:
   Query &limit(size_t limit);
   Query &offset(size_t offset);
 
+  // Grouping
+  Query &group_by(std::string_view alias, std::string_view property);
+
   // Execution
   struct ResultRow {
     std::unordered_map<std::string, std::string_view> fields;
@@ -138,6 +141,10 @@ private:
     std::string property;
     bool ascending = true;
   };
+  struct GroupStep {
+    std::string alias;
+    std::string property;
+  };
 
   std::optional<MatchStep> initial_match_;
   std::vector<Step> steps_;
@@ -145,6 +152,7 @@ private:
   std::vector<FilterHas> filters_has_;
   std::vector<ReturnStep> projections_;
   std::vector<SortStep> sorts_;
+  std::vector<GroupStep> groups_;
   std::optional<size_t> limit_;
   std::optional<size_t> offset_;
 };

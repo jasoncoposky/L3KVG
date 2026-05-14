@@ -5,6 +5,7 @@
 #include <variant>
 #include <regex>
 #include <iostream>
+#include <iomanip>
 
 #ifdef IRODS_SERVER
 #include "irods/rodsLog.h"
@@ -198,6 +199,11 @@ Query &Query::offset(size_t offset) {
     return *this;
 }
 
+Query &Query::group_by(std::string_view alias, std::string_view property) {
+    groups_.push_back({std::string(alias), std::string(property)});
+    return *this;
+}
+
 static const Query::Filter* find_first_eq_filter(const Query::FilterGroup& g, std::string_view alias, std::string_view key = "") {
     for (const auto& n : g.nodes) {
         if (auto* f = std::get_if<Query::Filter>(&n.node)) {
@@ -226,7 +232,6 @@ std::vector<Query::ResultRow> Query::execute() {
 
   if (frontier.empty()) {
     // Try secondary index lookup if available (Only for Equality)
-    // We search the tree for ANY equality filter on the initial alias
     for (const auto &n : root_filters_.nodes) {
         if (auto* f = std::get_if<Filter>(&n.node)) {
             if (f->alias == initial_match_->alias && f->op == Op::Eq) {
@@ -249,10 +254,8 @@ std::vector<Query::ResultRow> Query::execute() {
     std::string inner_prefix = "idx:" + initial_match_->alias + ":id:";
     std::string store_prefix = "n:{" + inner_prefix; 
     L3_LOG(LOG_DEBUG, "L3KVG: Query - Falling back to prefix scan for [%s] using prefix [%s]", initial_match_->alias.c_str(), store_prefix.c_str());
-    // We scan the id index prefix which should exist for major types
     auto keys = engine_->get_store()->get_prefix_keys_all_shards(store_prefix, "", 1000);
     for (const auto& k : keys) {
-        // k is n:{uuid}
         std::string uuid = k.substr(3, k.size() - 4);
         auto idx_node = engine_->get_node(uuid);
         if (idx_node && idx_node->has_attribute("id")) {
@@ -268,7 +271,6 @@ std::vector<Query::ResultRow> Query::execute() {
   // Filter the initial frontier
   {
       std::vector<std::string> filtered;
-      L3_LOG(LOG_DEBUG, "L3KVG: Query - Filtering initial frontier of size %zu", frontier.size());
       for (const auto& uuid : frontier) {
           auto node = engine_->get_node(uuid);
           if (!node) continue;
@@ -276,11 +278,9 @@ std::vector<Query::ResultRow> Query::execute() {
           std::unordered_map<std::string, std::shared_ptr<Node>> available;
           available[initial_match_->alias] = node;
           
-          bool pass = evaluate_group(root_filters_, available, initial_match_->alias);
-          L3_LOG(LOG_DEBUG, "L3KVG: Query - Alias [%s] Filter evaluation on node [%s] results in: %s", 
-                 initial_match_->alias.c_str(), uuid.c_str(), pass ? "PASS" : "FAIL");
-          
-          if (pass) filtered.push_back(uuid);
+          if (evaluate_group(root_filters_, available, initial_match_->alias)) {
+              filtered.push_back(uuid);
+          }
       }
       frontier = std::move(filtered);
   }
@@ -310,10 +310,6 @@ std::vector<Query::ResultRow> Query::execute() {
                 if (it == path.alias_to_node.end()) continue;
 
                 auto neighbors = it->second->get_neighbors(s.label, s.min_weight);
-                
-                L3_LOG(LOG_DEBUG, "L3KVG: Query - Traversal [%s] -> [%s] found %zu neighbors", 
-                       path.last_alias.c_str(), s.target_alias.c_str(), neighbors.size());
-
                 for (const auto& neighbor_uuid : neighbors) {
                     auto neighbor_node = engine_->get_node(neighbor_uuid);
                     if (!neighbor_node) continue;
@@ -334,7 +330,6 @@ std::vector<Query::ResultRow> Query::execute() {
                 if (it == path.alias_to_node.end()) continue;
 
                 auto neighbors = it->second->get_in_neighbors(s.label);
-
                 for (const auto& neighbor_uuid : neighbors) {
                     auto neighbor_node = engine_->get_node(neighbor_uuid);
                     if (!neighbor_node) continue;
@@ -354,25 +349,17 @@ std::vector<Query::ResultRow> Query::execute() {
   }
 
   // Output Materialization
-  L3_LOG(LOG_DEBUG, "L3KVG: Query - Materializing %zu paths", paths.size());
   for (const auto &path : paths) {
     try {
         ResultRow row;
-        // Pre-populate fields for all aliases in the path
         for (const auto& [alias, node] : path.alias_to_node) {
             row.nodes.push_back(node);
             
-            // Find all projections for THIS alias and populate them
+            // Projections
             for (size_t col_idx = 0; col_idx < projections_.size(); ++col_idx) {
                 if (projections_[col_idx].alias == alias) {
                     std::string_view view = "";
-                    try {
-                        view = node->get_attribute_view(projections_[col_idx].property);
-                    } catch (const std::exception& e) {
-                        L3_LOG(LOG_ERROR, "L3KVG: Query - Exception in get_attribute_view for [%s.%s]: %s", 
-                               alias.c_str(), projections_[col_idx].property.c_str(), e.what());
-                    }
-
+                    try { view = node->get_attribute_view(projections_[col_idx].property); } catch (...) {}
                     if (view.empty()) {
                         try {
                             std::string val = node->get_attribute_as_string(projections_[col_idx].property);
@@ -387,7 +374,7 @@ std::vector<Query::ResultRow> Query::execute() {
                 }
             }
             
-            // Also populate for Sorts if not already present
+            // Sorts
             for (const auto& s : sorts_) {
                 if (s.alias == alias) {
                     std::string key = alias + "." + s.property;
@@ -407,75 +394,106 @@ std::vector<Query::ResultRow> Query::execute() {
                     }
                 }
             }
+
+            // Groups
+            for (const auto& g : groups_) {
+                if (g.alias == alias) {
+                    std::string key = alias + "." + g.property;
+                    if (row.fields.find(key) == row.fields.end()) {
+                        std::string_view view = "";
+                        try { view = node->get_attribute_view(g.property); } catch(...) {}
+                        if (view.empty()) {
+                            try {
+                                std::string val = node->get_attribute_as_string(g.property);
+                                if (!val.empty()) {
+                                    row.fallback_strings.push_back(std::move(val));
+                                    view = row.fallback_strings.back();
+                                }
+                            } catch (...) {}
+                        }
+                        row.fields[key] = view;
+                    }
+                }
+            }
         }
         
-        // Ensure every projection has at least an empty entry to avoid "Key not found"
         for (size_t col_idx = 0; col_idx < projections_.size(); ++col_idx) {
             if (row.fields.find(std::to_string(col_idx)) == row.fields.end()) {
                 row.fields[std::to_string(col_idx)] = "";
             }
         }
-        
         results.push_back(std::move(row));
-    } catch (const std::exception& e) {
-        L3_LOG(LOG_ERROR, "L3KVG: Query - Exception during path materialization: %s", e.what());
-        // Re-throw to be caught by execute_query
-        throw;
-    }
+    } catch (...) {}
   }
 
   // 4. Aggregation Post-Processing
   bool has_aggregates = false;
   for (const auto& p : projections_) if (p.agg != AggOp::None) { has_aggregates = true; break; }
 
-  if (has_aggregates && !results.empty()) {
-      ResultRow agg_row;
-      for (size_t col_idx = 0; col_idx < projections_.size(); ++col_idx) {
-          const auto& p = projections_[col_idx];
-          std::string col_key = std::to_string(col_idx);
-          
-          if (p.agg == AggOp::None) {
-              agg_row.fields[col_key] = results[0].fields.at(col_key);
-          } else if (p.agg == AggOp::Count) {
-              agg_row.fallback_strings.push_back(std::to_string(results.size()));
-              agg_row.fields[col_key] = agg_row.fallback_strings.back();
-          } else {
-              double val = 0;
-              bool first = true;
-              for (const auto& row : results) {
-                  double row_val = 0;
-                  try { row_val = std::stod(std::string(row.fields.at(col_key))); } catch(...) {}
-                  
-                  if (first) {
-                      val = row_val;
-                      first = false;
-                  } else {
-                      if (p.agg == AggOp::Sum || p.agg == AggOp::Avg) val += row_val;
-                      else if (p.agg == AggOp::Min) val = std::min(val, row_val);
-                      else if (p.agg == AggOp::Max) val = std::max(val, row_val);
-                  }
+  if (has_aggregates) {
+      std::unordered_map<std::string, std::vector<ResultRow>> partitions;
+      if (groups_.empty()) {
+          partitions["ALL"] = std::move(results);
+      } else {
+          for (auto& row : results) {
+              std::string group_key;
+              for (const auto& g : groups_) {
+                  std::string key = g.alias + "." + g.property;
+                  auto it = row.fields.find(key);
+                  if (it != row.fields.end()) group_key += std::string(it->second) + "|";
+                  else group_key += "|";
               }
-              if (p.agg == AggOp::Avg) val /= results.size();
+              partitions[group_key].push_back(std::move(row));
+          }
+      }
+
+      std::vector<ResultRow> final_results;
+      for (auto& pair : partitions) {
+          auto& partition = pair.second;
+          ResultRow agg_row;
+          for (size_t col_idx = 0; col_idx < projections_.size(); ++col_idx) {
+              const auto& p = projections_[col_idx];
+              std::string col_key = std::to_string(col_idx);
               
-              std::stringstream ss;
-              if (val == (long long)val) ss << (long long)val;
-              else ss << std::fixed << std::setprecision(2) << val;
-              agg_row.fallback_strings.push_back(ss.str());
-              agg_row.fields[col_key] = agg_row.fallback_strings.back();
+              if (p.agg == AggOp::None) {
+                  if (!partition.empty()) agg_row.fields[col_key] = partition[0].fields.at(col_key);
+              } else if (p.agg == AggOp::Count) {
+                  agg_row.fallback_strings.push_back(std::to_string(partition.size()));
+                  agg_row.fields[col_key] = agg_row.fallback_strings.back();
+              } else {
+                  double val = 0;
+                  bool first = true;
+                  for (const auto& row : partition) {
+                      double row_val = 0;
+                      try { row_val = std::stod(std::string(row.fields.at(col_key))); } catch(...) {}
+                      if (first) { val = row_val; first = false; }
+                      else {
+                          if (p.agg == AggOp::Sum || p.agg == AggOp::Avg) val += row_val;
+                          else if (p.agg == AggOp::Min) val = std::min(val, row_val);
+                          else if (p.agg == AggOp::Max) val = std::max(val, row_val);
+                      }
+                  }
+                  if (p.agg == AggOp::Avg && !partition.empty()) val /= partition.size();
+                  std::stringstream ss;
+                  if (val == (long long)val) ss << (long long)val;
+                  else ss << std::fixed << std::setprecision(2) << val;
+                  agg_row.fallback_strings.push_back(ss.str());
+                  agg_row.fields[col_key] = agg_row.fallback_strings.back();
+              }
           }
+          final_results.push_back(std::move(agg_row));
       }
-      return {std::move(agg_row)};
-  } else if (has_aggregates && results.empty()) {
-      ResultRow agg_row;
-      for (size_t col_idx = 0; col_idx < projections_.size(); ++col_idx) {
-          if (projections_[col_idx].agg == AggOp::Count) {
-              agg_row.fallback_strings.push_back("0");
-              agg_row.fields[std::to_string(col_idx)] = agg_row.fallback_strings.back();
-          } else {
-              agg_row.fields[std::to_string(col_idx)] = "";
+      if (final_results.empty() && groups_.empty()) {
+          ResultRow agg_row;
+          for (size_t col_idx = 0; col_idx < projections_.size(); ++col_idx) {
+              if (projections_[col_idx].agg == AggOp::Count) {
+                  agg_row.fallback_strings.push_back("0");
+                  agg_row.fields[std::to_string(col_idx)] = agg_row.fallback_strings.back();
+              } else { agg_row.fields[std::to_string(col_idx)] = ""; }
           }
+          final_results.push_back(std::move(agg_row));
       }
-      return {std::move(agg_row)};
+      return final_results;
   }
 
   // 5. Sorting
@@ -486,10 +504,7 @@ std::vector<Query::ResultRow> Query::execute() {
               auto it_a = a.fields.find(key);
               auto it_b = b.fields.find(key);
               if (it_a == a.fields.end() || it_b == b.fields.end()) continue;
-              
               if (it_a->second == it_b->second) continue;
-              
-              // Try numeric sort
               try {
                   double d_a = std::stod(std::string(it_a->second));
                   double d_b = std::stod(std::string(it_b->second));
@@ -504,14 +519,12 @@ std::vector<Query::ResultRow> Query::execute() {
       });
   }
 
-  // 6. Pagination (Slicing)
+  // 6. Pagination
   if (offset_.has_value() || limit_.has_value()) {
       size_t start = offset_.value_or(0);
       if (start >= results.size()) return {};
-      
       size_t end = results.size();
       if (limit_.has_value()) end = std::min(end, start + limit_.value());
-      
       std::vector<ResultRow> sliced;
       for (size_t i = start; i < end; ++i) sliced.push_back(std::move(results[i]));
       return sliced;
