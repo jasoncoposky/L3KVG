@@ -66,6 +66,7 @@ public:
     ~EdgeCoordinator();
 
     std::future<void> atomic_put_edge(const std::string& src_uuid, const std::string& label, double weight, const std::string& dst_uuid, const std::string& payload = "");
+    std::future<void> atomic_del_edge(const std::string& src_uuid, const std::string& label, double weight, const std::string& dst_uuid);
 
 private:
     struct BatchEntry {

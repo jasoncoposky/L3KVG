@@ -115,9 +115,10 @@ std::vector<std::string> Node::get_neighbors(std::string_view label,
       for (const auto &key : chunk) {
           if (key.ends_with(":meta"))
               continue;
-          size_t last_colon = key.find_last_of(':');
-          if (last_colon != std::string::npos) {
-              neighbors.push_back(key.substr(last_colon + 1));
+          size_t start_brace = key.find_last_of('{');
+          size_t end_brace = key.find_last_of('}');
+          if (start_brace != std::string::npos && end_brace != std::string::npos && end_brace > start_brace) {
+              neighbors.push_back(key.substr(start_brace + 1, end_brace - start_brace - 1));
           }
       }
       return neighbors;
@@ -134,6 +135,28 @@ std::vector<std::string> Node::get_neighbors(std::string_view label,
       return {};
     }
   }
+  return neighbors;
+}
+
+std::vector<std::string> Node::get_in_neighbors(std::string_view label) {
+  std::vector<std::string> neighbors;
+  std::string_view prefix = KeyBuilder::edge_in_prefix(uuid_, label);
+  
+  auto *store = engine_->get_store();
+  size_t target_shard = store->get_routing_shard(std::string(prefix));
+
+  auto chunk = store->get_prefix_keys(std::string(prefix), target_shard, std::string(prefix), 1000);
+  for (const auto &key : chunk) {
+      if (key.ends_with(":meta"))
+          continue;
+      size_t start_brace = key.find_last_of('{');
+      size_t end_brace = key.find_last_of('}');
+      if (start_brace != std::string::npos && end_brace != std::string::npos && end_brace > start_brace) {
+          neighbors.push_back(key.substr(start_brace + 1, end_brace - start_brace - 1));
+      }
+  }
+  
+  // For prototype, we'll assume local only or that the EdgeCoordinator handled it.
   return neighbors;
 }
 
@@ -171,24 +194,27 @@ std::vector<std::shared_ptr<Edge>> Node::get_edges(std::string_view label,
     
     lite3cpp::Buffer buf = store->get(key); // Fetch property payload
     
-    // Parse key: e:out:{src}:label:weight:dst
-    // We already know src (uuid_), label, weight (from key), and dst (from key)
-    
-    size_t last_colon = key.find_last_of(':');
-    if (last_colon != std::string::npos) {
-        std::string dst_uuid = key.substr(last_colon + 1);
-        
-        // Extract weight from key
-        size_t weight_colon = key.find_last_of(':', last_colon - 1);
+    // Parse key: e:out:{src}:{label}:{weight}:{dst}
+    size_t start_brace_dst = key.find_last_of('{');
+    size_t end_brace_dst = key.find_last_of('}');
+
+    if (start_brace_dst != std::string::npos && end_brace_dst != std::string::npos && end_brace_dst > start_brace_dst) {
+        std::string dst_uuid = key.substr(start_brace_dst + 1, end_brace_dst - start_brace_dst - 1);
+
+        // Extract weight from key: it's between the second-to-last colon and the last open-brace
+        size_t weight_end = start_brace_dst - 1; // The colon before {dst}
+        size_t weight_start = key.find_last_of(':', weight_end - 1);
+
         double weight = 0.0;
-        if (weight_colon != std::string::npos) {
-            std::string w_str = key.substr(weight_colon + 1, last_colon - weight_colon - 1);
+        if (weight_start != std::string::npos) {
+            std::string w_str = key.substr(weight_start + 1, weight_end - weight_start - 1);
             weight = std::stod(w_str);
         }
-        
+
         edges.push_back(std::make_shared<Edge>(engine_, uuid_, std::string(label), weight, dst_uuid, 
                                                buf.size() > 0 ? std::make_optional(std::move(buf)) : std::nullopt));
     }
+
   }
   return edges;
 }
@@ -218,7 +244,12 @@ void Node::hydrate(const std::string &data) {
     payload_->init_object();
   } else {
     try {
-        payload_ = lite3cpp::lite3_json::from_json_string(data);
+        if (data.starts_with("{")) {
+            payload_ = lite3cpp::lite3_json::from_json_string(data);
+        } else {
+            // It's binary BSON, reconstruct Buffer directly
+            payload_ = lite3cpp::Buffer(std::vector<uint8_t>(data.begin(), data.end()));
+        }
     } catch (...) {
         payload_ = lite3cpp::Buffer(std::vector<uint8_t>(data.begin(), data.end()));
     }
@@ -232,6 +263,33 @@ bool Node::has_attribute(const std::string &key) {
     return false;
   return payload_->get_type(0, key) != lite3cpp::Type::Null &&
          payload_->get_type(0, key) != lite3cpp::Type::Invalid;
+}
+
+lite3cpp::Type Node::get_attribute_type(std::string_view key) {
+  ensure_loaded();
+  if (!payload_ || payload_->size() == 0)
+    return lite3cpp::Type::Invalid;
+  return payload_->get_type(0, key);
+}
+
+std::string Node::get_attribute_as_string(std::string_view key) {
+  ensure_loaded();
+  if (!payload_ || payload_->size() == 0)
+    return "";
+
+  auto type = payload_->get_type(0, key);
+  switch (type) {
+    case lite3cpp::Type::String:
+      return std::string(payload_->get_str(0, key));
+    case lite3cpp::Type::Int64:
+      return std::to_string(payload_->get_i64(0, key));
+    case lite3cpp::Type::Float64:
+      return std::to_string(payload_->get_f64(0, key));
+    case lite3cpp::Type::Bool:
+      return payload_->get_bool(0, key) ? "true" : "false";
+    default:
+      return "";
+  }
 }
 
 } // namespace l3kvg

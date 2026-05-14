@@ -138,6 +138,20 @@ std::vector<std::shared_ptr<Node>> Engine::fetch_nodes(const std::vector<std::st
   return result;
 }
 
+std::vector<std::shared_ptr<Node>> Engine::get_nodes_by_prefix(const std::string& prefix) {
+  auto keys = store_->get_prefix_keys_all_shards(prefix, "", 1000);
+  std::vector<std::string> uuids;
+  for (auto& k : keys) {
+      auto node = get_node(k);
+      if (node && node->has_attribute("id")) {
+          uuids.push_back(node->get_attribute_as_string("id"));
+      } else {
+          uuids.push_back(k);
+      }
+  }
+  return fetch_nodes(uuids);
+}
+
 void Engine::put_node(std::string uuid, std::string payload) {
   lite3::NodeID owner = resolver_.get_node_owner(uuid);
   
@@ -154,6 +168,22 @@ void Engine::put_node(std::string uuid, std::string payload) {
   store_->put(std::move(key), std::move(payload));
 }
 
+void Engine::del_node(std::string uuid) {
+  lite3::NodeID owner = resolver_.get_node_owner(uuid);
+  
+  if (owner != resolver_.get_local_node_id()) {
+    // Phase 5 Pending: Remote del_node RPC
+    return;
+  }
+
+  std::string key = std::string(KeyBuilder::node_key(uuid));
+  store_->del(key);
+}
+
+void Engine::flush() {
+  store_->wait_all_shards();
+}
+
 std::string Engine::format_weight(double weight) {
   return std::string(KeyBuilder::format_weight(weight));
 }
@@ -162,6 +192,11 @@ void Engine::add_edge(std::string src_uuid, std::string label,
                       double weight, std::string dst_uuid,
                       std::string payload) {
   edge_coordinator_->atomic_put_edge(std::move(src_uuid), std::move(label), weight, std::move(dst_uuid), std::move(payload));
+}
+
+void Engine::del_edge(std::string src_uuid, std::string label,
+                      double weight, std::string dst_uuid) {
+  edge_coordinator_->atomic_del_edge(std::move(src_uuid), std::move(label), weight, std::move(dst_uuid));
 }
 
 } // namespace l3kvg

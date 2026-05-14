@@ -43,7 +43,7 @@ public:
     static std::string_view edge_out_key(std::string_view src_uuid, std::string_view label, 
                                          double weight, std::string_view dst_uuid) {
         char* buf = get_buffer();
-        int len = std::snprintf(buf, MAX_KEY_SIZE, "e:out:{%.*s}:%.*s:%012.4f:%.*s", 
+        int len = std::snprintf(buf, MAX_KEY_SIZE, "e:out:{%.*s}:%.*s:%012.4f:{%.*s}", 
                                 static_cast<int>(src_uuid.size()), src_uuid.data(), 
                                 static_cast<int>(label.size()), label.data(),
                                 weight,
@@ -52,11 +52,21 @@ public:
         return std::string_view(buf, static_cast<size_t>(len));
     }
 
+    // Build incoming edge prefix: e:in:{dst}:{label}:
+    static std::string_view edge_in_prefix(std::string_view dst_uuid, std::string_view label) {
+        char* buf = get_buffer();
+        int len = std::snprintf(buf, MAX_KEY_SIZE, "e:in:{%.*s}:%.*s:",
+                                static_cast<int>(dst_uuid.size()), dst_uuid.data(),
+                                static_cast<int>(label.size()), label.data());
+        if (len < 0 || len >= static_cast<int>(MAX_KEY_SIZE)) return {};
+        return std::string_view(buf, static_cast<size_t>(len));
+    }
+
     // Build incoming edge key: e:in:{dst}:{label}:{src}
     static std::string_view edge_in_key(std::string_view dst_uuid, std::string_view label, 
                                          std::string_view src_uuid) {
         char* buf = get_buffer();
-        int len = std::snprintf(buf, MAX_KEY_SIZE, "e:in:{%.*s}:%.*s:%.*s", 
+        int len = std::snprintf(buf, MAX_KEY_SIZE, "e:in:{%.*s}:%.*s:{%.*s}", 
                                 static_cast<int>(dst_uuid.size()), dst_uuid.data(), 
                                 static_cast<int>(label.size()), label.data(),
                                 static_cast<int>(src_uuid.size()), src_uuid.data());

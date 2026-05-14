@@ -95,6 +95,43 @@ std::future<void> EdgeCoordinator::atomic_put_edge(const std::string& src_uuid, 
     });
 }
 
+std::future<void> EdgeCoordinator::atomic_del_edge(const std::string& src_uuid, const std::string& label, double weight, const std::string& dst_uuid) {
+    lite3::NodeID src_owner = resolver_.get_node_owner(src_uuid);
+    lite3::NodeID dst_owner = resolver_.get_node_owner(dst_uuid);
+    lite3::NodeID local_id = resolver_.get_local_node_id();
+
+    std::string out_key = std::string(KeyBuilder::edge_out_key(src_uuid, label, weight, dst_uuid));
+    std::string in_key = std::string(KeyBuilder::edge_in_key(dst_uuid, label, src_uuid));
+
+    std::vector<std::future<void>> futures;
+
+    auto handle_del = [&](lite3::NodeID owner, const std::string& key) {
+        if (owner == local_id) {
+            size_t shard_idx = store_->get_routing_shard(key);
+            futures.push_back(store_->submit_to_shard_idx(shard_idx, [this, key]() {
+                store_->del(key);
+            }));
+        } else {
+            // Phase 5 Pending: Remote del_edge batching/RPC
+            // For now we'll just ignore or log
+        }
+    };
+
+    handle_del(src_owner, out_key);
+    handle_del(dst_owner, in_key);
+
+    if (futures.size() == 1) return std::move(futures[0]);
+    if (futures.empty()) {
+        std::promise<void> p;
+        p.set_value();
+        return p.get_future();
+    }
+
+    return std::async(std::launch::deferred, [futs = std::move(futures)]() mutable {
+        for (auto& f : futs) f.get();
+    });
+}
+
 void EdgeCoordinator::flush_loop() {
     while (!stop_flusher_) {
         {
@@ -143,15 +180,15 @@ void EdgeCoordinator::flush_shard(size_t shard_idx) {
         // Let's re-resolve for now (fast consistent hash lookup)
         lite3::NodeID owner;
         if (entry.key.starts_with("e:out:")) {
-            // parse src_uuid
-            size_t start = 6;
-            size_t end = entry.key.find(':', start);
-            owner = resolver_.get_node_owner(entry.key.substr(start, end - start));
+            // parse src_uuid: e:out:{src}:...
+            size_t start = entry.key.find('{');
+            size_t end = entry.key.find('}', start);
+            owner = resolver_.get_node_owner(entry.key.substr(start + 1, end - start - 1));
         } else {
-            // parse dst_uuid
-            size_t start = 5;
-            size_t end = entry.key.find(':', start);
-            owner = resolver_.get_node_owner(entry.key.substr(start, end - start));
+            // parse dst_uuid: e:in:{dst}:...
+            size_t start = entry.key.find('{');
+            size_t end = entry.key.find('}', start);
+            owner = resolver_.get_node_owner(entry.key.substr(start + 1, end - start - 1));
         }
 
         if (!node_batches.contains(owner)) {

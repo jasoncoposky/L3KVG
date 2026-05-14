@@ -48,13 +48,18 @@ public:
 
   std::shared_ptr<Node> get_node(std::string_view uuid);
   std::vector<std::shared_ptr<Node>> fetch_nodes(const std::vector<std::string>& uuids);
+  std::vector<std::shared_ptr<Node>> get_nodes_by_prefix(const std::string& prefix);
   void put_node(std::string uuid, std::string payload);
+  void del_node(std::string uuid);
+  void flush();
 
   static std::string format_weight(double weight);
 
   void add_edge(std::string src_uuid, std::string label,
                 double weight, std::string dst_uuid, 
                 std::string payload = "");
+  void del_edge(std::string src_uuid, std::string label,
+                double weight, std::string dst_uuid);
 
   // Mechanical Sympathy & HPC APIs
   SREMetrics &get_metrics() { return metrics_; }

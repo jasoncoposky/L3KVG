@@ -22,6 +22,8 @@ public:
   void hydrate(const std::string &data);
 
   bool has_attribute(const std::string &key);
+  lite3cpp::Type get_attribute_type(std::string_view key);
+  std::string get_attribute_as_string(std::string_view key);
 
   // Zero-copy Raw Attribute Access
   std::string_view get_raw_view(std::string_view key);
@@ -39,6 +41,8 @@ public:
 
   std::vector<std::string> get_neighbors(std::string_view label,
                                          double min_weight = -999999.0);
+
+  std::vector<std::string> get_in_neighbors(std::string_view label);
 
   std::vector<std::shared_ptr<Edge>> get_edges(std::string_view label,
                                                double min_weight = -999999.0);
