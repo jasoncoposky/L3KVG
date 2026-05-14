@@ -360,7 +360,7 @@ std::vector<Query::ResultRow> Query::execute() {
 
                     if (view.empty()) {
                         try {
-                            std::string val = node->get_attribute<std::string>(projections_[col_idx].property);
+                            std::string val = node->get_attribute_as_string(projections_[col_idx].property);
                             if (!val.empty()) {
                                 row.fallback_strings.push_back(std::move(val));
                                 view = row.fallback_strings.back();
