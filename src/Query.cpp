@@ -22,51 +22,28 @@ template<class... Ts> overloaded(Ts...) -> overloaded<Ts...>;
 
 static bool evaluate_filter(Node* node, const Query::Filter& f) {
     if (!node->has_attribute(f.key)) return false;
-    
     auto type = node->get_attribute_type(f.key);
     std::string s_val = node->get_attribute_as_string(f.key);
-    
     switch (f.op) {
-        case Query::Op::Eq: 
-            return s_val == f.value;
-        case Query::Op::Ne: 
-            return s_val != f.value;
+        case Query::Op::Eq: return s_val == f.value;
+        case Query::Op::Ne: return s_val != f.value;
         case Query::Op::Gt: 
-            if (type == lite3cpp::Type::Int64 || type == lite3cpp::Type::Float64) {
-                return std::stod(s_val) > std::stod(f.value);
-            }
+            if (type == lite3cpp::Type::Int64 || type == lite3cpp::Type::Float64) return std::stod(s_val) > std::stod(f.value);
             return s_val > f.value;
         case Query::Op::Ge:
-            if (type == lite3cpp::Type::Int64 || type == lite3cpp::Type::Float64) {
-                return std::stod(s_val) >= std::stod(f.value);
-            }
+            if (type == lite3cpp::Type::Int64 || type == lite3cpp::Type::Float64) return std::stod(s_val) >= std::stod(f.value);
             return s_val >= f.value;
         case Query::Op::Lt:
-            if (type == lite3cpp::Type::Int64 || type == lite3cpp::Type::Float64) {
-                return std::stod(s_val) < std::stod(f.value);
-            }
+            if (type == lite3cpp::Type::Int64 || type == lite3cpp::Type::Float64) return std::stod(s_val) < std::stod(f.value);
             return s_val < f.value;
         case Query::Op::Le:
-            if (type == lite3cpp::Type::Int64 || type == lite3cpp::Type::Float64) {
-                return std::stod(s_val) <= std::stod(f.value);
-            }
+            if (type == lite3cpp::Type::Int64 || type == lite3cpp::Type::Float64) return std::stod(s_val) <= std::stod(f.value);
             return s_val <= f.value;
         case Query::Op::Like: {
-            std::string pattern = f.value;
-            size_t pos = 0;
-            while ((pos = pattern.find('%', pos)) != std::string::npos) {
-                pattern.replace(pos, 1, ".*");
-                pos += 2;
-            }
-            pos = 0;
-            while ((pos = pattern.find('_', pos)) != std::string::npos) {
-                pattern.replace(pos, 1, ".");
-                pos += 1;
-            }
-            try {
-                std::regex re(pattern);
-                return std::regex_match(std::string(s_val), re);
-            } catch(...) { return false; }
+            std::string pattern = f.value; size_t pos = 0;
+            while ((pos = pattern.find('%', pos)) != std::string::npos) { pattern.replace(pos, 1, ".*"); pos += 2; }
+            pos = 0; while ((pos = pattern.find('_', pos)) != std::string::npos) { pattern.replace(pos, 1, "."); pos += 1; }
+            try { std::regex re(pattern); return std::regex_match(s_val, re); } catch(...) { return false; }
         }
     }
     return false;
@@ -103,14 +80,12 @@ Query::FilterGroup& Query::FilterGroup::or_where_group(std::function<void(Filter
     return *this;
 }
 
-Query &Query::where(std::string_view alias, std::string_view key, Op op,
-                    std::string_view value) {
+Query &Query::where(std::string_view alias, std::string_view key, Op op, std::string_view value) {
   root_filters_.where(alias, key, op, value);
   return *this;
 }
 
-Query &Query::or_where(std::string_view alias, std::string_view key, Op op,
-                       std::string_view value) {
+Query &Query::or_where(std::string_view alias, std::string_view key, Op op, std::string_view value) {
   root_filters_.or_where(alias, key, op, value);
   return *this;
 }
@@ -127,41 +102,29 @@ Query &Query::or_where_group(std::function<void(FilterGroup&)> cb) {
 
 static bool evaluate_group(const Query::FilterGroup& g, const std::unordered_map<std::string, std::shared_ptr<Node>>& available_nodes, std::string_view current_alias) {
     if (g.nodes.empty()) return true;
-    
     bool result = true;
     for (const auto& n : g.nodes) {
         bool val = std::visit(overloaded{
             [&](const Query::Filter& f) {
                 auto it = available_nodes.find(f.alias);
-                if (it != available_nodes.end()) {
-                    return evaluate_filter(it->second.get(), f);
-                }
+                if (it != available_nodes.end()) return evaluate_filter(it->second.get(), f);
                 return true; 
             },
-            [&](const std::shared_ptr<Query::FilterGroup>& sub) {
-                return evaluate_group(*sub, available_nodes, current_alias);
-            }
+            [&](const std::shared_ptr<Query::FilterGroup>& sub) { return evaluate_group(*sub, available_nodes, current_alias); }
         }, n.node);
-        
         if (n.prepended_op == Query::LogicalOp::And) {
-            if (&n == &g.nodes.front()) result = val;
-            else result = result && val;
-        } else {
-            result = result || val;
-        }
+            if (&n == &g.nodes.front()) result = val; else result = result && val;
+        } else result = result || val;
     }
     return result;
 }
 
-Query &Query::where_has(std::string_view alias, std::string_view key,
-                        std::string_view value_type) {
-  filters_has_.push_back(
-      {std::string(alias), std::string(key), std::string(value_type)});
+Query &Query::where_has(std::string_view alias, std::string_view key, std::string_view value_type) {
+  filters_has_.push_back({std::string(alias), std::string(key), std::string(value_type)});
   return *this;
 }
 
-Query::OutEdgeBuilder Query::out(std::string_view edge_label,
-                                 double min_weight) {
+Query::OutEdgeBuilder Query::out(std::string_view edge_label, double min_weight) {
   return OutEdgeBuilder(*this, edge_label, min_weight);
 }
 
@@ -189,16 +152,8 @@ Query &Query::order_by(std::string_view alias, std::string_view property, bool a
     return *this;
 }
 
-Query &Query::limit(size_t limit) {
-    limit_ = limit;
-    return *this;
-}
-
-Query &Query::offset(size_t offset) {
-    offset_ = offset;
-    return *this;
-}
-
+Query &Query::limit(size_t limit) { limit_ = limit; return *this; }
+Query &Query::offset(size_t offset) { offset_ = offset; return *this; }
 Query &Query::group_by(std::string_view alias, std::string_view property) {
     groups_.push_back({std::string(alias), std::string(property)});
     return *this;
@@ -207,9 +162,7 @@ Query &Query::group_by(std::string_view alias, std::string_view property) {
 static const Query::Filter* find_first_eq_filter(const Query::FilterGroup& g, std::string_view alias, std::string_view key = "") {
     for (const auto& n : g.nodes) {
         if (auto* f = std::get_if<Query::Filter>(&n.node)) {
-            if (f->alias == alias && f->op == Query::Op::Eq && (key.empty() || f->key == key)) {
-                return f;
-            }
+            if (f->alias == alias && f->op == Query::Op::Eq && (key.empty() || f->key == key)) return f;
         } else if (auto* sub = std::get_if<std::shared_ptr<Query::FilterGroup>>(&n.node)) {
             if (auto* res = find_first_eq_filter(**sub, alias, key)) return res;
         }
@@ -218,129 +171,71 @@ static const Query::Filter* find_first_eq_filter(const Query::FilterGroup& g, st
 }
 
 std::vector<Query::ResultRow> Query::execute() {
-  std::vector<ResultRow> results;
-  if (!initial_match_)
-    return results;
-
+  std::vector<ResultRow> results; if (!initial_match_) return results;
   std::vector<std::string> frontier;
-
-  // Naive index lookup: requires `id` exact match on the root node
-  if (auto* f = find_first_eq_filter(root_filters_, initial_match_->alias, "id")) {
-      L3_LOG(LOG_DEBUG, "L3KVG: Query - ID lookup for [%s]: %s", f->alias.c_str(), f->value.c_str());
-      frontier.push_back(f->value);
-  }
-
+  if (auto* f = find_first_eq_filter(root_filters_, initial_match_->alias, "id")) frontier.push_back(f->value);
   if (frontier.empty()) {
-    // Try secondary index lookup if available (Only for Equality)
     for (const auto &n : root_filters_.nodes) {
         if (auto* f = std::get_if<Filter>(&n.node)) {
             if (f->alias == initial_match_->alias && f->op == Op::Eq) {
                 std::string idx_key = "idx:" + f->alias + ":" + f->key + ":" + f->value;
-                L3_LOG(LOG_DEBUG, "L3KVG: Query - Secondary Index lookup: %s", idx_key.c_str());
                 auto idx_node = engine_->get_node(idx_key);
                 if (idx_node && idx_node->has_attribute("id")) {
-                    std::string target_id = idx_node->get_attribute_as_string("id");
-                    L3_LOG(LOG_DEBUG, "L3KVG: Query - Resolved index to ID: %s", target_id.c_str());
-                    frontier.push_back(target_id);
-                    break;
+                    frontier.push_back(idx_node->get_attribute_as_string("id")); break;
                 }
             }
         }
     }
   }
-
   if (frontier.empty()) {
-    // FALLBACK: Full Scan by Prefix for Prototype
     std::string inner_prefix = "idx:" + initial_match_->alias + ":id:";
     std::string store_prefix = "n:{" + inner_prefix; 
-    L3_LOG(LOG_DEBUG, "L3KVG: Query - Falling back to prefix scan for [%s] using prefix [%s]", initial_match_->alias.c_str(), store_prefix.c_str());
     auto keys = engine_->get_store()->get_prefix_keys_all_shards(store_prefix, "", 1000);
     for (const auto& k : keys) {
         std::string uuid = k.substr(3, k.size() - 4);
         auto idx_node = engine_->get_node(uuid);
-        if (idx_node && idx_node->has_attribute("id")) {
-             frontier.push_back(idx_node->get_attribute_as_string("id"));
-        }
+        if (idx_node && idx_node->has_attribute("id")) frontier.push_back(idx_node->get_attribute_as_string("id"));
     }
   }
-
-  if (frontier.empty()) {
-    return results;
-  }
-
-  // Filter the initial frontier
+  if (frontier.empty()) return results;
   {
       std::vector<std::string> filtered;
       for (const auto& uuid : frontier) {
           auto node = engine_->get_node(uuid);
           if (!node) continue;
-          
           std::unordered_map<std::string, std::shared_ptr<Node>> available;
           available[initial_match_->alias] = node;
-          
-          if (evaluate_group(root_filters_, available, initial_match_->alias)) {
-              filtered.push_back(uuid);
-          }
+          if (evaluate_group(root_filters_, available, initial_match_->alias)) filtered.push_back(uuid);
       }
       frontier = std::move(filtered);
   }
-
   if (frontier.empty()) return results;
-  
-  // Process linear traversals and keep track of aliases
-  struct Path {
-      std::unordered_map<std::string, std::shared_ptr<Node>> alias_to_node;
-      std::string last_alias;
-  };
+  struct Path { std::unordered_map<std::string, std::shared_ptr<Node>> alias_to_node; std::string last_alias; };
   std::vector<Path> paths;
-  for (const auto& uuid : frontier) {
-      Path p;
-      p.alias_to_node[initial_match_->alias] = engine_->get_node(uuid);
-      p.last_alias = initial_match_->alias;
-      paths.push_back(std::move(p));
-  }
+  for (const auto& uuid : frontier) { Path p; p.alias_to_node[initial_match_->alias] = engine_->get_node(uuid); p.last_alias = initial_match_->alias; paths.push_back(std::move(p)); }
 
   for (const auto &step : steps_) {
     std::vector<Path> next_paths;
-    
     std::visit(overloaded{
         [&](const OutStep& s) {
             for (const auto &path : paths) {
-                auto it = path.alias_to_node.find(path.last_alias);
-                if (it == path.alias_to_node.end()) continue;
-
-                auto neighbors = it->second->get_neighbors(s.label, s.min_weight);
+                auto neighbors = path.alias_to_node.at(path.last_alias)->get_neighbors(s.label, s.min_weight);
                 for (const auto& neighbor_uuid : neighbors) {
                     auto neighbor_node = engine_->get_node(neighbor_uuid);
                     if (!neighbor_node) continue;
-                    
-                    Path new_path = path;
-                    new_path.alias_to_node[s.target_alias] = neighbor_node; 
-                    new_path.last_alias = s.target_alias;
-                    
-                    if (evaluate_group(root_filters_, new_path.alias_to_node, s.target_alias)) {
-                        next_paths.push_back(std::move(new_path));
-                    }
+                    Path new_path = path; new_path.alias_to_node[s.target_alias] = neighbor_node; new_path.last_alias = s.target_alias;
+                    if (evaluate_group(root_filters_, new_path.alias_to_node, s.target_alias)) next_paths.push_back(std::move(new_path));
                 }
             }
         },
         [&](const InStep& s) {
             for (const auto &path : paths) {
-                auto it = path.alias_to_node.find(path.last_alias);
-                if (it == path.alias_to_node.end()) continue;
-
-                auto neighbors = it->second->get_in_neighbors(s.label);
+                auto neighbors = path.alias_to_node.at(path.last_alias)->get_in_neighbors(s.label);
                 for (const auto& neighbor_uuid : neighbors) {
                     auto neighbor_node = engine_->get_node(neighbor_uuid);
                     if (!neighbor_node) continue;
-
-                    Path new_path = path;
-                    new_path.alias_to_node[s.target_alias] = neighbor_node; 
-                    new_path.last_alias = s.target_alias;
-                    
-                    if (evaluate_group(root_filters_, new_path.alias_to_node, s.target_alias)) {
-                        next_paths.push_back(std::move(new_path));
-                    }
+                    Path new_path = path; new_path.alias_to_node[s.target_alias] = neighbor_node; new_path.last_alias = s.target_alias;
+                    if (evaluate_group(root_filters_, new_path.alias_to_node, s.target_alias)) next_paths.push_back(std::move(new_path));
                 }
             }
         }
@@ -348,188 +243,105 @@ std::vector<Query::ResultRow> Query::execute() {
     paths = std::move(next_paths);
   }
 
-  // Output Materialization
   for (const auto &path : paths) {
-    try {
-        ResultRow row;
-        for (const auto& [alias, node] : path.alias_to_node) {
-            row.nodes.push_back(node);
-            
-            // Projections
-            for (size_t col_idx = 0; col_idx < projections_.size(); ++col_idx) {
-                if (projections_[col_idx].alias == alias) {
-                    std::string_view view = "";
-                    try { view = node->get_attribute_view(projections_[col_idx].property); } catch (...) {}
-                    if (view.empty()) {
-                        try {
-                            std::string val = node->get_attribute_as_string(projections_[col_idx].property);
-                            if (!val.empty()) {
-                                row.fallback_strings.push_back(std::move(val));
-                                view = row.fallback_strings.back();
-                            }
-                        } catch (...) {}
-                    }
-                    row.fields[alias + "." + projections_[col_idx].property] = view;
-                    row.fields[std::to_string(col_idx)] = view;
-                }
-            }
-            
-            // Sorts
-            for (const auto& s : sorts_) {
-                if (s.alias == alias) {
-                    std::string key = alias + "." + s.property;
-                    if (row.fields.find(key) == row.fields.end()) {
-                        std::string_view view = "";
-                        try { view = node->get_attribute_view(s.property); } catch(...) {}
-                        if (view.empty()) {
-                            try {
-                                std::string val = node->get_attribute_as_string(s.property);
-                                if (!val.empty()) {
-                                    row.fallback_strings.push_back(std::move(val));
-                                    view = row.fallback_strings.back();
-                                }
-                            } catch (...) {}
-                        }
-                        row.fields[key] = view;
-                    }
-                }
-            }
-
-            // Groups
-            for (const auto& g : groups_) {
-                if (g.alias == alias) {
-                    std::string key = alias + "." + g.property;
-                    if (row.fields.find(key) == row.fields.end()) {
-                        std::string_view view = "";
-                        try { view = node->get_attribute_view(g.property); } catch(...) {}
-                        if (view.empty()) {
-                            try {
-                                std::string val = node->get_attribute_as_string(g.property);
-                                if (!val.empty()) {
-                                    row.fallback_strings.push_back(std::move(val));
-                                    view = row.fallback_strings.back();
-                                }
-                            } catch (...) {}
-                        }
-                        row.fields[key] = view;
-                    }
-                }
+    ResultRow row;
+    for (const auto& [alias, node] : path.alias_to_node) {
+        row.nodes.push_back(node);
+        for (size_t i = 0; i < projections_.size(); ++i) {
+            if (projections_[i].alias == alias) {
+                row.fields[alias + "." + projections_[i].property] = node->get_attribute_as_string(projections_[i].property);
+                row.fields[std::to_string(i)] = row.fields[alias + "." + projections_[i].property];
             }
         }
-        
-        for (size_t col_idx = 0; col_idx < projections_.size(); ++col_idx) {
-            if (row.fields.find(std::to_string(col_idx)) == row.fields.end()) {
-                row.fields[std::to_string(col_idx)] = "";
+        for (const auto& s : sorts_) {
+            if (s.alias == alias) {
+                std::string k = s.alias + "." + s.property;
+                if (row.fields.find(k) == row.fields.end()) row.fields[k] = node->get_attribute_as_string(s.property);
             }
         }
-        results.push_back(std::move(row));
-    } catch (...) {}
+        for (const auto& g : groups_) {
+            if (g.alias == alias) {
+                std::string k = g.alias + "." + g.property;
+                if (row.fields.find(k) == row.fields.end()) row.fields[k] = node->get_attribute_as_string(g.property);
+            }
+        }
+    }
+    for (size_t i = 0; i < projections_.size(); ++i) { if (!row.fields.contains(std::to_string(i))) row.fields[std::to_string(i)] = ""; }
+    results.push_back(std::move(row));
   }
 
-  // 4. Aggregation Post-Processing
-  bool has_aggregates = false;
-  for (const auto& p : projections_) if (p.agg != AggOp::None) { has_aggregates = true; break; }
-
-  if (has_aggregates) {
+  bool has_agg = false; for (const auto& p : projections_) if (p.agg != AggOp::None) { has_agg = true; break; }
+  if (has_agg) {
       std::unordered_map<std::string, std::vector<ResultRow>> partitions;
-      if (groups_.empty()) {
-          partitions["ALL"] = std::move(results);
-      } else {
+      if (groups_.empty()) partitions["ALL"] = std::move(results);
+      else {
           for (auto& row : results) {
-              std::string group_key;
+              std::string g_key;
               for (const auto& g : groups_) {
-                  std::string key = g.alias + "." + g.property;
-                  auto it = row.fields.find(key);
-                  if (it != row.fields.end()) group_key += std::string(it->second) + "|";
-                  else group_key += "|";
+                  auto it = row.fields.find(g.alias + "." + g.property);
+                  if (it != row.fields.end()) g_key += it->second + "|"; else g_key += "|";
               }
-              partitions[group_key].push_back(std::move(row));
+              partitions[g_key].push_back(std::move(row));
           }
       }
-
-      std::vector<ResultRow> final_results;
+      std::vector<ResultRow> final_res;
       for (auto& pair : partitions) {
-          auto& partition = pair.second;
-          ResultRow agg_row;
-          for (size_t col_idx = 0; col_idx < projections_.size(); ++col_idx) {
-              const auto& p = projections_[col_idx];
-              std::string col_key = std::to_string(col_idx);
-              
-              if (p.agg == AggOp::None) {
-                  if (!partition.empty()) agg_row.fields[col_key] = partition[0].fields.at(col_key);
-              } else if (p.agg == AggOp::Count) {
-                  agg_row.fallback_strings.push_back(std::to_string(partition.size()));
-                  agg_row.fields[col_key] = agg_row.fallback_strings.back();
-              } else {
-                  double val = 0;
-                  bool first = true;
-                  for (const auto& row : partition) {
-                      double row_val = 0;
-                      try { row_val = std::stod(std::string(row.fields.at(col_key))); } catch(...) {}
-                      if (first) { val = row_val; first = false; }
+          auto& part = pair.second; ResultRow agg_row;
+          for (size_t i = 0; i < projections_.size(); ++i) {
+              const auto& p = projections_[i]; std::string k = std::to_string(i);
+              if (p.agg == AggOp::None) { if (!part.empty()) agg_row.fields[k] = part[0].fields.at(k); }
+              else if (p.agg == AggOp::Count) agg_row.fields[k] = std::to_string(part.size());
+              else {
+                  double val = 0; bool first = true;
+                  for (const auto& r : part) {
+                      double rv = 0; try { rv = std::stod(r.fields.at(k)); } catch(...) {}
+                      if (first) { val = rv; first = false; }
                       else {
-                          if (p.agg == AggOp::Sum || p.agg == AggOp::Avg) val += row_val;
-                          else if (p.agg == AggOp::Min) val = std::min(val, row_val);
-                          else if (p.agg == AggOp::Max) val = std::max(val, row_val);
+                          if (p.agg == AggOp::Sum || p.agg == AggOp::Avg) val += rv;
+                          else if (p.agg == AggOp::Min) val = std::min(val, rv);
+                          else if (p.agg == AggOp::Max) val = std::max(val, rv);
                       }
                   }
-                  if (p.agg == AggOp::Avg && !partition.empty()) val /= partition.size();
-                  std::stringstream ss;
-                  if (val == (long long)val) ss << (long long)val;
-                  else ss << std::fixed << std::setprecision(2) << val;
-                  agg_row.fallback_strings.push_back(ss.str());
-                  agg_row.fields[col_key] = agg_row.fallback_strings.back();
+                  if (p.agg == AggOp::Avg && !part.empty()) val /= part.size();
+                  std::stringstream ss; if (val == (long long)val) ss << (long long)val; else ss << std::fixed << std::setprecision(2) << val;
+                  agg_row.fields[k] = ss.str();
               }
           }
-          final_results.push_back(std::move(agg_row));
+          final_res.push_back(std::move(agg_row));
       }
-      if (final_results.empty() && groups_.empty()) {
+      if (final_res.empty() && groups_.empty()) {
           ResultRow agg_row;
-          for (size_t col_idx = 0; col_idx < projections_.size(); ++col_idx) {
-              if (projections_[col_idx].agg == AggOp::Count) {
-                  agg_row.fallback_strings.push_back("0");
-                  agg_row.fields[std::to_string(col_idx)] = agg_row.fallback_strings.back();
-              } else { agg_row.fields[std::to_string(col_idx)] = ""; }
+          for (size_t i = 0; i < projections_.size(); ++i) {
+              if (projections_[i].agg == AggOp::Count) agg_row.fields[std::to_string(i)] = "0";
+              else agg_row.fields[std::to_string(i)] = "";
           }
-          final_results.push_back(std::move(agg_row));
+          final_res.push_back(std::move(agg_row));
       }
-      return final_results;
+      return final_res;
   }
 
-  // 5. Sorting
-  if (!sorts_.empty() && !has_aggregates) {
+  if (!sorts_.empty()) {
       std::sort(results.begin(), results.end(), [&](const ResultRow& a, const ResultRow& b) {
           for (const auto& s : sorts_) {
-              std::string key = s.alias + "." + s.property;
-              auto it_a = a.fields.find(key);
-              auto it_b = b.fields.find(key);
+              std::string k = s.alias + "." + s.property;
+              auto it_a = a.fields.find(k); auto it_b = b.fields.find(k);
               if (it_a == a.fields.end() || it_b == b.fields.end()) continue;
               if (it_a->second == it_b->second) continue;
               try {
-                  double d_a = std::stod(std::string(it_a->second));
-                  double d_b = std::stod(std::string(it_b->second));
-                  if (s.ascending) return d_a < d_b;
-                  return d_a > d_b;
-              } catch(...) {
-                  if (s.ascending) return it_a->second < it_b->second;
-                  return it_a->second > it_b->second;
-              }
+                  double d_a = std::stod(it_a->second); double d_b = std::stod(it_b->second);
+                  if (s.ascending) return d_a < d_b; return d_a > d_b;
+              } catch(...) { if (s.ascending) return it_a->second < it_b->second; return it_a->second > it_b->second; }
           }
           return false;
       });
   }
 
-  // 6. Pagination
   if (offset_.has_value() || limit_.has_value()) {
-      size_t start = offset_.value_or(0);
-      if (start >= results.size()) return {};
-      size_t end = results.size();
-      if (limit_.has_value()) end = std::min(end, start + limit_.value());
-      std::vector<ResultRow> sliced;
-      for (size_t i = start; i < end; ++i) sliced.push_back(std::move(results[i]));
+      size_t start = offset_.value_or(0); if (start >= results.size()) return {};
+      size_t end = results.size(); if (limit_.has_value()) end = std::min(end, start + limit_.value());
+      std::vector<ResultRow> sliced; for (size_t i = start; i < end; ++i) sliced.push_back(std::move(results[i]));
       return sliced;
   }
-
   return results;
 }
 

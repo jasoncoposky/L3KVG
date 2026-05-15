@@ -102,9 +102,8 @@ public:
 
   // Execution
   struct ResultRow {
-    std::unordered_map<std::string, std::string_view> fields;
+    std::unordered_map<std::string, std::string> fields;
     std::vector<std::shared_ptr<Node>> nodes; // Keep memory alive for views
-    std::vector<std::string> fallback_strings; // Keep memory alive for fallbacks
   };
   std::vector<ResultRow> execute();
 
