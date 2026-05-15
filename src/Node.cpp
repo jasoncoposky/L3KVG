@@ -156,7 +156,6 @@ std::vector<std::string> Node::get_in_neighbors(std::string_view label) {
       }
   }
   
-  // For prototype, we'll assume local only or that the EdgeCoordinator handled it.
   return neighbors;
 }
 
