@@ -99,6 +99,7 @@ public:
 
   // Grouping
   Query &group_by(std::string_view alias, std::string_view property);
+  Query &distinct(bool enable = true);
 
   // Execution
   struct ResultRow {
@@ -152,6 +153,7 @@ private:
   std::vector<ReturnStep> projections_;
   std::vector<SortStep> sorts_;
   std::vector<GroupStep> groups_;
+  bool distinct_ = false;
   std::optional<size_t> limit_;
   std::optional<size_t> offset_;
 };

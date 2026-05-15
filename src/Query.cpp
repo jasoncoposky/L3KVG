@@ -6,6 +6,7 @@
 #include <regex>
 #include <iostream>
 #include <iomanip>
+#include <unordered_set>
 
 #ifdef IRODS_SERVER
 #include "irods/rodsLog.h"
@@ -156,6 +157,11 @@ Query &Query::limit(size_t limit) { limit_ = limit; return *this; }
 Query &Query::offset(size_t offset) { offset_ = offset; return *this; }
 Query &Query::group_by(std::string_view alias, std::string_view property) {
     groups_.push_back({std::string(alias), std::string(property)});
+    return *this;
+}
+
+Query &Query::distinct(bool enable) {
+    distinct_ = enable;
     return *this;
 }
 
@@ -318,6 +324,22 @@ std::vector<Query::ResultRow> Query::execute() {
           final_res.push_back(std::move(agg_row));
       }
       return final_res;
+  }
+
+  // 4.5 DISTINCT
+  if (distinct_) {
+      std::unordered_set<std::string> seen;
+      std::vector<ResultRow> unique_results;
+      for (auto& row : results) {
+          std::string row_key;
+          for (size_t i = 0; i < projections_.size(); ++i) {
+              row_key += row.fields.at(std::to_string(i)) + "|";
+          }
+          if (seen.insert(row_key).second) {
+              unique_results.push_back(std::move(row));
+          }
+      }
+      results = std::move(unique_results);
   }
 
   if (!sorts_.empty()) {
