@@ -9,6 +9,8 @@
 #include <zmq.hpp>
 #include <lite3/ring.hpp>
 #include <cstdint>
+#include <atomic>
+#include <chrono>
 #include "buffer.hpp"
 #include "L3KVG/QueryResult.hpp"
 #include "L3KVG/ThreadPool.hpp"
@@ -16,6 +18,8 @@
 
 
 namespace l3kvg {
+
+enum class CircuitState { CLOSED, OPEN, HALF_OPEN };
 
 class RemoteL3KVClient {
 public:
@@ -72,15 +76,25 @@ public:
         const lite3cpp::Buffer& batch_buffer
     );
 
+    // Circuit Breaker API
+    CircuitState get_circuit_state(lite3::NodeID node_id);
+    void set_circuit_state(lite3::NodeID node_id, CircuitState state);
+    void report_failure(lite3::NodeID node_id);
+    void report_success(lite3::NodeID node_id);
+
 private:
     struct Session {
         std::mutex mu;
         std::unique_ptr<zmq::socket_t> socket;
         bool connected = false;
+        std::atomic<CircuitState> state{CircuitState::CLOSED};
+        std::atomic<int> consecutive_failures{0};
+        std::chrono::steady_clock::time_point last_failure_time;
     };
 
     std::shared_ptr<Session> get_session(lite3::NodeID node_id);
 
+    Settings settings_;
     std::unordered_map<lite3::NodeID, std::string> peer_endpoints_;
     std::unordered_map<lite3::NodeID, std::shared_ptr<Session>> peer_sessions_;
     std::mutex endpoints_mutex_;
