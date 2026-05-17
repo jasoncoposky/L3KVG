@@ -14,7 +14,7 @@ add_library(l3kvg_engine STATIC
     src/Node.cpp
     src/Query.cpp
     src/Cypher.cpp
-    src/ClusterResolver.cpp
+    src/FederationResolver.cpp
     src/RemoteL3KVClient.cpp
     src/EdgeCoordinator.cpp
 )
@@ -57,8 +57,8 @@ target_link_libraries(test_fluent_api PRIVATE l3kvg_engine gtest_main Threads::T
 add_executable(test_cypher tests/test_cypher.cpp)
 target_link_libraries(test_cypher PRIVATE l3kvg_engine gtest_main Threads::Threads)
 
-add_executable(test_cluster_resolver tests/test_cluster_resolver.cpp)
-target_link_libraries(test_cluster_resolver PRIVATE l3kvg_engine gtest_main Threads::Threads)
+add_executable(test_federation_resolver tests/test_federation_resolver.cpp)
+target_link_libraries(test_federation_resolver PRIVATE l3kvg_engine gtest_main Threads::Threads)
 
 add_executable(test_remote_client tests/test_remote_client.cpp)
 target_link_libraries(test_remote_client PRIVATE l3kvg_engine gtest_main Threads::Threads $<$<BOOL:${WIN32}>:ws2_32>)
@@ -75,15 +75,27 @@ target_link_libraries(test_edge_properties PRIVATE l3kvg_engine gtest_main Threa
 add_executable(test_federation_id tests/test_federation_id.cpp)
 target_link_libraries(test_federation_id PRIVATE l3kvg_engine gtest_main Threads::Threads)
 
+add_executable(test_federation_query tests/test_federation_query.cpp)
+target_link_libraries(test_federation_query PRIVATE l3kvg_engine gtest_main Threads::Threads $<$<BOOL:${WIN32}>:ws2_32>)
+
 add_test(NAME test_engine COMMAND test_l3kvg)
 add_test(NAME test_fluent COMMAND test_fluent_api)
 add_test(NAME test_cypher_ast COMMAND test_cypher)
-add_test(NAME test_cluster COMMAND test_cluster_resolver)
+add_test(NAME test_federation_resolver COMMAND test_federation_resolver)
 add_test(NAME test_remote COMMAND test_remote_client)
 add_test(NAME test_coordinator COMMAND test_edge_coordinator)
 add_test(NAME test_async COMMAND test_async_traversal)
 add_test(NAME test_edge_props COMMAND test_edge_properties)
 add_test(NAME test_federation COMMAND test_federation_id)
+add_test(NAME test_federation_query COMMAND test_federation_query)
+
+add_executable(test_federation_integration tests/test_federation_integration.cpp)
+target_link_libraries(test_federation_integration PRIVATE l3kvg_engine gtest_main Threads::Threads $<$<BOOL:${WIN32}>:ws2_32>)
+add_test(NAME test_federation_integration COMMAND test_federation_integration)
+
+add_executable(test_federation_complex tests/test_federation_complex.cpp)
+target_link_libraries(test_federation_complex PRIVATE l3kvg_engine gtest_main Threads::Threads $<$<BOOL:${WIN32}>:ws2_32>)
+add_test(NAME test_federation_complex COMMAND test_federation_complex)
 
 add_executable(l3kvg_server src/server/main.cpp)
 target_link_libraries(l3kvg_server PRIVATE l3kvg_engine Threads::Threads $<$<BOOL:${WIN32}>:ws2_32> $<$<BOOL:${WIN32}>:wsock32> $<$<BOOL:${WIN32}>:crypt32>)

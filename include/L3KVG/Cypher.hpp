@@ -13,7 +13,7 @@ public:
   explicit CypherParser(Engine *engine);
 
   // Parses a Cypher subset query and triggers execution, returning rows.
-  std::vector<Query::ResultRow> execute(std::string_view query_text);
+  std::vector<ResultRow> execute(std::string_view query_text);
 
 private:
   Engine *engine_;

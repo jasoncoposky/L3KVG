@@ -7,6 +7,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <cstdint>
 #include "L3KVG/Edge.hpp"
 #include "L3KVG/KeyBuilder.hpp"
 
@@ -16,7 +17,7 @@ class Engine;
 
 class Node {
 public:
-  Node(Engine *engine, std::string uuid);
+  Node(Engine *engine, uint64_t id);
   void ensure_loaded();
   bool is_loaded() const { return loaded_.load(std::memory_order_acquire); }
   void hydrate(const std::string &data);
@@ -39,19 +40,19 @@ public:
 
   template <typename T> T get_attribute(std::string_view key);
 
-  std::vector<std::string> get_neighbors(std::string_view label,
+  std::vector<uint64_t> get_neighbors(std::string_view label,
                                          double min_weight = -999999.0);
 
-  std::vector<std::string> get_in_neighbors(std::string_view label);
+  std::vector<uint64_t> get_in_neighbors(std::string_view label);
 
   std::vector<std::shared_ptr<Edge>> get_edges(std::string_view label,
                                                double min_weight = -999999.0);
 
-  const std::string &get_uuid() const { return uuid_; }
+  uint64_t get_id() const { return id_; }
 
 private:
   Engine *engine_;
-  std::string uuid_;
+  uint64_t id_;
   
   // High Performance Proxy: payload_ owns the memory for all zero-copy views.
   // Pointer stability is guaranteed as long as this Node object is alive.

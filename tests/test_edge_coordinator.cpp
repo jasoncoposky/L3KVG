@@ -24,7 +24,7 @@ TEST(EdgeCoordinatorTest, BasicLocalDualWrite) {
         auto nodeA = engine.get_node("node_A");
         auto neighbors_A = nodeA->get_neighbors("knows", 0.5);
         ASSERT_EQ(neighbors_A.size(), size_t(1));
-        EXPECT_EQ(neighbors_A[0], std::string("node_B"));
+        EXPECT_EQ(neighbors_A[0], engine.get_resolver().parse_uuid("node_B"));
     }
     
     std::filesystem::remove_all(db_path);

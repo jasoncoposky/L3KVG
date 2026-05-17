@@ -25,6 +25,8 @@
 #include <vector>
 
 #include <nlohmann/json.hpp>
+#include <zmq.hpp>
+#include <zmq_addon.hpp>
 #include "httplib.h"
 
 #include "L3KVG/Cypher.hpp"
@@ -59,9 +61,17 @@ struct PeerConfig {
 struct Config {
   std::string address = "0.0.0.0";
   int port = 8080;
+  int zmq_port = 8081;
   uint32_t node_id = 1;
   std::string db_path = "prod_l3kvg_db";
+  size_t thread_pool_size = 256;
   std::vector<PeerConfig> peers;
+  size_t node_cache_size_per_shard = 2000;
+  size_t node_cache_shards = 8;
+  size_t edge_write_shards = 8;
+  size_t prefix_scan_limit = 1000;
+  int zmq_sndhwm = 1000;
+  int edge_flush_interval_ms = 2;
 };
 
 Config load_config(const std::string &path) {
@@ -73,14 +83,22 @@ Config load_config(const std::string &path) {
       f >> j;
       cfg.address = j.value("address", cfg.address);
       cfg.port = j.value("port", cfg.port);
+      cfg.zmq_port = j.value("zmq_port", cfg.port + 1);
       cfg.node_id = j.value("node_id", cfg.node_id);
       cfg.db_path = j.value("db_path", cfg.db_path);
+      cfg.thread_pool_size = j.value("thread_pool_size", cfg.thread_pool_size);
       if (j.contains("peers")) {
         for (auto &p : j["peers"]) {
           cfg.peers.push_back({p.value("id", 0u), p.value("host", "127.0.0.1"),
                                p.value("port", 8080)});
         }
       }
+      cfg.node_cache_size_per_shard = j.value("node_cache_size_per_shard", cfg.node_cache_size_per_shard);
+      cfg.node_cache_shards = j.value("node_cache_shards", cfg.node_cache_shards);
+      cfg.edge_write_shards = j.value("edge_write_shards", cfg.edge_write_shards);
+      cfg.prefix_scan_limit = j.value("prefix_scan_limit", cfg.prefix_scan_limit);
+      cfg.zmq_sndhwm = j.value("zmq_sndhwm", cfg.zmq_sndhwm);
+      cfg.edge_flush_interval_ms = j.value("edge_flush_interval_ms", cfg.edge_flush_interval_ms);
     } catch (...) {
       std::cerr << "Failed to parse config, using defaults.\n";
     }
@@ -108,11 +126,19 @@ int main(int argc, char *argv[]) {
     Config cfg = load_config(config_path);
     printf("Step 2: Config loaded. Node: %u\n", cfg.node_id); fflush(stdout);
 
+    l3kvg::Settings settings;
+    settings.node_cache_size_per_shard = cfg.node_cache_size_per_shard;
+    settings.node_cache_shards = cfg.node_cache_shards;
+    settings.edge_write_shards = cfg.edge_write_shards;
+    settings.prefix_scan_limit = cfg.prefix_scan_limit;
+    settings.zmq_sndhwm = cfg.zmq_sndhwm;
+    settings.edge_flush_interval_ms = cfg.edge_flush_interval_ms;
+
     auto ring = std::make_shared<lite3::ConsistentHash>();
     ring->add_node(cfg.node_id);
     printf("Step 3: Ring initialized\n"); fflush(stdout);
 
-    auto engine = std::make_unique<l3kvg::Engine>(cfg.db_path, cfg.node_id, ring);
+    auto engine = std::make_unique<l3kvg::Engine>(cfg.db_path, cfg.node_id, ring, cfg.thread_pool_size, settings);
     auto logger = std::make_shared<FileLogger>("node" + std::to_string(cfg.node_id) + ".log");
     engine->get_store()->set_logger(logger);
     printf("Step 4: Engine created with logging to node%u.log\n", cfg.node_id); fflush(stdout);
@@ -120,14 +146,113 @@ int main(int argc, char *argv[]) {
     for (const auto &p : cfg.peers) {
       printf("Step 5: Adding peer client: %u at %s:%d\n", p.id, p.host.c_str(), p.port); fflush(stdout);
       engine->get_remote_client().add_peer(
-          p.id, "http://" + p.host + ":" + std::to_string(p.port));
+          p.id, "tcp://" + p.host + ":" + std::to_string(p.port));
     }
     printf("Step 6: Peers added\n"); fflush(stdout);
 
     l3kvg::CypherParser parser(engine.get());
     printf("Step 7: Parser created\n"); fflush(stdout);
+
+    // Setup ZMQ Server for Federation
+    std::thread zmq_thread([&]() {
+        zmq::context_t ctx(1);
+        zmq::socket_t sock(ctx, ZMQ_ROUTER);
+        std::string zmq_endpoint = "tcp://0.0.0.0:" + std::to_string(cfg.zmq_port);
+        sock.bind(zmq_endpoint);
+        printf("ZMQ Federation Server listening on %s\n", zmq_endpoint.c_str()); fflush(stdout);
+
+        while (true) {
+            std::vector<zmq::message_t> recv_msgs;
+            auto result = zmq::recv_multipart(sock, std::back_inserter(recv_msgs));
+            if (!result || recv_msgs.size() < 4) continue;
+
+            auto& identity = recv_msgs[0];
+            auto opcode = recv_msgs[2].to_string();
+
+            if (opcode == "R") {
+                try {
+                    std::vector<uint64_t> nodes = json::parse(recv_msgs[3].to_string());
+                    std::string query_json = recv_msgs[4].to_string();
+
+                    auto results = engine->query().resume(nodes, query_json).execute();
+
+                    json j_res = json::array();
+                    for (const auto& row : results) {
+                        json jr = json::object();
+                        for (const auto& [k, v] : row.fields) jr[k] = v;
+                        j_res.push_back(jr);
+                    }
+
+                    std::string resp_json = j_res.dump();
+                    sock.send(identity, zmq::send_flags::sndmore);
+                    sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                    sock.send(zmq::message_t(resp_json.data(), resp_json.size()), zmq::send_flags::none);
+                } catch (...) {
+                    sock.send(identity, zmq::send_flags::sndmore);
+                    sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                    sock.send(zmq::message_t("[]", 2), zmq::send_flags::none);
+                }
+            } else if (opcode == "G") {
+                // GET node
+                try {
+                    uint64_t id = std::stoull(recv_msgs[3].to_string(), nullptr, 16);
+                    std::string key = std::string(l3kvg::KeyBuilder::node_key(id));
+                    auto buf = engine->get_store()->get(key);
+                    
+                    sock.send(identity, zmq::send_flags::sndmore);
+                    sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                    if (buf.size() > 0) {
+                        sock.send(zmq::message_t(buf.data(), buf.size()), zmq::send_flags::none);
+                    } else {
+                        sock.send(zmq::message_t("", 0), zmq::send_flags::none);
+                    }
+                } catch (...) {
+                    sock.send(identity, zmq::send_flags::sndmore);
+                    sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                    sock.send(zmq::message_t("", 0), zmq::send_flags::none);
+                }
+            } else if (opcode == "P") {
+                // PUT node/edge (key based)
+                try {
+                    std::string key = recv_msgs[3].to_string();
+                    std::string payload = recv_msgs[4].to_string();
+                    engine->get_store()->put(key, payload);
+                    
+                    sock.send(identity, zmq::send_flags::sndmore);
+                    sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                    sock.send(zmq::message_t("OK", 2), zmq::send_flags::none);
+                } catch (...) {
+                    sock.send(identity, zmq::send_flags::sndmore);
+                    sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                    sock.send(zmq::message_t("ERR", 3), zmq::send_flags::none);
+                }
+            } else if (opcode == "B") {
+                // BATCH PUT (binary buffer)
+                try {
+                    std::vector<uint8_t> data(reinterpret_cast<const uint8_t*>(recv_msgs[3].data()), 
+                                             reinterpret_cast<const uint8_t*>(recv_msgs[3].data()) + recv_msgs[3].size());
+                    lite3cpp::Buffer batch_buf(std::move(data));
+                    for (auto it = batch_buf.begin(0); it != batch_buf.end(0); ++it) {
+                        std::string key_str(it->key);
+                        std::span<const std::byte> val_bytes = batch_buf.get_bytes(0, it->key);
+                        std::string val_str(reinterpret_cast<const char*>(val_bytes.data()), val_bytes.size());
+                        engine->get_store()->put(key_str, val_str);
+                    }
+                    sock.send(identity, zmq::send_flags::sndmore);
+                    sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                    sock.send(zmq::message_t("OK", 2), zmq::send_flags::none);
+                } catch (...) {
+                    sock.send(identity, zmq::send_flags::sndmore);
+                    sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                    sock.send(zmq::message_t("ERR", 3), zmq::send_flags::none);
+                }
+            }
+        }
+    });
+    zmq_thread.detach();
+
     httplib::Server svr;
-    svr.new_task_queue = [] { return new httplib::ThreadPool(256); };
+    svr.new_task_queue = [tp_size = cfg.thread_pool_size] { return new httplib::ThreadPool(tp_size); };
     svr.set_keep_alive_max_count(1000000);
     svr.set_keep_alive_timeout(60);
 
@@ -136,9 +261,6 @@ int main(int argc, char *argv[]) {
       res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
       res.set_header("Access-Control-Allow-Headers", "Content-Type");
     });
-    
-    // ... rest of the handlers ...
-    // (Omitted for brevity in this replace call, but I'll make sure they are preserved)
 
   svr.Options(".*", [](const httplib::Request &, httplib::Response &res) {
     res.status = 200;
@@ -206,8 +328,13 @@ int main(int argc, char *argv[]) {
       std::string l = j_neigh_req.at("label").get<std::string>();
       double w = j_neigh_req.value("min_weight", 0.0);
       auto n = engine->get_node(t);
-      std::vector<std::string> neighbors = n->get_neighbors(l, w);
-      json j_neigh_resp = neighbors;
+      std::vector<uint64_t> neighbors = n->get_neighbors(l, w);
+      json j_neigh_resp = json::array();
+      for (auto id : neighbors) {
+          char buf[32];
+          std::snprintf(buf, sizeof(buf), "%016llx", (unsigned long long)id);
+          j_neigh_resp.push_back(std::string(buf));
+      }
       res.set_content(j_neigh_resp.dump(), "application/json");
     } catch (...) { res.status = 400; }
   });

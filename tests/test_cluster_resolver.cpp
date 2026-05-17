@@ -1,34 +1,38 @@
 #include <gtest/gtest.h>
-#include "L3KVG/ClusterResolver.hpp"
+#include "L3KVG/FederationResolver.hpp"
 #include <lite3/ring.hpp>
 #include <memory>
 
-TEST(ClusterResolverTest, BasicMapping) {
+TEST(FederationResolverTest, BasicMapping) {
   auto ring = std::make_shared<lite3::ConsistentHash>(100);
   ring->add_node(1);
   ring->add_node(2);
   ring->add_node(3);
 
-  l3kvg::ClusterResolver resolver(ring, 1);
+  l3kvg::FederationResolver resolver(ring, 1);
 
   EXPECT_EQ(resolver.get_local_node_id(), 1);
 
-  // Check some vertex assignments
-  lite3::NodeID owner1 = resolver.get_node_owner("vertex_A");
-  lite3::NodeID owner2 = resolver.get_node_owner("vertex_B");
+  // Check some vertex assignments using the new uint64_t ID system
+  uint64_t id1 = resolver.parse_uuid("vertex_A");
+  uint64_t id2 = resolver.parse_uuid("vertex_B");
+  
+  lite3::NodeID owner1 = resolver.get_node_owner(id1);
+  lite3::NodeID owner2 = resolver.get_node_owner(id2);
   
   EXPECT_TRUE(owner1 >= 1 && owner1 <= 3);
   EXPECT_TRUE(owner2 >= 1 && owner2 <= 3);
 
   // Same vertex should always return same owner
-  EXPECT_EQ(resolver.get_node_owner("vertex_A"), owner1);
+  EXPECT_EQ(resolver.get_node_owner(id1), owner1);
 }
 
-TEST(ClusterResolverTest, UnshardedFallback) {
+TEST(FederationResolverTest, UnshardedFallback) {
   auto empty_ring = std::make_shared<lite3::ConsistentHash>(100);
-  l3kvg::ClusterResolver resolver(empty_ring, 42);
+  l3kvg::FederationResolver resolver(empty_ring, 42);
 
   // Should fallback to local node id
-  EXPECT_EQ(resolver.get_node_owner("any_vertex"), 42);
-  EXPECT_TRUE(resolver.is_local("any_vertex"));
+  uint64_t id = resolver.parse_uuid("any_vertex");
+  EXPECT_EQ(resolver.get_node_owner(id), 42);
+  EXPECT_TRUE(resolver.is_local(id));
 }

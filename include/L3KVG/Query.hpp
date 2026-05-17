@@ -1,6 +1,7 @@
 #pragma once
 
 #include "L3KVG/Engine.hpp"
+#include "L3KVG/QueryResult.hpp"
 #include <optional>
 #include <string>
 #include <string_view>
@@ -15,6 +16,7 @@ class Engine;
 
 class Query {
 public:
+  using ResultRow = l3kvg::ResultRow;
   explicit Query(Engine *engine);
 
   // Initial node selection
@@ -102,14 +104,15 @@ public:
   Query &distinct(bool enable = true);
 
   // Execution
-  struct ResultRow {
-    std::unordered_map<std::string, std::string> fields;
-    std::vector<std::shared_ptr<Node>> nodes; // Keep memory alive for views
-  };
   std::vector<ResultRow> execute();
+
+  // Federation Support
+  Query &resume(const std::vector<uint64_t>& starting_nodes, std::string_view query_json);
 
 private:
   Engine *engine_;
+  std::vector<uint64_t> starting_nodes_;
+  std::string root_alias_ = "__root";
 
   // AST State
   struct MatchStep {
@@ -156,6 +159,8 @@ private:
   bool distinct_ = false;
   std::optional<size_t> limit_;
   std::optional<size_t> offset_;
+
+  static std::string serialize_steps(const std::vector<Step>& steps);
 };
 
 } // namespace l3kvg

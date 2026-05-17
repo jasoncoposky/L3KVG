@@ -9,6 +9,7 @@
 #include <utility>
 #include <iostream>
 #include <stdexcept>
+#include <cstdint>
 
 namespace l3kvg {
 
@@ -16,14 +17,14 @@ class Engine;
 
 class Edge {
 public:
-  Edge(Engine *engine, std::string src, std::string label, double weight, std::string dst, std::optional<lite3cpp::Buffer> payload = std::nullopt)
-      : engine_(engine), src_(std::move(src)), label_(std::move(label)), 
-        weight_(weight), dst_(std::move(dst)), payload_(std::move(payload)) {}
+  Edge(Engine *engine, uint64_t src, std::string label, double weight, uint64_t dst, std::optional<lite3cpp::Buffer> payload = std::nullopt)
+      : engine_(engine), src_(src), label_(std::move(label)), 
+        weight_(weight), dst_(dst), payload_(std::move(payload)) {}
 
-  const std::string& get_src() const { return src_; }
+  uint64_t get_src() const { return src_; }
   const std::string& get_label() const { return label_; }
   double get_weight() const { return weight_; }
-  const std::string& get_dst() const { return dst_; }
+  uint64_t get_dst() const { return dst_; }
 
   template <typename T> T get_attribute(std::string_view key) {
     if (!payload_ || payload_->size() == 0)
@@ -63,10 +64,10 @@ public:
 
 private:
   Engine *engine_;
-  std::string src_;
+  uint64_t src_;
   std::string label_;
   double weight_;
-  std::string dst_;
+  uint64_t dst_;
   std::optional<lite3cpp::Buffer> payload_;
 };
 

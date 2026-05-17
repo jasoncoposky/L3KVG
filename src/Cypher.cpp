@@ -10,7 +10,7 @@ CypherParser::CypherParser(Engine *engine) : engine_(engine) {}
 // A very fast, lightweight regex-assisted parser specifically built to parse
 // OpenCypher Subsets mapped identically to the L3KVG Fluent Traversal API
 // capabilities.
-std::vector<Query::ResultRow>
+std::vector<ResultRow>
 CypherParser::execute(std::string_view query_text) {
   std::string query(query_text);
   Query q = engine_->query();

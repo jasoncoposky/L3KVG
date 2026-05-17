@@ -9,12 +9,15 @@
 
 namespace l3kvg {
 
-EdgeCoordinator::EdgeCoordinator(l3kv::Engine* store, ClusterResolver& resolver, RemoteL3KVClient& remote_client, uint32_t node_id)
-    : store_(store), resolver_(resolver), remote_client_(remote_client), hlc_(node_id) {
-    shards_ = std::make_unique<BatchShard[]>(NUM_SHARDS);
-    task_pool_ = std::make_unique<ThreadPool>(16); // Managed completion pool
+EdgeCoordinator::EdgeCoordinator(l3kv::Engine* store, FederationResolver& resolver, RemoteL3KVClient& remote_client, uint32_t node_id, std::shared_ptr<ThreadPool> pool, const Settings& settings)
+    : store_(store), resolver_(resolver), remote_client_(remote_client), hlc_(node_id), 
+      num_shards_(settings.edge_write_shards), 
+      edge_flush_interval_ms_(settings.edge_flush_interval_ms),
+      task_pool_(std::move(pool)) {
+    shards_ = std::make_unique<BatchShard[]>(num_shards_);
     flush_thread_ = std::thread(&EdgeCoordinator::flush_loop, this);
 }
+
 
 EdgeCoordinator::~EdgeCoordinator() {
     stop_flusher_ = true;
@@ -24,35 +27,27 @@ EdgeCoordinator::~EdgeCoordinator() {
     }
 }
 
-std::future<void> EdgeCoordinator::atomic_put_edge(const std::string& src_uuid, const std::string& label, double weight, const std::string& dst_uuid, const std::string& payload) {
+std::future<void> EdgeCoordinator::atomic_put_edge(uint64_t src_id, const std::string& label, double weight, uint64_t dst_id, const std::string& payload) {
     auto ts = hlc_.now();
     
     // Create a pure lite3-cpp buffer for the payload
-    lite3cpp::Buffer buf;
-    buf.init_object();
-    size_t root = 0;
-    size_t ts_obj = buf.set_obj(root, "ts");
-    buf.set_i64(ts_obj, "wall_time", static_cast<int64_t>(ts.wall_time));
-    buf.set_i64(ts_obj, "logical", static_cast<int64_t>(ts.logical));
-    buf.set_i64(ts_obj, "node_id", static_cast<int64_t>(ts.node_id));
-    
+    std::string full_json = "{\"ts\":" + ts.to_json_string();
     if (!payload.empty()) {
-        // If payload is already a JSON string (for legacy/props), store as string
-        // but if we want "pure lite3", we should ideally accept props as a buffer.
-        // For now, we'll store props as raw bytes if it looks like a buffer data
-        // or just a string.
-        buf.set_str(root, "props", payload);
+        full_json += ",\"props\":" + payload;
     }
+    full_json += "}";
+    
+    lite3cpp::Buffer buf = lite3cpp::lite3_json::from_json_string(full_json);
 
     // Capture raw buffer data
     std::vector<uint8_t> final_payload_data(buf.data(), buf.data() + buf.size());
 
-    lite3::NodeID src_owner = resolver_.get_node_owner(src_uuid);
-    lite3::NodeID dst_owner = resolver_.get_node_owner(dst_uuid);
+    lite3::NodeID src_owner = resolver_.get_node_owner(src_id);
+    lite3::NodeID dst_owner = resolver_.get_node_owner(dst_id);
     lite3::NodeID local_id = resolver_.get_local_node_id();
 
-    std::string out_key = std::string(KeyBuilder::edge_out_key(src_uuid, label, weight, dst_uuid));
-    std::string in_key = std::string(KeyBuilder::edge_in_key(dst_uuid, label, src_uuid));
+    std::string out_key = std::string(KeyBuilder::edge_out_key(src_id, label, weight, dst_id));
+    std::string in_key = std::string(KeyBuilder::edge_in_key(dst_id, label, src_id));
 
     std::vector<std::future<void>> futures;
 
@@ -68,7 +63,7 @@ std::future<void> EdgeCoordinator::atomic_put_edge(const std::string& src_uuid, 
             auto prom = std::make_shared<std::promise<void>>();
             futures.push_back(prom->get_future());
             
-            size_t shard_idx = owner % NUM_SHARDS;
+            size_t shard_idx = owner % num_shards_;
             auto& shard = shards_[shard_idx];
             {
                 std::lock_guard<std::mutex> lock(shard.mu);
@@ -95,13 +90,13 @@ std::future<void> EdgeCoordinator::atomic_put_edge(const std::string& src_uuid, 
     });
 }
 
-std::future<void> EdgeCoordinator::atomic_del_edge(const std::string& src_uuid, const std::string& label, double weight, const std::string& dst_uuid) {
-    lite3::NodeID src_owner = resolver_.get_node_owner(src_uuid);
-    lite3::NodeID dst_owner = resolver_.get_node_owner(dst_uuid);
+std::future<void> EdgeCoordinator::atomic_del_edge(uint64_t src_id, const std::string& label, double weight, uint64_t dst_id) {
+    lite3::NodeID src_owner = resolver_.get_node_owner(src_id);
+    lite3::NodeID dst_owner = resolver_.get_node_owner(dst_id);
     lite3::NodeID local_id = resolver_.get_local_node_id();
 
-    std::string out_key = std::string(KeyBuilder::edge_out_key(src_uuid, label, weight, dst_uuid));
-    std::string in_key = std::string(KeyBuilder::edge_in_key(dst_uuid, label, src_uuid));
+    std::string out_key = std::string(KeyBuilder::edge_out_key(src_id, label, weight, dst_id));
+    std::string in_key = std::string(KeyBuilder::edge_in_key(dst_id, label, src_id));
 
     std::vector<std::future<void>> futures;
 
@@ -113,7 +108,6 @@ std::future<void> EdgeCoordinator::atomic_del_edge(const std::string& src_uuid, 
             }));
         } else {
             // Phase 5 Pending: Remote del_edge batching/RPC
-            // For now we'll just ignore or log
         }
     };
 
@@ -136,9 +130,9 @@ void EdgeCoordinator::flush_loop() {
     while (!stop_flusher_) {
         {
             std::unique_lock<std::mutex> lock(cv_mu_);
-            cv_.wait_for(lock, std::chrono::milliseconds(2), [this] { 
+            cv_.wait_for(lock, std::chrono::milliseconds(edge_flush_interval_ms_), [this] { 
                 if (stop_flusher_) return true;
-                for (size_t i = 0; i < NUM_SHARDS; ++i) {
+                for (size_t i = 0; i < num_shards_; ++i) {
                     std::lock_guard<std::mutex> s_lock(shards_[i].mu);
                     if (!shards_[i].buffer.empty()) return true;
                 }
@@ -147,11 +141,11 @@ void EdgeCoordinator::flush_loop() {
         }
 
         if (stop_flusher_) {
-            for (size_t i = 0; i < NUM_SHARDS; ++i) flush_shard(i);
+            for (size_t i = 0; i < num_shards_; ++i) flush_shard(i);
             break;
         }
 
-        for (size_t i = 0; i < NUM_SHARDS; ++i) {
+        for (size_t i = 0; i < num_shards_; ++i) {
             flush_shard(i);
         }
     }
@@ -169,26 +163,22 @@ void EdgeCoordinator::flush_shard(size_t shard_idx) {
         promises.swap(shard.promises);
     }
 
-    // Identify targets in this shard (could be multiple NodeIDs hashing to same shard)
     std::unordered_map<lite3::NodeID, lite3cpp::Buffer> node_batches;
     std::unordered_map<lite3::NodeID, std::vector<std::shared_ptr<std::promise<void>>>> node_promises;
 
     for (size_t i = 0; i < to_flush.size(); ++i) {
         auto const& entry = to_flush[i];
-        // We need to know which owner this key belongs to.
-        // For simplicity in this shard model, we can re-resolve or store owner in BatchEntry.
-        // Let's re-resolve for now (fast consistent hash lookup)
         lite3::NodeID owner;
         if (entry.key.starts_with("e:out:")) {
-            // parse src_uuid: e:out:{src}:...
             size_t start = entry.key.find('{');
             size_t end = entry.key.find('}', start);
-            owner = resolver_.get_node_owner(entry.key.substr(start + 1, end - start - 1));
+            std::string id_str = entry.key.substr(start + 1, end - start - 1);
+            owner = resolver_.get_node_owner(std::stoull(id_str, nullptr, 16));
         } else {
-            // parse dst_uuid: e:in:{dst}:...
             size_t start = entry.key.find('{');
             size_t end = entry.key.find('}', start);
-            owner = resolver_.get_node_owner(entry.key.substr(start + 1, end - start - 1));
+            std::string id_str = entry.key.substr(start + 1, end - start - 1);
+            owner = resolver_.get_node_owner(std::stoull(id_str, nullptr, 16));
         }
 
         if (!node_batches.contains(owner)) {
@@ -199,13 +189,10 @@ void EdgeCoordinator::flush_shard(size_t shard_idx) {
     }
 
     for (auto& [owner, batch_buf] : node_batches) {
-        // ZeroMQ handles the asynchronous delivery in its own I/O threads.
-        // We no longer need to enqueue a task to wait for a future.
         remote_client_.put_batch_binary_async(owner, batch_buf);
         auto p_list = std::move(node_promises[owner]);
         for (auto& p : p_list) p->set_value();
     }
 }
-
 
 } // namespace l3kvg

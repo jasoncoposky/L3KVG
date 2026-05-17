@@ -26,3 +26,13 @@ compile_commands.json
 
 # Test databases
 test_l3kvg_bench_db_*
+test_l3kvg_fed_db/
+test_remote_db/
+test_local_db/
+test_remote_db_complex/
+test_local_db_complex/
+test_remote_db_proj/
+test_local_db_proj/
+test_db_cluster1/
+test_db_cluster2/
+test_db_cluster3/

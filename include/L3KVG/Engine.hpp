@@ -6,13 +6,15 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
-
-#include "L3KVG/ClusterResolver.hpp"
-#include "L3KVG/RemoteL3KVClient.hpp"
-#include "L3KVG/EdgeCoordinator.hpp"
-
 #include <list>
 #include <vector>
+#include <cstdint>
+
+#include "L3KVG/FederationResolver.hpp"
+#include "L3KVG/RemoteL3KVClient.hpp"
+#include "L3KVG/EdgeCoordinator.hpp"
+#include "L3KVG/ThreadPool.hpp"
+#include "L3KVG/Settings.hpp"
 
 namespace l3kv {
 class Engine;
@@ -38,7 +40,7 @@ struct SREMetrics {
 
 class Engine {
 public:
-  Engine(const std::string &db_path, uint32_t node_id = 1, std::shared_ptr<lite3::ConsistentHash> ring = nullptr);
+  Engine(const std::string &db_path, uint32_t node_id = 1, std::shared_ptr<lite3::ConsistentHash> ring = nullptr, size_t thread_pool_size = 4, Settings settings = {});
   ~Engine();
 
   Engine(const Engine &) = delete;
@@ -46,51 +48,64 @@ public:
 
   Query query();
 
+  std::shared_ptr<Node> get_node(uint64_t id);
   std::shared_ptr<Node> get_node(std::string_view uuid);
-  std::vector<std::shared_ptr<Node>> fetch_nodes(const std::vector<std::string>& uuids);
+  
+  std::vector<std::shared_ptr<Node>> fetch_nodes(const std::vector<uint64_t>& ids);
   std::vector<std::shared_ptr<Node>> get_nodes_by_prefix(const std::string& prefix);
-  void put_node(std::string uuid, std::string payload);
-  void del_node(std::string uuid);
+  
+  void put_node(uint64_t id, std::string payload);
+  void put_node(std::string_view uuid, std::string payload);
+  
+  void del_node(uint64_t id);
   void flush();
 
   static std::string format_weight(double weight);
 
-  void add_edge(std::string src_uuid, std::string label,
-                double weight, std::string dst_uuid, 
+  void add_edge(uint64_t src_id, std::string label,
+                double weight, uint64_t dst_id, 
                 std::string payload = "");
-  void del_edge(std::string src_uuid, std::string label,
-                double weight, std::string dst_uuid);
+  void add_edge(std::string_view src_uuid, std::string label,
+                double weight, std::string_view dst_uuid,
+                std::string payload = "");
+
+  void del_edge(uint64_t src_id, std::string label,
+                double weight, uint64_t dst_id);
 
   // Mechanical Sympathy & HPC APIs
   SREMetrics &get_metrics() { return metrics_; }
+  const Settings& get_settings() const { return settings_; }
 
   // Pointer Swizzling Registry
-  void swizzle_node(std::string_view uuid, std::shared_ptr<Node> ptr);
-  std::shared_ptr<Node> get_swizzled(std::string_view uuid);
+  void swizzle_node(uint64_t id, std::shared_ptr<Node> ptr);
+  std::shared_ptr<Node> get_swizzled(uint64_t id);
 
   l3kv::Engine *get_store() const { return store_.get(); }
   
-  ClusterResolver& get_resolver() { return resolver_; }
-  RemoteL3KVClient& get_remote_client() { return remote_client_; }
+  FederationResolver& get_resolver() { return resolver_; }
+  RemoteL3KVClient& get_remote_client() { return *remote_client_; }
+  void set_remote_client(std::unique_ptr<RemoteL3KVClient> client) { remote_client_ = std::move(client); }
   EdgeCoordinator& get_edge_coordinator() { return *edge_coordinator_; }
+  ThreadPool& get_thread_pool() { return *pool_; }
+  std::shared_ptr<ThreadPool> get_thread_pool_ptr() { return pool_; }
 
 private:
   struct CacheShard {
     std::mutex mutex;
-    std::unordered_map<std::string, std::shared_ptr<Node>> map;
-    std::list<std::string> lru;
-    static constexpr size_t MAX_SHARD_SIZE = 2000;
+    std::unordered_map<uint64_t, std::shared_ptr<Node>> map;
+    std::list<uint64_t> lru;
   };
 
-  size_t get_cache_shard(std::string_view uuid);
+  size_t get_cache_shard(uint64_t id);
 
   std::unique_ptr<l3kv::Engine> store_;
-  ClusterResolver resolver_;
-  RemoteL3KVClient remote_client_;
+  FederationResolver resolver_;
+  std::unique_ptr<RemoteL3KVClient> remote_client_;
   std::unique_ptr<EdgeCoordinator> edge_coordinator_;
+  std::shared_ptr<ThreadPool> pool_;
+  Settings settings_;
   
   std::vector<std::unique_ptr<CacheShard>> cache_shards_;
-  static constexpr size_t CACHE_SHARDS = 8;
   
   SREMetrics metrics_;
 };

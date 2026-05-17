@@ -5,6 +5,7 @@
 #include <cstring>
 #include <cstdio>
 #include <array>
+#include <cstdint>
 
 namespace l3kvg {
 
@@ -12,20 +13,20 @@ class KeyBuilder {
 public:
     static constexpr size_t MAX_KEY_SIZE = 1024;
 
-    // Build node key: n:{uuid}
-    static std::string_view node_key(std::string_view uuid) {
+    // Build node key: n:{id}
+    static std::string_view node_key(uint64_t id) {
         char* buf = get_buffer();
-        int len = std::snprintf(buf, MAX_KEY_SIZE, "n:{%.*s}", 
-                                static_cast<int>(uuid.size()), uuid.data());
+        int len = std::snprintf(buf, MAX_KEY_SIZE, "n:{%016llx}", 
+                                static_cast<unsigned long long>(id));
         if (len < 0 || len >= static_cast<int>(MAX_KEY_SIZE)) return {};
         return std::string_view(buf, static_cast<size_t>(len));
     }
 
     // Build edge out prefix: e:out:{src}:{label}:
-    static std::string_view edge_prefix(std::string_view src_uuid, std::string_view label) {
+    static std::string_view edge_prefix(uint64_t src_id, std::string_view label) {
         char* buf = get_buffer();
-        int len = std::snprintf(buf, MAX_KEY_SIZE, "e:out:{%.*s}:%.*s:",
-                                static_cast<int>(src_uuid.size()), src_uuid.data(),
+        int len = std::snprintf(buf, MAX_KEY_SIZE, "e:out:{%016llx}:%.*s:",
+                                static_cast<unsigned long long>(src_id),
                                 static_cast<int>(label.size()), label.data());
         if (len < 0 || len >= static_cast<int>(MAX_KEY_SIZE)) return {};
         return std::string_view(buf, static_cast<size_t>(len));
@@ -40,36 +41,36 @@ public:
     }
 
     // Build edge key: e:out:{src}:{label}:{weight}:{dst}
-    static std::string_view edge_out_key(std::string_view src_uuid, std::string_view label, 
-                                         double weight, std::string_view dst_uuid) {
+    static std::string_view edge_out_key(uint64_t src_id, std::string_view label, 
+                                         double weight, uint64_t dst_id) {
         char* buf = get_buffer();
-        int len = std::snprintf(buf, MAX_KEY_SIZE, "e:out:{%.*s}:%.*s:%012.4f:{%.*s}", 
-                                static_cast<int>(src_uuid.size()), src_uuid.data(), 
+        int len = std::snprintf(buf, MAX_KEY_SIZE, "e:out:{%016llx}:%.*s:%012.4f:{%016llx}", 
+                                static_cast<unsigned long long>(src_id),
                                 static_cast<int>(label.size()), label.data(),
                                 weight,
-                                static_cast<int>(dst_uuid.size()), dst_uuid.data());
+                                static_cast<unsigned long long>(dst_id));
         if (len < 0 || len >= static_cast<int>(MAX_KEY_SIZE)) return {};
         return std::string_view(buf, static_cast<size_t>(len));
     }
 
     // Build incoming edge prefix: e:in:{dst}:{label}:
-    static std::string_view edge_in_prefix(std::string_view dst_uuid, std::string_view label) {
+    static std::string_view edge_in_prefix(uint64_t dst_id, std::string_view label) {
         char* buf = get_buffer();
-        int len = std::snprintf(buf, MAX_KEY_SIZE, "e:in:{%.*s}:%.*s:",
-                                static_cast<int>(dst_uuid.size()), dst_uuid.data(),
+        int len = std::snprintf(buf, MAX_KEY_SIZE, "e:in:{%016llx}:%.*s:",
+                                static_cast<unsigned long long>(dst_id),
                                 static_cast<int>(label.size()), label.data());
         if (len < 0 || len >= static_cast<int>(MAX_KEY_SIZE)) return {};
         return std::string_view(buf, static_cast<size_t>(len));
     }
 
     // Build incoming edge key: e:in:{dst}:{label}:{src}
-    static std::string_view edge_in_key(std::string_view dst_uuid, std::string_view label, 
-                                         std::string_view src_uuid) {
+    static std::string_view edge_in_key(uint64_t dst_id, std::string_view label, 
+                                         uint64_t src_id) {
         char* buf = get_buffer();
-        int len = std::snprintf(buf, MAX_KEY_SIZE, "e:in:{%.*s}:%.*s:{%.*s}", 
-                                static_cast<int>(dst_uuid.size()), dst_uuid.data(), 
+        int len = std::snprintf(buf, MAX_KEY_SIZE, "e:in:{%016llx}:%.*s:{%016llx}", 
+                                static_cast<unsigned long long>(dst_id),
                                 static_cast<int>(label.size()), label.data(),
-                                static_cast<int>(src_uuid.size()), src_uuid.data());
+                                static_cast<unsigned long long>(src_id));
         if (len < 0 || len >= static_cast<int>(MAX_KEY_SIZE)) return {};
         return std::string_view(buf, static_cast<size_t>(len));
     }

@@ -24,8 +24,8 @@ TEST(EdgePropertiesTest, StoreAndRetrieveProperties) {
         ASSERT_EQ(edges.size(), 1);
         auto edge = edges[0];
         
-        EXPECT_EQ(edge->get_src(), "a");
-        EXPECT_EQ(edge->get_dst(), "b");
+        EXPECT_EQ(edge->get_src(), engine.get_resolver().parse_uuid("a"));
+        EXPECT_EQ(edge->get_dst(), engine.get_resolver().parse_uuid("b"));
         EXPECT_EQ(edge->get_label(), "works_with");
         EXPECT_DOUBLE_EQ(edge->get_weight(), 1.0);
         

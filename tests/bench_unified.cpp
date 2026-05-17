@@ -24,7 +24,7 @@
 #include <numeric>
 
 #include "L3KVG/EdgeCoordinator.hpp"
-#include "L3KVG/ClusterResolver.hpp"
+#include "L3KVG/FederationResolver.hpp"
 #include "L3KVG/RemoteL3KVClient.hpp"
 #include "L3KVG/Engine.hpp"
 #include "engine/store.hpp"
@@ -58,7 +58,7 @@ void run_kv_bench(l3kvg::EdgeCoordinator& coordinator, int num_ops, int threads)
     std::cout << "KV Ops Phase Finished (Internal only in this proxy mode)\n";
 }
 
-void run_graph_bench(l3kvg::EdgeCoordinator& coordinator, int num_edges, int threads) {
+void run_graph_bench(l3kvg::EdgeCoordinator& coordinator, l3kvg::FederationResolver& resolver, int num_edges, int threads) {
     std::cout << "--- Phase 2: L3KVG Unified Edge Creation (" << num_edges << " edges, " << threads << " threads) ---\n";
     std::atomic<int> completed{0};
     auto start = std::chrono::high_resolution_clock::now();
@@ -74,7 +74,9 @@ void run_graph_bench(l3kvg::EdgeCoordinator& coordinator, int num_edges, int thr
                     std::string src = "u_" + std::to_string(src_idx);
                     std::string dst = "u_" + std::to_string(dst_idx);
                     
-                    auto fut = coordinator.atomic_put_edge(src, "knows", 1.0, dst, "{\"meta\": \"bench\"}");
+                    uint64_t src_id = resolver.parse_uuid(src);
+                    uint64_t dst_id = resolver.parse_uuid(dst);
+                    auto fut = coordinator.atomic_put_edge(src_id, "knows", 1.0, dst_id, "{\"meta\": \"bench\"}");
                     if (i == (num_edges / threads) - 1) fut.get();
                     completed++;
                 }
@@ -105,17 +107,19 @@ int main() {
         ring->add_node(2);
         ring->add_node(3);
 
-        l3kvg::ClusterResolver resolver(ring, 1);
+        l3kvg::FederationResolver resolver(ring, 1);
         l3kvg::RemoteL3KVClient remote_client;
         remote_client.add_peer(1, "tcp://127.0.0.1:8081");
         remote_client.add_peer(2, "tcp://127.0.0.1:8082");
         remote_client.add_peer(3, "tcp://127.0.0.1:8083");
 
+        auto pool = std::make_shared<l3kvg::ThreadPool>(4);
+        remote_client.set_thread_pool(pool);
 
         auto engine_kv = std::make_unique<l3kv::Engine>("bench_unified_db", 1);
-        l3kvg::EdgeCoordinator coordinator(engine_kv.get(), resolver, remote_client, 1);
+        l3kvg::EdgeCoordinator coordinator(engine_kv.get(), resolver, remote_client, 1, pool);
 
-        run_graph_bench(coordinator, 100000, 16);
+        run_graph_bench(coordinator, resolver, 100000, 16);
 
     } catch (const std::exception& e) {
         std::cerr << "Critical Error: " << e.what() << "\n";
