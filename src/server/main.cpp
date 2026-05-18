@@ -58,14 +58,23 @@ struct PeerConfig {
   int port;
 };
 
+struct FederationConfig {
+  uint16_t id;
+  std::string name;
+  std::vector<std::string> endpoints;
+};
+
 struct Config {
   std::string address = "0.0.0.0";
   int port = 8080;
   int zmq_port = 8081;
   uint32_t node_id = 1;
+  uint16_t cluster_id = 1;
+  std::string cluster_name = "local";
   std::string db_path = "prod_l3kvg_db";
   size_t thread_pool_size = 256;
   std::vector<PeerConfig> peers;
+  std::vector<FederationConfig> federations;
   size_t node_cache_size_per_shard = 2000;
   size_t node_cache_shards = 8;
   size_t edge_write_shards = 8;
@@ -91,6 +100,8 @@ Config load_config(const std::string &path) {
       cfg.port = j.value("port", cfg.port);
       cfg.zmq_port = j.value("zmq_port", cfg.port + 1);
       cfg.node_id = j.value("node_id", cfg.node_id);
+      cfg.cluster_id = j.value("cluster_id", cfg.cluster_id);
+      cfg.cluster_name = j.value("cluster_name", cfg.cluster_name);
       cfg.db_path = j.value("db_path", cfg.db_path);
       cfg.thread_pool_size = j.value("thread_pool_size", cfg.thread_pool_size);
       if (j.contains("peers")) {
@@ -98,6 +109,15 @@ Config load_config(const std::string &path) {
           cfg.peers.push_back({p.value("id", 0u), p.value("host", "127.0.0.1"),
                                p.value("port", 8080)});
         }
+      }
+      if (j.contains("federations")) {
+          for (auto &f : j["federations"]) {
+              cfg.federations.push_back({
+                  static_cast<uint16_t>(f.value("id", 0u)),
+                  f.value("name", ""),
+                  f.value("endpoints", std::vector<std::string>{})
+              });
+          }
       }
       cfg.node_cache_size_per_shard = j.value("node_cache_size_per_shard", cfg.node_cache_size_per_shard);
       cfg.node_cache_shards = j.value("node_cache_shards", cfg.node_cache_shards);
@@ -154,9 +174,14 @@ int main(int argc, char *argv[]) {
 
     auto ring = std::make_shared<lite3::ConsistentHash>();
     ring->add_node(cfg.node_id);
-    printf("Step 3: Ring initialized\n"); fflush(stdout);
+    for (const auto &p : cfg.peers) {
+        ring->add_node(p.id);
+    }
+    printf("Step 3: Ring initialized with %zu local peers\n", cfg.peers.size() + 1); fflush(stdout);
 
     auto engine = std::make_unique<l3kvg::Engine>(cfg.db_path, cfg.node_id, ring, cfg.thread_pool_size, settings);
+    engine->get_resolver().register_local_cluster(cfg.cluster_name, cfg.cluster_id);
+    
     auto logger = std::make_shared<FileLogger>("node" + std::to_string(cfg.node_id) + ".log");
     engine->get_store()->set_logger(logger);
     printf("Step 4: Engine created with logging to node%u.log\n", cfg.node_id); fflush(stdout);
@@ -166,7 +191,15 @@ int main(int argc, char *argv[]) {
       engine->get_remote_client().add_peer(
           p.id, "tcp://" + p.host + ":" + std::to_string(p.port));
     }
-    printf("Step 6: Peers added\n"); fflush(stdout);
+
+    for (const auto &f : cfg.federations) {
+        printf("Step 5.5: Registering federation: %s (ID: %u)\n", f.name.c_str(), f.id); fflush(stdout);
+        engine->get_resolver().register_federation(f.name, f.id, f.endpoints);
+        for (const auto &ep : f.endpoints) {
+            engine->get_remote_client().add_peer(f.id, ep);
+        }
+    }
+    printf("Step 6: Peers and Federations added\n"); fflush(stdout);
 
     l3kvg::CypherParser parser(engine.get());
     printf("Step 7: Parser created\n"); fflush(stdout);

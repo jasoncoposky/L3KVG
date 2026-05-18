@@ -32,19 +32,63 @@ The engine has evolved from local clusters into a globally interconnected graph 
 - **Inter-Cluster Replication**: Updates are asynchronously broadcast to all other N regional clusters. Every packet carries an `OriginClusterID` to prevent broadcast loops.
 - **Resilient Federation**: Remote regions are accessed via a "Local-First" routing strategy. If a local replicated copy is unavailable, the engine falls back to remote federation, protected by a state-machine circuit breaker.
 
-### Production Audit Status
-| Feature | Status | Notes |
-| :--- | :--- | :--- |
-| **Consistency** | ✅ HLC + LWW | Global Active-Active deterministic convergence. |
-| **Persistence** | ✅ L3KV WAL | Crash-safe with zero-data-loss durability. |
-| **Performance** | ✅ Zero-Copy | Sub-500µs local sharded traversals. |
-| **Resilience** | ✅ Circuit Breaker | Fail-fast with background heartbeat recovery. |
-| **Security** | ⚠️ Needs Proxy | No built-in TLS/Auth. Use Nginx/mTLS. |
-| **Availability** | ✅ Global Mesh | Federated AP Sharding + N-way replication. |
+## Configuration Guide
+
+L3KVG nodes are configured via a `config.json` file passed at startup.
+
+### 1. Local Cluster (Sharding)
+To set up a local 3-node cluster, each node must list its local peers. This populates the `ConsistentHash` ring and enables intra-cluster RPC.
+
+```json
+{
+  "node_id": 101,
+  "cluster_id": 1,
+  "cluster_name": "us-east",
+  "zmq_port": 9001,
+  "peers": [
+    { "id": 102, "host": "10.0.0.2", "port": 9001 },
+    { "id": 103, "host": "10.0.0.3", "port": 9001 }
+  ]
+}
+```
+
+### 2. Global Federation (N-Way Replication)
+To interconnect regional clusters, add the `federations` section. Any cluster listed here will receive asynchronous replication updates (Active-Active) and participate in federated queries.
+
+```json
+{
+  "node_id": 101,
+  "cluster_id": 1,
+  "federations": [
+    {
+      "id": 2,
+      "name": "eu-west",
+      "endpoints": ["tcp://52.1.2.3:9001"]
+    },
+    {
+      "id": 3,
+      "name": "asia-pacific",
+      "endpoints": ["tcp://13.4.5.6:9001"]
+    }
+  ]
+}
+```
+
+### 3. Operational Parameters
+Tune the circuit breaker and replication performance based on your network environment.
+
+```json
+{
+  "fed_timeout_ms": 500,
+  "breaker_failure_threshold": 3,
+  "breaker_reset_timeout_ms": 10000,
+  "health_check_interval_ms": 2000,
+  "node_cache_shards": 16,
+  "edge_write_shards": 16
+}
+```
 
 ## ZMQ Replication Protocol (Internal)
-
-L3KVG nodes communicate using a high-performance multipart ZMQ protocol:
 
 | Opcode | Description | Structure |
 | :--- | :--- | :--- |
@@ -57,30 +101,16 @@ L3KVG nodes communicate using a high-performance multipart ZMQ protocol:
 
 ## Getting Started
 
-### 1. Build Requirements
-- C++20 Compiler (GCC 11+, Clang 13+, MSVC 2022)
-- CMake 3.20+
-- ZeroMQ & CPPZMQ (Included via FetchContent)
-- L3KV Core (Sibling directory)
-
-### 2. Quick Run
+### 1. Build
 ```bash
 mkdir build && cd build
 cmake ..
 make -j$(nproc)
-./l3kvg_server ../node1.json
 ```
 
-### 3. Dynamic Configuration (`config.json`)
-```json
-{
-  "node_id": 1,
-  "fed_timeout_ms": 500,
-  "breaker_failure_threshold": 3,
-  "breaker_reset_timeout_ms": 5000,
-  "health_check_interval_ms": 1000,
-  "node_cache_shards": 8
-}
+### 2. Run
+```bash
+./l3kvg_server config.json
 ```
 
 Detailed API documentation is available in [API.md](API.md).
