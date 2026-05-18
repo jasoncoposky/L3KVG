@@ -97,6 +97,30 @@ add_executable(test_federation_complex tests/test_federation_complex.cpp)
 target_link_libraries(test_federation_complex PRIVATE l3kvg_engine gtest_main Threads::Threads $<$<BOOL:${WIN32}>:ws2_32>)
 add_test(NAME test_federation_complex COMMAND test_federation_complex)
 
+add_executable(test_circuit_breaker tests/test_circuit_breaker.cpp)
+target_link_libraries(test_circuit_breaker PRIVATE l3kvg_engine gtest_main Threads::Threads $<$<BOOL:${WIN32}>:ws2_32>)
+add_test(NAME test_circuit_breaker COMMAND test_circuit_breaker)
+
+add_executable(test_replication_routing tests/test_replication_routing.cpp)
+target_link_libraries(test_replication_routing PRIVATE l3kvg_engine gtest_main Threads::Threads $<$<BOOL:${WIN32}>:ws2_32>)
+add_test(NAME test_replication_routing COMMAND test_replication_routing)
+
+add_executable(test_replication_broadcast tests/test_replication_broadcast.cpp)
+target_link_libraries(test_replication_broadcast PRIVATE l3kvg_engine gtest_main Threads::Threads $<$<BOOL:${WIN32}>:ws2_32>)
+add_test(NAME test_replication_broadcast COMMAND test_replication_broadcast)
+
+add_executable(test_replication_loop tests/test_replication_loop.cpp)
+target_link_libraries(test_replication_loop PRIVATE l3kvg_engine gtest_main Threads::Threads $<$<BOOL:${WIN32}>:ws2_32>)
+add_test(NAME test_replication_loop COMMAND test_replication_loop)
+
+add_executable(test_replication_conflict tests/test_replication_conflict.cpp)
+target_link_libraries(test_replication_conflict PRIVATE l3kvg_engine gtest_main Threads::Threads $<$<BOOL:${WIN32}>:ws2_32>)
+add_test(NAME test_replication_conflict COMMAND test_replication_conflict)
+
+add_executable(test_ultimate_mesh tests/test_ultimate_mesh.cpp)
+target_link_libraries(test_ultimate_mesh PRIVATE l3kvg_engine gtest_main Threads::Threads $<$<BOOL:${WIN32}>:ws2_32>)
+add_test(NAME test_ultimate_mesh COMMAND test_ultimate_mesh)
+
 add_executable(l3kvg_server src/server/main.cpp)
 target_link_libraries(l3kvg_server PRIVATE l3kvg_engine Threads::Threads $<$<BOOL:${WIN32}>:ws2_32> $<$<BOOL:${WIN32}>:wsock32> $<$<BOOL:${WIN32}>:crypt32>)
 

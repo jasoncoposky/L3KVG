@@ -57,7 +57,7 @@ CypherParser::execute(std::string_view query_text) {
   parse_props(src_props, src_alias);
 
   // Search for WHERE clause
-  double min_weight = -999999.0;
+  double min_weight = engine_->get_settings().default_min_weight;
   std::regex where_rx(R"(WHERE\s+([^\.]+)\.([^ ]+)\s*(>=|>|=)\s*([0-9\.]+))");
   std::smatch where_ast;
   if (std::regex_search(query, where_ast, where_rx)) {

@@ -2,112 +2,85 @@
   <img src="l3kvg_logo.jpg" alt="L3KVG Logo" width="100%" />
 </p>
 
-# L3KVG: High-Performance Embedded Graph Engine
+# L3KVG: High-Performance Federated Sharded Mesh
 
-L3KVG is a C++20 embedded property graph engine built directly on top of the **L3KV** actor-model key-value store, leveraging **lite3-cpp** for zero-copy native BSON-like JSON document resolution over PMR (Polymorphic Memory Resources).
+L3KVG is a C++20 embedded property graph engine built directly on top of the **L3KV** high-performance key-value store. It provides horizontal scalability via consistent hashing, geographic resilience via N-way replication, and production-grade failure management via built-in circuit breakers.
 
-## Features
+## Key Features
 
-- **Embedded & Network-Free:** No serialized network round-trips. Direct pointer-local traversals isolated completely to the host process.
-- **Fluent C++ API:** A Cypher-inspired fluent builder API natively available directly in C++.
-- **Zero-Copy Attributes:** Node and Edge properties are represented as `lite3::Buffer` views, enforcing lazy evaluation. Attributes are only dynamically allocated and resolved exactly when projected.
-- **Lock-Free Concurrency:** Fully concurrent multi-threaded architecture leveraging L3KV's internal 64-way sharded actor-model message queues, bypassing global serialization locks.
-- **Horizontal Scaling**: Native support for sharded graph distribution across a cluster using consistent hashing and HLC-synchronized distributed writes.
-- **SRE-First Observability**: Built-in metrics engine with dedicated React-based visualizer for tracking topology and performance.
-
-## Horizontal Scaling & Distribution
-
-L3KVG Evolution 2 transitions the engine from local-only to a distributed graph fabric:
-
-- **Cluster Mapping**: Utilizes `ConsistentHash` to deterministically shard nodes across physical peers.
-- **Transparent RPC**: `RemoteL3KVClient` automatically forwards property lookups and neighbor traversals to the owner node via high-performance ZeroMQ (ZMQ_DEALER/ROUTER).
-- **Atomic Edge Coordination**: The `EdgeCoordinator` implements a dual-shard write protocol with Hybrid Logical Clocks (HLC), ensuring causal consistency for edges spanning multiple physical nodes.
-- **Auto-Routing**: `Engine::put_node` automatically routes write operations to the correct shard owner in the cluster.
-- **Structured Edge Metadata**: Evolutionary support for rich property objects on edges, maintained with HLC consistency and stored in zero-copy BSON buffers.
-
-## Edge Properties & Structured Metadata
-
-L3KVG Evolution 3 introduces support for structured edge metadata. Each edge can now carry a full JSON payload. User-defined properties are automatically nested under a `props` key to separate them from system metadata (e.g., timestamps):
-
-- **Atomic Hydration**: Edge properties are hydrated automatically from the distributed store during `get_edges()` calls.
-- **Type-Safe Access**: Retrieve properties using the `get_attribute<T>(key)` template method on the `Edge` object.
-- **Zero-Collision Mapping**: The engine ensures that user properties do not overwrite system-level telemetry like the logical clock.
+- **Embedded & Network-Free**: Zero-copy pointer-local traversals. All graph logic resides in-process for sub-microsecond local access.
+- **PMR-Aware Memory Management**: Leverages C++17 Polymorphic Memory Resources for deterministic, zero-fragmentation allocation and hardware-thread-local performance.
+- **Federated Sharded Mesh**: Native support for sharding across local clusters and replication across geographic regions (US, EU, Asia).
+- **Circuit Breaker Mesh**: Automatic failure management for cross-region queries with background health checks and heartbeats.
+- **Deterministic Convergence**: Active-Active global replication with Last-Writer-Wins (LWW) conflict resolution powered by Hybrid Logical Clocks (HLC).
+- **Cypher-Lite Parser**: High-performance regex-assisted query engine supporting multi-hop federated MATCH/WHERE/RETURN traversals.
+- **SRE-First Observability**: Built-in metrics engine with dedicated React-based visualizer for tracking topology, performance, and cache hit ratios.
 
 ## Architecture & Performance
 
-To meet strict SRE guidelines (sub-500µs single hop traversal, >10,000 ops/sec writing), L3KVG implements the following foundational patterns:
+L3KVG uses a tiered storage and access model optimized for high-throughput workloads:
 
-- **Redis-style Hash Tagging (`{id}`)**: By embedding routing tags directly in edge keys (e.g. `e:out:{uuid}:label:weight:dst`), all outbound and inbound edges form contiguous edge blocks residing strictly on the **same hardware thread/shard** as their parent graph node.
-- **Actor-Model Routines**: `add_edge` and adjacency traversals encapsulate execution closures and pass them to bounded underlying core routines. This removes the necessity of thread-unsafe maps, achieving safe parallel traversal isolation.
-- **ZeroMQ Asynchronous Pipeline**: Leverages L3KV's April 2026 ZeroMQ upgrade, achieving **~97,000** concurrent edge additions/sec across a 3-node cluster.
+1.  **L1 Cache (PMR)**: Hot nodes are pinned in hardware-thread-local memory for zero-serialized access.
+2.  **L2 Shard (ZMQ)**: Warm nodes are sharded across the local cluster using consistent hashing, accessible via sub-500µs transparent RPC.
+3.  **L3 Disk (L3KV)**: Cold nodes reside in the high-performance WAL-backed store with zero-data-loss durability.
 
-- **Spin-Lock De-jitter**: By inserting spin-cycles preceding task yielding upon empty queues, L3KVG bypasses OS-level thread rescheduling penalties (~1-15ms Windows Jitter).
+### Distribution & Global Mesh
+The engine has evolved from local clusters into a globally interconnected graph fabric:
 
-## API Example
-
-```cpp
-#include "L3KVG/Engine.hpp"
-
-// Initialize Graph Engine bounds
-auto engine = std::make_unique<l3kvg::Engine>("db_path_test", 1);
-
-// Add Nodes
-engine->put_node("npc_1", R"({"name": "Thief", "type": "npc"})");
-engine->put_node("npc_2", R"({"name": "Guard", "type": "npc"})");
-
-// Link Edges with properties
-engine->add_edge("npc_1", "knows", 1.0, "npc_2", R"({"since": 2021, "status": "allied"})");
-
-// Fluent Traversal Pipeline
-auto results = engine->query()
-    .match("npc_1")
-    .where_eq("type", "npc")
-    .out("knows")
-    .return_({"name"})
-    .execute();
-
-// Direct Attribute Access
-auto edges = node->get_edges("knows", l3kvg::Direction::OUT);
-for (auto& edge : edges) {
-    int year = edge->get_attribute<int>("since");
-    std::string status = edge->get_attribute<std::string>("status");
-}
-```
-
-## SRE Metrics Dashboard & Native Cypher Graph
-
-The L3KVG Engine includes an embedded C++ `httplib` server serving directly over internal memory spaces tracking engine cache retention algorithms and parsing Cypher AST topologies. 
-
-**Running the SRE Visualizer:**
-
-1. **Start the API Server:**
-   ```bash
-   cmake --build build --config Release --target l3kvg_server
-   ./build/Release/l3kvg_server.exe
-   ```
-2. **Start the React Visualizer:**
-   ```bash
-   cd dashboard
-   npm install
-   npm run dev
-   ```
-   Navigate to `http://localhost:5173`. The application leverages Google Material Design 3 UI and strict D3 mapping algorithms to plot Cypher queries (`/api/query`) visibly directly out of the L3KV Graph Engine embedded runtime.
-
-## Production Readiness & Deployment
-
-### Deployment Strategy
-L3KVG is designed for **Shared-Nothing Architecture**. To deploy a cluster:
-1. **Configure Peers**: Seed the `ClusterResolver` with the IP/Port of all participating nodes.
-2. **Persistence**: Ensure each node has a dedicated NVMe path for the L3KV WAL (`node.wal`).
-3. **Networking**: Open ports for the Internal API (default: 8080) for cross-shard edge coordination.
+- **Cluster Mapping**: Utilizes `ConsistentHash` to deterministically shard nodes across physical peers.
+- **Atomic Edge Coordination**: The `EdgeCoordinator` implements a dual-shard write protocol with HLC synchronization, ensuring causal consistency for edges spanning multiple physical nodes.
+- **Inter-Cluster Replication**: Updates are asynchronously broadcast to all other N regional clusters. Every packet carries an `OriginClusterID` to prevent broadcast loops.
+- **Resilient Federation**: Remote regions are accessed via a "Local-First" routing strategy. If a local replicated copy is unavailable, the engine falls back to remote federation, protected by a state-machine circuit breaker.
 
 ### Production Audit Status
 | Feature | Status | Notes |
 | :--- | :--- | :--- |
-| **Consistency** | ✅ HLC Synced | Causal consistency across shards. |
+| **Consistency** | ✅ HLC + LWW | Global Active-Active deterministic convergence. |
 | **Persistence** | ✅ L3KV WAL | Crash-safe with zero-data-loss durability. |
-| **Performance** | ✅ Zero-Copy | Sub-500µs local traversals. |
+| **Performance** | ✅ Zero-Copy | Sub-500µs local sharded traversals. |
+| **Resilience** | ✅ Circuit Breaker | Fail-fast with background heartbeat recovery. |
 | **Security** | ⚠️ Needs Proxy | No built-in TLS/Auth. Use Nginx/mTLS. |
-| **Availability** | ✅ AP Sharding | Self-healing via Active Anti-Entropy (AAE). |
+| **Availability** | ✅ Global Mesh | Federated AP Sharding + N-way replication. |
 
-Detailed API documentation is available in [API.md](file:///c:/Users/jason/playground/L3KVG/API.md).
+## ZMQ Replication Protocol (Internal)
+
+L3KVG nodes communicate using a high-performance multipart ZMQ protocol:
+
+| Opcode | Description | Structure |
+| :--- | :--- | :--- |
+| **G** | Get Node | `[Identity, Delimiter, "G", HexID]` |
+| **N** | Get Neighbors | `[Identity, Delimiter, "N", HexID, Label, MinWeight]` |
+| **R** | Resume Query | `[Identity, Delimiter, "R", NodeListJSON, QueryJSON]` |
+| **P** | Put Node/Edge | `[Identity, Delimiter, "P", Key, Payload]` |
+| **S** | Replication Sync | `[Identity, Delimiter, "S", Key, Payload, OriginID]` |
+| **H** | Heartbeat | `[Identity, Delimiter, "H", Dummy]` |
+
+## Getting Started
+
+### 1. Build Requirements
+- C++20 Compiler (GCC 11+, Clang 13+, MSVC 2022)
+- CMake 3.20+
+- ZeroMQ & CPPZMQ (Included via FetchContent)
+- L3KV Core (Sibling directory)
+
+### 2. Quick Run
+```bash
+mkdir build && cd build
+cmake ..
+make -j$(nproc)
+./l3kvg_server ../node1.json
+```
+
+### 3. Dynamic Configuration (`config.json`)
+```json
+{
+  "node_id": 1,
+  "fed_timeout_ms": 500,
+  "breaker_failure_threshold": 3,
+  "breaker_reset_timeout_ms": 5000,
+  "health_check_interval_ms": 1000,
+  "node_cache_shards": 8
+}
+```
+
+Detailed API documentation is available in [API.md](API.md).

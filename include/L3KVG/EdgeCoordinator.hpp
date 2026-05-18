@@ -11,60 +11,22 @@
 #include <condition_variable>
 #include <atomic>
 #include <memory>
+#include <functional>
 #include "L3KVG/FederationResolver.hpp"
 #include "L3KVG/RemoteL3KVClient.hpp"
 #include "L3KVG/ThreadPool.hpp"
 #include "L3KVG/Settings.hpp"
+#include "L3KVG/HLC.hpp"
 #include "buffer.hpp"
 
 namespace l3kv { class Engine; }
 
 namespace l3kvg {
 
-struct HLCTimestamp {
-    uint64_t wall_time;
-    uint16_t logical;
-    uint32_t node_id;
-
-    std::string to_json_string() const {
-        return "{\"wall_time\": " + std::to_string(wall_time) + 
-               ", \"logical\": " + std::to_string(logical) + 
-               ", \"node_id\": " + std::to_string(node_id) + "}";
-    }
-};
-
-class HLCProvider {
-public:
-    explicit HLCProvider(uint32_t node_id) : node_id_(node_id), last_wall_time_(0), logical_counter_(0) {}
-
-    HLCTimestamp now() {
-        std::lock_guard<std::mutex> lock(mu_);
-        uint64_t current_wall = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
-        
-        if (current_wall == last_wall_time_) {
-            logical_counter_++;
-        } else if (current_wall > last_wall_time_) {
-            last_wall_time_ = current_wall;
-            logical_counter_ = 0;
-        } else {
-            current_wall = last_wall_time_;
-            logical_counter_++;
-        }
-
-        return {current_wall, logical_counter_, node_id_};
-    }
-
-private:
-    uint32_t node_id_;
-    uint64_t last_wall_time_;
-    uint16_t logical_counter_;
-    std::mutex mu_;
-};
-
 class EdgeCoordinator {
 public:
-    EdgeCoordinator(l3kv::Engine* store, FederationResolver& resolver, RemoteL3KVClient& remote_client, uint32_t node_id, std::shared_ptr<ThreadPool> pool, const Settings& settings = {});
+    EdgeCoordinator(l3kv::Engine* store, FederationResolver& resolver, RemoteL3KVClient& remote_client, uint32_t node_id, std::shared_ptr<ThreadPool> pool, const Settings& settings = {}, 
+                    std::function<void(const std::string&, const std::string&)> replication_cb = nullptr);
     ~EdgeCoordinator();
 
     std::future<void> atomic_put_edge(uint64_t src_id, const std::string& label, double weight, uint64_t dst_id, const std::string& payload = "");
@@ -96,6 +58,7 @@ private:
     
     std::thread flush_thread_;
     std::shared_ptr<ThreadPool> task_pool_;
+    std::function<void(const std::string&, const std::string&)> replication_cb_;
     std::atomic<bool> stop_flusher_{false};
     std::condition_variable cv_;
     std::mutex cv_mu_; // Dedicated mutex for the condition variable

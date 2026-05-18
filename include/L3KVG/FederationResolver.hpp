@@ -29,6 +29,8 @@ public:
   void register_federation(std::string name, uint16_t id, std::vector<std::string> endpoints);
   
   [[nodiscard]] bool is_local_cluster(uint16_t cluster_id) const noexcept;
+  [[nodiscard]] uint16_t get_local_cluster_id() const noexcept { return local_cluster_id_; }
+  [[nodiscard]] std::vector<uint16_t> get_remote_cluster_ids() const;
   [[nodiscard]] std::shared_ptr<const std::vector<std::string>> get_federation_endpoints(uint16_t cluster_id) const noexcept;
 
   // Edge-Hashed String Mapping

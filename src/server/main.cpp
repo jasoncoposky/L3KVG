@@ -72,6 +72,12 @@ struct Config {
   size_t prefix_scan_limit = 1000;
   int zmq_sndhwm = 1000;
   int edge_flush_interval_ms = 2;
+  int fed_timeout_ms = 500;
+  int breaker_failure_threshold = 3;
+  int breaker_reset_timeout_ms = 5000;
+  int health_check_interval_ms = 1000;
+  size_t node_initial_buffer_size = 1024;
+  double default_min_weight = -999999.0;
 };
 
 Config load_config(const std::string &path) {
@@ -99,6 +105,12 @@ Config load_config(const std::string &path) {
       cfg.prefix_scan_limit = j.value("prefix_scan_limit", cfg.prefix_scan_limit);
       cfg.zmq_sndhwm = j.value("zmq_sndhwm", cfg.zmq_sndhwm);
       cfg.edge_flush_interval_ms = j.value("edge_flush_interval_ms", cfg.edge_flush_interval_ms);
+      cfg.fed_timeout_ms = j.value("fed_timeout_ms", cfg.fed_timeout_ms);
+      cfg.breaker_failure_threshold = j.value("breaker_failure_threshold", cfg.breaker_failure_threshold);
+      cfg.breaker_reset_timeout_ms = j.value("breaker_reset_timeout_ms", cfg.breaker_reset_timeout_ms);
+      cfg.health_check_interval_ms = j.value("health_check_interval_ms", cfg.health_check_interval_ms);
+      cfg.node_initial_buffer_size = j.value("node_initial_buffer_size", cfg.node_initial_buffer_size);
+      cfg.default_min_weight = j.value("default_min_weight", cfg.default_min_weight);
     } catch (...) {
       std::cerr << "Failed to parse config, using defaults.\n";
     }
@@ -133,6 +145,12 @@ int main(int argc, char *argv[]) {
     settings.prefix_scan_limit = cfg.prefix_scan_limit;
     settings.zmq_sndhwm = cfg.zmq_sndhwm;
     settings.edge_flush_interval_ms = cfg.edge_flush_interval_ms;
+    settings.fed_timeout_ms = cfg.fed_timeout_ms;
+    settings.breaker_failure_threshold = cfg.breaker_failure_threshold;
+    settings.breaker_reset_timeout_ms = cfg.breaker_reset_timeout_ms;
+    settings.health_check_interval_ms = cfg.health_check_interval_ms;
+    settings.node_initial_buffer_size = cfg.node_initial_buffer_size;
+    settings.default_min_weight = cfg.default_min_weight;
 
     auto ring = std::make_shared<lite3::ConsistentHash>();
     ring->add_node(cfg.node_id);
@@ -192,6 +210,33 @@ int main(int argc, char *argv[]) {
                     sock.send(zmq::message_t(), zmq::send_flags::sndmore);
                     sock.send(zmq::message_t("[]", 2), zmq::send_flags::none);
                 }
+            } else if (opcode == "N") {
+                // GET neighbors
+                try {
+                    uint64_t target_id = std::stoull(recv_msgs[3].to_string(), nullptr, 16);
+                    std::string label = recv_msgs[4].to_string();
+                    double min_weight = 0.0;
+                    if (recv_msgs.size() >= 6) min_weight = std::stod(recv_msgs[5].to_string());
+                    
+                    auto node = engine->get_node(target_id);
+                    auto neighbors = node->get_neighbors(label, min_weight);
+                    
+                    json j_neighs = json::array();
+                    for (auto id : neighbors) {
+                        char id_buf[17];
+                        std::snprintf(id_buf, sizeof(id_buf), "%016llx", (unsigned long long)id);
+                        j_neighs.push_back(std::string(id_buf));
+                    }
+                    
+                    std::string resp_json = j_neighs.dump();
+                    sock.send(identity, zmq::send_flags::sndmore);
+                    sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                    sock.send(zmq::message_t(resp_json.data(), resp_json.size()), zmq::send_flags::none);
+                } catch (...) {
+                    sock.send(identity, zmq::send_flags::sndmore);
+                    sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                    sock.send(zmq::message_t("[]", 2), zmq::send_flags::none);
+                }
             } else if (opcode == "G") {
                 // GET node
                 try {
@@ -238,6 +283,30 @@ int main(int argc, char *argv[]) {
                         std::string val_str(reinterpret_cast<const char*>(val_bytes.data()), val_bytes.size());
                         engine->get_store()->put(key_str, val_str);
                     }
+                    sock.send(identity, zmq::send_flags::sndmore);
+                    sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                    sock.send(zmq::message_t("OK", 2), zmq::send_flags::none);
+                } catch (...) {
+                    sock.send(identity, zmq::send_flags::sndmore);
+                    sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                    sock.send(zmq::message_t("ERR", 3), zmq::send_flags::none);
+                }
+            } else if (opcode == "H") {
+                // HEARTBEAT
+                sock.send(identity, zmq::send_flags::sndmore);
+                sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                sock.send(zmq::message_t("OK", 2), zmq::send_flags::none);
+            } else if (opcode == "S") {
+                // REPLICATION SYNC
+                try {
+                    std::string key = recv_msgs[3].to_string();
+                    std::string payload = recv_msgs[4].to_string();
+                    uint16_t origin_cluster_id = 0;
+                    if (recv_msgs.size() >= 6) {
+                        origin_cluster_id = static_cast<uint16_t>(std::stoi(recv_msgs[5].to_string()));
+                    }
+                    engine->replicate_key(key, payload, origin_cluster_id);
+                    
                     sock.send(identity, zmq::send_flags::sndmore);
                     sock.send(zmq::message_t(), zmq::send_flags::sndmore);
                     sock.send(zmq::message_t("OK", 2), zmq::send_flags::none);

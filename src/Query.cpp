@@ -399,6 +399,7 @@ std::vector<ResultRow> Query::execute() {
           results.insert(results.end(), remote_res.begin(), remote_res.end());
       } catch (const std::exception& e) {
           std::cerr << "[Query::execute] Remote query failed: " << e.what() << "\n";
+          if (starting_nodes_.empty()) throw; // Re-throw if top-level
       }
   }
 

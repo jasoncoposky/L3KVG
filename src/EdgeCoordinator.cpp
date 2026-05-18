@@ -9,11 +9,13 @@
 
 namespace l3kvg {
 
-EdgeCoordinator::EdgeCoordinator(l3kv::Engine* store, FederationResolver& resolver, RemoteL3KVClient& remote_client, uint32_t node_id, std::shared_ptr<ThreadPool> pool, const Settings& settings)
+EdgeCoordinator::EdgeCoordinator(l3kv::Engine* store, FederationResolver& resolver, RemoteL3KVClient& remote_client, uint32_t node_id, std::shared_ptr<ThreadPool> pool, const Settings& settings, 
+                                 std::function<void(const std::string&, const std::string&)> replication_cb)
     : store_(store), resolver_(resolver), remote_client_(remote_client), hlc_(node_id), 
       num_shards_(settings.edge_write_shards), 
       edge_flush_interval_ms_(settings.edge_flush_interval_ms),
-      task_pool_(std::move(pool)) {
+      task_pool_(std::move(pool)),
+      replication_cb_(std::move(replication_cb)) {
     shards_ = std::make_unique<BatchShard[]>(num_shards_);
     flush_thread_ = std::thread(&EdgeCoordinator::flush_loop, this);
 }
@@ -56,6 +58,11 @@ std::future<void> EdgeCoordinator::atomic_put_edge(uint64_t src_id, const std::s
             size_t shard_idx = store_->get_routing_shard(key);
             // Engine::put takes a string, we'll cast the data
             std::string binary_str(reinterpret_cast<const char*>(final_payload_data.data()), final_payload_data.size());
+            
+            if (replication_cb_) {
+                replication_cb_(key, binary_str);
+            }
+
             futures.push_back(store_->submit_to_shard_idx(shard_idx, [this, key, binary_str]() {
                 store_->put(key, binary_str);
             }));

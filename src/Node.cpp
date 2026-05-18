@@ -120,7 +120,9 @@ std::vector<uint64_t> Node::get_neighbors(std::string_view label,
           size_t end_brace = key.find_last_of('}');
           if (start_brace != std::string::npos && end_brace != std::string::npos && end_brace > start_brace) {
               std::string id_str = key.substr(start_brace + 1, end_brace - start_brace - 1);
-              neighbors.push_back(std::stoull(id_str, nullptr, 16));
+              uint64_t nid = std::stoull(id_str, nullptr, 16);
+              // std::cout << "  [Node " << id_ << "] Found neighbor " << nid << " via key " << key << std::endl;
+              neighbors.push_back(nid);
           }
       }
       return neighbors;
@@ -243,7 +245,7 @@ void Node::hydrate(const std::string &data) {
   if (loaded_.load(std::memory_order_relaxed)) return;
   
   if (data.empty()) {
-    payload_ = lite3cpp::Buffer(1024);
+    payload_ = lite3cpp::Buffer(engine_->get_settings().node_initial_buffer_size);
     payload_->init_object();
   } else {
     try {

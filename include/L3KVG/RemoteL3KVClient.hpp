@@ -21,6 +21,16 @@ namespace l3kvg {
 
 enum class CircuitState { CLOSED, OPEN, HALF_OPEN };
 
+class CircuitBreakerOpenException : public std::runtime_error {
+public:
+    explicit CircuitBreakerOpenException(const std::string& msg) : std::runtime_error(msg) {}
+};
+
+class FederationTimeoutException : public std::runtime_error {
+public:
+    explicit FederationTimeoutException(const std::string& msg) : std::runtime_error(msg) {}
+};
+
 class RemoteL3KVClient {
 public:
     RemoteL3KVClient(const Settings& settings = {});
@@ -76,6 +86,17 @@ public:
         const lite3cpp::Buffer& batch_buffer
     );
 
+    // Replication API
+    std::future<bool> replicate_async(
+        uint16_t cluster_id,
+        const std::string& key,
+        const std::string& payload,
+        uint16_t origin_cluster_id
+    );
+
+    // Diagnostics
+    std::future<bool> ping_peer(lite3::NodeID node_id);
+
     // Circuit Breaker API
     CircuitState get_circuit_state(lite3::NodeID node_id);
     void set_circuit_state(lite3::NodeID node_id, CircuitState state);
@@ -84,7 +105,7 @@ public:
 
 private:
     struct Session {
-        std::mutex mu;
+        std::recursive_mutex mu;
         std::unique_ptr<zmq::socket_t> socket;
         bool connected = false;
         std::atomic<CircuitState> state{CircuitState::CLOSED};
@@ -93,6 +114,8 @@ private:
     };
 
     std::shared_ptr<Session> get_session(lite3::NodeID node_id);
+    void check_circuit(std::shared_ptr<Session> session);
+    void run_health_check_loop();
 
     Settings settings_;
     std::unordered_map<lite3::NodeID, std::string> peer_endpoints_;
@@ -102,6 +125,9 @@ private:
     
     int zmq_sndhwm_;
     zmq::context_t zmq_ctx_;
+
+    std::atomic<bool> stop_health_check_{false};
+    std::thread health_check_thread_;
 };
 
 

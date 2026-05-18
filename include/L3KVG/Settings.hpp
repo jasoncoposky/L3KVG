@@ -15,6 +15,8 @@ struct Settings {
   int breaker_failure_threshold = 3;
   int breaker_reset_timeout_ms = 5000;
   int health_check_interval_ms = 1000;
+  size_t node_initial_buffer_size = 1024;
+  double default_min_weight = -999999.0;
 };
 
 } // namespace l3kvg

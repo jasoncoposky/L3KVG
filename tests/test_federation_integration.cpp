@@ -37,31 +37,66 @@ void run_mock_server(uint16_t port, uint16_t cluster_id, const std::string& db_p
             continue;
         }
 
-        if (recv_msgs.size() < 4) continue;
+        if (recv_msgs.size() < 4) {
+            continue;
+        }
 
         auto& identity = recv_msgs[0];
         auto opcode = recv_msgs[2].to_string();
 
         if (opcode == "R") {
-            std::vector<uint64_t> nodes = json::parse(recv_msgs[3].to_string());
-            std::string query_json = recv_msgs[4].to_string();
+            try {
+                std::vector<uint64_t> nodes = json::parse(recv_msgs[3].to_string());
+                std::string query_json = recv_msgs[4].to_string();
 
-            auto results = engine->query().resume(nodes, query_json).execute();
+                auto results = engine->query().resume(nodes, query_json).execute();
 
-            json j_res = json::array();
-            for (const auto& row : results) {
-                json jr = json::object();
-                for (const auto& [k, v] : row.fields) jr[k] = v;
-                j_res.push_back(jr);
+                json j_res = json::array();
+                for (const auto& row : results) {
+                    json jr = json::object();
+                    for (const auto& [k, v] : row.fields) jr[k] = v;
+                    j_res.push_back(jr);
+                }
+
+                std::string resp_json = j_res.dump();
+                sock.send(identity, zmq::send_flags::sndmore);
+                sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                sock.send(zmq::message_t(resp_json.data(), resp_json.size()), zmq::send_flags::none);
+                running = false;
+            } catch (...) {
             }
-
-            std::string resp_json = j_res.dump();
+        } else if (opcode == "H") {
             sock.send(identity, zmq::send_flags::sndmore);
             sock.send(zmq::message_t(), zmq::send_flags::sndmore);
-            sock.send(zmq::message_t(resp_json.data(), resp_json.size()), zmq::send_flags::none);
-            running = false;
+            sock.send(zmq::message_t("OK", 2), zmq::send_flags::none);
         }
     }
+}
+
+TEST(FederationIntegrationTest, ClientPing) {
+    uint16_t remote_port = 5558;
+    uint16_t remote_cluster_id = 101;
+    std::string remote_db = "test_remote_db_ping";
+    
+    std::thread remote_thread(run_mock_server, remote_port, remote_cluster_id, remote_db);
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    l3kvg::Settings settings;
+    settings.fed_timeout_ms = 500;
+    l3kvg::RemoteL3KVClient client(settings);
+    auto pool = std::make_shared<l3kvg::ThreadPool>(1);
+    client.set_thread_pool(pool);
+    client.add_peer(remote_cluster_id, "tcp://127.0.0.1:" + std::to_string(remote_port));
+
+    auto future = client.ping_peer(remote_cluster_id);
+    EXPECT_TRUE(future.get());
+
+    // Clean up mock server (it will exit on next query, but for ping we might need another way or just let it time out/detach)
+    // For this test, let's trigger the "R" opcode to let it join cleanly.
+    (void)client.resume_query_async(remote_cluster_id, {1}, "{}").get();
+    
+    remote_thread.join();
+    std::filesystem::remove_all(remote_db);
 }
 
 TEST(FederationIntegrationTest, EndToEndZmqQuery) {

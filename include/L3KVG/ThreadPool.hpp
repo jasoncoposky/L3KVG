@@ -60,8 +60,9 @@ public:
             stop_ = true;
         }
         condition_.notify_all();
-        for(std::thread &worker: workers_)
-            worker.join();
+        for(std::thread &worker: workers_) {
+            if (worker.joinable()) worker.join();
+        }
     }
 
 private:

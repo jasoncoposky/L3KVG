@@ -1,5 +1,6 @@
 #include "L3KVG/FederationResolver.hpp"
 #include "L3KVG/FederationID.hpp"
+#include "L3KVG/KeyBuilder.hpp"
 #include <mutex>
 #include <stdexcept>
 #include <xxhash.h>
@@ -24,9 +25,7 @@ lite3::NodeID FederationResolver::get_node_owner_impl(uint64_t vertex_id) const 
   if (!ring_ || ring_->size() == 0) {
     return local_node_id_;
   }
-  char buf[17];
-  std::snprintf(buf, sizeof(buf), "%016llx", (unsigned long long)vertex_id);
-  return ring_->get_node(std::string_view(buf, 16));
+  return ring_->get_node(KeyBuilder::node_key(vertex_id));
 }
 
 void FederationResolver::register_local_cluster(std::string name, uint16_t id) {
@@ -45,6 +44,17 @@ void FederationResolver::register_federation(std::string name, uint16_t id, std:
 bool FederationResolver::is_local_cluster(uint16_t cluster_id) const noexcept {
     std::shared_lock lock(mutex_);
     return cluster_id == local_cluster_id_;
+}
+
+std::vector<uint16_t> FederationResolver::get_remote_cluster_ids() const {
+    std::shared_lock lock(mutex_);
+    std::vector<uint16_t> ids;
+    for (auto& [id, info] : federation_map_) {
+        if (id != local_cluster_id_) {
+            ids.push_back(id);
+        }
+    }
+    return ids;
 }
 
 std::shared_ptr<const std::vector<std::string>> FederationResolver::get_federation_endpoints(uint16_t cluster_id) const noexcept {

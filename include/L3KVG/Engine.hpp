@@ -15,6 +15,7 @@
 #include "L3KVG/EdgeCoordinator.hpp"
 #include "L3KVG/ThreadPool.hpp"
 #include "L3KVG/Settings.hpp"
+#include "L3KVG/HLC.hpp"
 
 namespace l3kv {
 class Engine;
@@ -57,6 +58,10 @@ public:
   void put_node(uint64_t id, std::string payload);
   void put_node(std::string_view uuid, std::string payload);
   
+  // Replication Interface
+  void replicate_key(const std::string& key, std::string payload, uint16_t origin_cluster_id);
+  void broadcast_replication(const std::string& key, const std::string& payload, uint16_t origin_cluster_id = 0);
+
   void del_node(uint64_t id);
   void flush();
 
@@ -86,6 +91,7 @@ public:
   RemoteL3KVClient& get_remote_client() { return *remote_client_; }
   void set_remote_client(std::unique_ptr<RemoteL3KVClient> client) { remote_client_ = std::move(client); }
   EdgeCoordinator& get_edge_coordinator() { return *edge_coordinator_; }
+  HLCProvider& get_hlc() { return hlc_; }
   ThreadPool& get_thread_pool() { return *pool_; }
   std::shared_ptr<ThreadPool> get_thread_pool_ptr() { return pool_; }
 
@@ -107,6 +113,7 @@ private:
   
   std::vector<std::unique_ptr<CacheShard>> cache_shards_;
   
+  HLCProvider hlc_;
   SREMetrics metrics_;
 };
 
