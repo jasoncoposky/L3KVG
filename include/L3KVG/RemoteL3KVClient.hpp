@@ -37,6 +37,7 @@ public:
     virtual ~RemoteL3KVClient();
 
     void set_thread_pool(std::shared_ptr<ThreadPool> pool) { task_pool_ = std::move(pool); }
+    void set_auth_secret(const std::string& secret) { auth_secret_ = secret; }
 
     void add_peer(lite3::NodeID node_id, const std::string& endpoint_url);
 
@@ -108,16 +109,19 @@ private:
         std::recursive_mutex mu;
         std::unique_ptr<zmq::socket_t> socket;
         bool connected = false;
+        std::atomic<bool> authenticated{false};
         std::atomic<CircuitState> state{CircuitState::CLOSED};
         std::atomic<int> consecutive_failures{0};
         std::chrono::steady_clock::time_point last_failure_time;
     };
 
     std::shared_ptr<Session> get_session(lite3::NodeID node_id);
+    void ensure_authenticated(std::shared_ptr<Session> session, lite3::NodeID node_id);
     void check_circuit(std::shared_ptr<Session> session);
     void run_health_check_loop();
 
     Settings settings_;
+    std::string auth_secret_;
     std::unordered_map<lite3::NodeID, std::string> peer_endpoints_;
     std::unordered_map<lite3::NodeID, std::shared_ptr<Session>> peer_sessions_;
     std::mutex endpoints_mutex_;

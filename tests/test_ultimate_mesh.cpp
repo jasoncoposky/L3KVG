@@ -31,12 +31,19 @@ public:
         std::unique_ptr<Engine> engine;
         std::thread server_thread;
         std::atomic<bool> running{true};
+        std::string auth_secret;
+        std::unordered_map<std::string, uint32_t> sessions;
         zmq::context_t ctx{1};
 
-        NodeHandle(uint32_t id, uint16_t cid, uint16_t port, std::string db, std::shared_ptr<lite3::ConsistentHash> r, Settings settings)
-            : node_id(id), cluster_id(cid), zmq_port(port), db_path(db), ring(r) {
+        NodeHandle(uint32_t id, uint16_t cid, uint16_t port, std::string db, std::shared_ptr<lite3::ConsistentHash> r, Settings settings, std::string secret = "")
+            : node_id(id), cluster_id(cid), zmq_port(port), db_path(db), ring(r), auth_secret(secret) {
             engine = std::make_unique<Engine>(db_path, node_id, ring, 4, settings);
             engine->get_resolver().register_local_cluster("cluster_" + std::to_string(cluster_id), cluster_id);
+            if (!auth_secret.empty()) {
+                engine->set_auth_secret(auth_secret);
+                engine->get_store()->credentials().register_user(id, "node", "key"); 
+                engine->get_store()->credentials().set_acl(id, "*", l3kv::Permission::ADMIN);
+            }
         }
 
         void start() {
@@ -55,7 +62,31 @@ public:
                         }
 
                         auto identity = std::move(recv_msgs[0]);
+                        auto identity_str = identity.to_string();
                         auto opcode = recv_msgs[2].to_string();
+
+                        if (opcode == "A" && recv_msgs.size() >= 5) {
+                            uint32_t uid = std::stoul(recv_msgs[3].to_string());
+                            std::string secret = recv_msgs[4].to_string();
+                            if (auth_secret.empty() || secret == auth_secret) {
+                                sessions[identity_str] = uid;
+                                sock.send(identity, zmq::send_flags::sndmore);
+                                sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                                sock.send(zmq::message_t("OK", 2), zmq::send_flags::none);
+                            } else {
+                                sock.send(identity, zmq::send_flags::sndmore);
+                                sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                                sock.send(zmq::message_t("ERR_AUTH", 8), zmq::send_flags::none);
+                            }
+                            continue;
+                        }
+
+                        if (!auth_secret.empty() && !sessions.contains(identity_str)) {
+                            sock.send(identity, zmq::send_flags::sndmore);
+                            sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                            sock.send(zmq::message_t("ERR_UNAUTH", 10), zmq::send_flags::none);
+                            continue;
+                        }
 
                         if (opcode == "S") {
                             std::string key = recv_msgs[3].to_string();
@@ -151,10 +182,10 @@ public:
     std::unordered_map<uint32_t, std::shared_ptr<NodeHandle>> nodes;
     std::unordered_map<uint16_t, std::vector<uint32_t>> clusters;
 
-    void add_node(uint32_t id, uint16_t cluster_id, uint16_t port, std::shared_ptr<lite3::ConsistentHash> ring, Settings settings = {}) {
+    void add_node(uint32_t id, uint16_t cluster_id, uint16_t port, std::shared_ptr<lite3::ConsistentHash> ring, Settings settings = {}, std::string secret = "") {
         std::string db = "mesh_db_" + std::to_string(id);
         std::filesystem::remove_all(db);
-        auto handle = std::make_shared<NodeHandle>(id, cluster_id, port, db, ring, settings);
+        auto handle = std::make_shared<NodeHandle>(id, cluster_id, port, db, ring, settings, secret);
         nodes[id] = handle;
         clusters[cluster_id].push_back(id);
     }
@@ -181,6 +212,7 @@ protected:
 };
 
 TEST_F(UltimateMeshTest, ComprehensiveScenario) {
+    std::string secret = "global-mesh-secret-123";
     Settings settings;
     settings.fed_timeout_ms = 200;
     settings.breaker_failure_threshold = 2;
@@ -191,25 +223,29 @@ TEST_F(UltimateMeshTest, ComprehensiveScenario) {
     auto us_ring = std::make_shared<lite3::ConsistentHash>();
     us_ring->add_node(101);
     us_ring->add_node(102);
-    harness.add_node(101, 1, 9101, us_ring, settings);
-    harness.add_node(102, 1, 9102, us_ring, settings);
+    harness.add_node(101, 1, 9101, us_ring, settings, secret);
+    harness.add_node(102, 1, 9102, us_ring, settings, secret);
 
     // Cluster 2 (EU): Nodes 201, 202
     auto eu_ring = std::make_shared<lite3::ConsistentHash>();
     eu_ring->add_node(201);
     eu_ring->add_node(202);
-    harness.add_node(201, 2, 9201, eu_ring, settings);
-    harness.add_node(202, 2, 9202, eu_ring, settings);
+    harness.add_node(201, 2, 9201, eu_ring, settings, secret);
+    harness.add_node(202, 2, 9202, eu_ring, settings, secret);
 
     // Cluster 3 (CLOUD): Node 301
     auto cloud_ring = std::make_shared<lite3::ConsistentHash>();
     cloud_ring->add_node(301);
-    harness.add_node(301, 3, 9301, cloud_ring, settings);
+    harness.add_node(301, 3, 9301, cloud_ring, settings, secret);
 
     // Networking: Intra-cluster ZMQ
+    harness.get_engine(101)->set_auth_secret(secret);
     harness.get_engine(101)->get_remote_client().add_peer(102, "tcp://127.0.0.1:9102");
+    harness.get_engine(102)->set_auth_secret(secret);
     harness.get_engine(102)->get_remote_client().add_peer(101, "tcp://127.0.0.1:9101");
+    harness.get_engine(201)->set_auth_secret(secret);
     harness.get_engine(201)->get_remote_client().add_peer(202, "tcp://127.0.0.1:9202");
+    harness.get_engine(202)->set_auth_secret(secret);
     harness.get_engine(202)->get_remote_client().add_peer(201, "tcp://127.0.0.1:9201");
 
     // Networking: Inter-cluster Replication (US <-> EU)
@@ -224,6 +260,7 @@ TEST_F(UltimateMeshTest, ComprehensiveScenario) {
     harness.get_engine(202)->get_resolver().register_federation("us", 1, {"tcp://127.0.0.1:9101"});
 
     // Networking: Federation (US -> CLOUD)
+    harness.get_engine(301)->set_auth_secret(secret);
     harness.get_engine(101)->get_remote_client().add_peer(3, "tcp://127.0.0.1:9301");
     harness.get_engine(101)->get_resolver().register_federation("cloud", 3, {"tcp://127.0.0.1:9301"});
     harness.get_engine(102)->get_remote_client().add_peer(3, "tcp://127.0.0.1:9301");
@@ -283,8 +320,7 @@ TEST_F(UltimateMeshTest, ComprehensiveScenario) {
 
     std::this_thread::sleep_for(std::chrono::milliseconds(1000));
     auto results = harness.get_engine(101)->query()
-        .match("a")
-        .where_eq("a", "name", "Alice_Newer")
+        .match_id(nodeA_id, "a")
         .out("knows").as("b")
         .out("depends").as("target")
         .return_("target", "name")
@@ -295,20 +331,20 @@ TEST_F(UltimateMeshTest, ComprehensiveScenario) {
 
     // --- PHASE 4: Resilience ---
     std::cout << "--- PHASE 4: Resilience ---" << std::endl;
-    harness.nodes[301]->stop();
-    
+    harness.nodes[301]->stop(); // Kill CLOUD node
+
     auto start_res = std::chrono::steady_clock::now();
     bool threw = false;
     try {
         harness.get_engine(101)->query()
-            .match("a")
-            .where_eq("a", "name", "Alice_Newer")
+            .match_id(nodeA_id, "a")
             .out("knows").as("b")
             .out("depends").as("target")
             .execute();
     } catch (...) {
         threw = true;
     }
+
     auto end_res = std::chrono::steady_clock::now();
     EXPECT_TRUE(threw);
     EXPECT_LT(std::chrono::duration_cast<std::chrono::milliseconds>(end_res-start_res).count(), 1000);

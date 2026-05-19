@@ -74,7 +74,20 @@ To interconnect regional clusters, add the `federations` section. Any cluster li
 }
 ```
 
-### 3. Operational Parameters
+### 3. Security & ACLs
+L3KVG enforces Zero-Trust security via a shared `auth_secret` and prefix-based Access Control Lists (ACLs). This ensures regional sovereignty and protects against unauthorized data access.
+
+```json
+{
+  "node_id": 101,
+  "auth_secret": "your-mesh-shared-secret",
+  "cluster_id": 1,
+  "cluster_name": "us-east"
+}
+```
+*Note: In the current version, all regional peers must share the same `auth_secret` to participate in the mesh.*
+
+### 4. Operational Parameters
 Tune the circuit breaker and replication performance based on your network environment.
 
 ```json

@@ -21,6 +21,7 @@ public:
 
   // Initial node selection
   Query &match(std::string_view node_alias);
+  Query &match_id(uint64_t id, std::string_view alias = "a");
 
   // Filters
   enum class Op { Eq, Ne, Gt, Ge, Lt, Le, Like };
@@ -108,6 +109,8 @@ public:
 
   // Federation Support
   Query &resume(const std::vector<uint64_t>& starting_nodes, std::string_view query_json);
+
+  bool is_federated_branch_ = false;
 
 private:
   Engine *engine_;

@@ -121,6 +121,10 @@ add_executable(test_ultimate_mesh tests/test_ultimate_mesh.cpp)
 target_link_libraries(test_ultimate_mesh PRIVATE l3kvg_engine gtest_main Threads::Threads $<$<BOOL:${WIN32}>:ws2_32>)
 add_test(NAME test_ultimate_mesh COMMAND test_ultimate_mesh)
 
+add_executable(test_secure_mesh tests/test_secure_mesh.cpp)
+target_link_libraries(test_secure_mesh PRIVATE l3kvg_engine gtest_main Threads::Threads $<$<BOOL:${WIN32}>:ws2_32>)
+add_test(NAME test_secure_mesh COMMAND test_secure_mesh)
+
 add_executable(l3kvg_server src/server/main.cpp)
 target_link_libraries(l3kvg_server PRIVATE l3kvg_engine Threads::Threads $<$<BOOL:${WIN32}>:ws2_32> $<$<BOOL:${WIN32}>:wsock32> $<$<BOOL:${WIN32}>:crypt32>)
 

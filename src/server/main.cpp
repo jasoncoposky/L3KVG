@@ -87,6 +87,7 @@ struct Config {
   int health_check_interval_ms = 1000;
   size_t node_initial_buffer_size = 1024;
   double default_min_weight = -999999.0;
+  std::string auth_secret;
 };
 
 Config load_config(const std::string &path) {
@@ -131,6 +132,7 @@ Config load_config(const std::string &path) {
       cfg.health_check_interval_ms = j.value("health_check_interval_ms", cfg.health_check_interval_ms);
       cfg.node_initial_buffer_size = j.value("node_initial_buffer_size", cfg.node_initial_buffer_size);
       cfg.default_min_weight = j.value("default_min_weight", cfg.default_min_weight);
+      cfg.auth_secret = j.value("auth_secret", "");
     } catch (...) {
       std::cerr << "Failed to parse config, using defaults.\n";
     }
@@ -166,6 +168,7 @@ int main(int argc, char *argv[]) {
     settings.zmq_sndhwm = cfg.zmq_sndhwm;
     settings.edge_flush_interval_ms = cfg.edge_flush_interval_ms;
     settings.fed_timeout_ms = cfg.fed_timeout_ms;
+    settings.node_id = cfg.node_id;
     settings.breaker_failure_threshold = cfg.breaker_failure_threshold;
     settings.breaker_reset_timeout_ms = cfg.breaker_reset_timeout_ms;
     settings.health_check_interval_ms = cfg.health_check_interval_ms;
@@ -181,6 +184,8 @@ int main(int argc, char *argv[]) {
 
     auto engine = std::make_unique<l3kvg::Engine>(cfg.db_path, cfg.node_id, ring, cfg.thread_pool_size, settings);
     engine->get_resolver().register_local_cluster(cfg.cluster_name, cfg.cluster_id);
+    engine->set_auth_secret(cfg.auth_secret);
+    engine->get_store()->credentials().register_user(cfg.node_id, cfg.cluster_name, "local-node-key"); // UID is node_id for simplicity
     
     auto logger = std::make_shared<FileLogger>("node" + std::to_string(cfg.node_id) + ".log");
     engine->get_store()->set_logger(logger);

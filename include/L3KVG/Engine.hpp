@@ -90,6 +90,7 @@ public:
   FederationResolver& get_resolver() { return resolver_; }
   RemoteL3KVClient& get_remote_client() { return *remote_client_; }
   void set_remote_client(std::unique_ptr<RemoteL3KVClient> client) { remote_client_ = std::move(client); }
+  void set_auth_secret(const std::string& secret) { remote_client_->set_auth_secret(secret); }
   EdgeCoordinator& get_edge_coordinator() { return *edge_coordinator_; }
   HLCProvider& get_hlc() { return hlc_; }
   ThreadPool& get_thread_pool() { return *pool_; }

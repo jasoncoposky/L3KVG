@@ -14,6 +14,7 @@ namespace l3kvg {
 
 Engine::Engine(const std::string &db_path, uint32_t node_id, std::shared_ptr<lite3::ConsistentHash> ring, size_t thread_pool_size, Settings settings)
     : resolver_(std::move(ring), node_id), settings_(std::move(settings)), hlc_(node_id) {
+  settings_.node_id = node_id;
   store_ = std::make_unique<l3kv::Engine>(db_path, node_id);
   pool_ = std::make_shared<ThreadPool>(thread_pool_size);
   remote_client_ = std::make_unique<RemoteL3KVClient>(settings_);

@@ -76,7 +76,15 @@ Query::Query(Engine *engine) : engine_(engine) {}
 
 Query &Query::match(std::string_view node_alias) {
   initial_match_ = MatchStep{std::string(node_alias)};
+  root_alias_ = std::string(node_alias);
   return *this;
+}
+
+Query &Query::match_id(uint64_t id, std::string_view alias) {
+    starting_nodes_ = {id};
+    initial_match_ = MatchStep{std::string(alias)};
+    root_alias_ = std::string(alias);
+    return *this;
 }
 
 Query::FilterGroup& Query::FilterGroup::where(std::string_view alias, std::string_view key, Query::Op op, std::string_view value) {
@@ -398,8 +406,7 @@ std::vector<ResultRow> Query::execute() {
           auto remote_res = f.get();
           results.insert(results.end(), remote_res.begin(), remote_res.end());
       } catch (const std::exception& e) {
-          std::cerr << "[Query::execute] Remote query failed: " << e.what() << "\n";
-          if (starting_nodes_.empty()) throw; // Re-throw if top-level
+          if (!is_federated_branch_) throw; // Re-throw if top-level user query
       }
   }
 
@@ -482,7 +489,10 @@ std::vector<ResultRow> Query::execute() {
 
 Query &Query::resume(const std::vector<uint64_t>& starting_nodes, std::string_view query_json) {
     starting_nodes_ = starting_nodes;
+    is_federated_branch_ = true;
+
     try {
+
         json j = json::parse(query_json);
         if (j.contains("root_alias")) {
             root_alias_ = j["root_alias"];
