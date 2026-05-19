@@ -110,10 +110,13 @@ public:
   // Federation Support
   Query &resume(const std::vector<uint64_t>& starting_nodes, std::string_view query_json);
 
+  Query &set_principal_id(uint32_t uid) { principal_id_ = uid; return *this; }
+
   bool is_federated_branch_ = false;
 
 private:
   Engine *engine_;
+  uint32_t principal_id_ = INTERNAL_UID;
   std::vector<uint64_t> starting_nodes_;
   std::string root_alias_ = "__root";
 

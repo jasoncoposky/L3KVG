@@ -17,6 +17,7 @@ public:
 
   // Maps a Vertex ID to a specific physical Peer ID
   [[nodiscard]] lite3::NodeID get_node_owner(uint64_t vertex_id) const;
+  [[nodiscard]] lite3::NodeID get_local_shard_owner(uint64_t vertex_id) const;
 
   // Identifies if the data is local or requires an RPC
   [[nodiscard]] bool is_local(uint64_t vertex_id) const;
@@ -31,6 +32,7 @@ public:
   [[nodiscard]] bool is_local_cluster(uint16_t cluster_id) const noexcept;
   [[nodiscard]] uint16_t get_local_cluster_id() const noexcept { return local_cluster_id_; }
   [[nodiscard]] std::vector<uint16_t> get_remote_cluster_ids() const;
+  [[nodiscard]] std::vector<lite3::NodeID> get_all_node_ids() const;
   [[nodiscard]] std::shared_ptr<const std::vector<std::string>> get_federation_endpoints(uint16_t cluster_id) const noexcept;
 
   // Edge-Hashed String Mapping

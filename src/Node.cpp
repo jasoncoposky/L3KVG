@@ -93,7 +93,8 @@ void Node::register_edge_bloom(std::string_view label) {
 }
 
 std::vector<uint64_t> Node::get_neighbors(std::string_view label,
-                                             double min_weight) {
+                                             double min_weight,
+                                             uint32_t principal_id) {
   if (!might_have_edge(label)) {
     return {};
   }
@@ -133,7 +134,7 @@ std::vector<uint64_t> Node::get_neighbors(std::string_view label,
     lite3::NodeID owner = resolver.get_node_owner(id_);
     auto& client = engine_->get_remote_client();
     try {
-      return client.get_neighbors_async(owner, id_, std::string(label), min_weight).get();
+      return client.get_neighbors_async(owner, id_, std::string(label), min_weight, principal_id).get();
     } catch (const std::exception& e) {
       std::cerr << "[Node::get_neighbors] Remote RPC Failed: " << e.what() << "\n";
       return {};
@@ -142,7 +143,7 @@ std::vector<uint64_t> Node::get_neighbors(std::string_view label,
   return neighbors;
 }
 
-std::vector<uint64_t> Node::get_in_neighbors(std::string_view label) {
+std::vector<uint64_t> Node::get_in_neighbors(std::string_view label, uint32_t principal_id) {
   std::vector<uint64_t> neighbors;
   std::string_view prefix = KeyBuilder::edge_in_prefix(id_, label);
   
@@ -165,8 +166,10 @@ std::vector<uint64_t> Node::get_in_neighbors(std::string_view label) {
 }
 
 std::vector<std::shared_ptr<Edge>> Node::get_edges(std::string_view label,
-                                                  double min_weight) {
+                                                 double min_weight,
+                                                 uint32_t principal_id) {
   if (!might_have_edge(label)) {
+
     return {};
   }
 

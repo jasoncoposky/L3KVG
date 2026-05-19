@@ -74,43 +74,35 @@ To interconnect regional clusters, add the `federations` section. Any cluster li
 }
 ```
 
-### 3. Security & ACLs
-L3KVG enforces Zero-Trust security via a shared `auth_secret` and prefix-based Access Control Lists (ACLs). This ensures regional sovereignty and protects against unauthorized data access.
+### 3. Foundational Unified Identity
+L3KVG implements a **Security at the Lowest Layer** model. Identity and authorization are built directly into the foundational storage engine, ensuring that all graph operations are secure-by-design.
+
+- **Principal Propagation**: Every ZMQ request carries a 4-byte `EffectiveUID` frame. Physical nodes establishment trusted pipes via `auth_secret` and are delegated authority to "forward" the identities of the users they act for.
+- **Local-First Authorization**: Security metadata (users and ACLs) under the `sys:` prefix is automatically replicated to all nodes globally. Authorization checks happen locally in the storage hot-path (< 5ns), eliminating WAN bottlenecks for permission lookups.
+- **Single Global Identity**: A user defined in the US cluster can execute a federated query spanning EU and Asia nodes using their single global UID.
 
 ```json
 {
   "node_id": 101,
   "auth_secret": "your-mesh-shared-secret",
-  "cluster_id": 1,
-  "cluster_name": "us-east"
-}
-```
-*Note: In the current version, all regional peers must share the same `auth_secret` to participate in the mesh.*
-
-### 4. Operational Parameters
-Tune the circuit breaker and replication performance based on your network environment.
-
-```json
-{
-  "fed_timeout_ms": 500,
-  "breaker_failure_threshold": 3,
-  "breaker_reset_timeout_ms": 10000,
-  "health_check_interval_ms": 2000,
-  "node_cache_shards": 16,
-  "edge_write_shards": 16
+  "default_principal_id": 1001
 }
 ```
 
 ## ZMQ Replication Protocol (Internal)
 
+All mesh requests follow a unified structure:
+`[Identity, Delimiter, EffectiveUID (4b), Opcode (1b), ...Payload Frames]`
+
 | Opcode | Description | Structure |
 | :--- | :--- | :--- |
-| **G** | Get Node | `[Identity, Delimiter, "G", HexID]` |
-| **N** | Get Neighbors | `[Identity, Delimiter, "N", HexID, Label, MinWeight]` |
-| **R** | Resume Query | `[Identity, Delimiter, "R", NodeListJSON, QueryJSON]` |
-| **P** | Put Node/Edge | `[Identity, Delimiter, "P", Key, Payload]` |
-| **S** | Replication Sync | `[Identity, Delimiter, "S", Key, Payload, OriginID]` |
-| **H** | Heartbeat | `[Identity, Delimiter, "H", Dummy]` |
+| **G** | Get Node | `[..., "G", HexID]` |
+| **M** | Multi-Get | `[..., "M", Key1, Key2, ...]` |
+| **N** | Get Neighbors | `[..., "N", HexID, Label, MinWeight]` |
+| **R** | Resume Query | `[..., "R", NodeListJSON, QueryJSON]` |
+| **P** | Put Node/Edge | `[..., "P", Key, Payload]` |
+| **S** | Replication Sync | `[..., "S", Key, Payload, OriginID]` |
+| **H** | Heartbeat | `[..., "H", Dummy]` |
 
 ## Getting Started
 

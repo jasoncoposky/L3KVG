@@ -15,8 +15,8 @@ public:
     std::future<std::vector<ResultRow>> resume_query_async(
         uint16_t cluster_id,
         const std::vector<uint64_t>& starting_nodes,
-        const std::string& query_json
-    ) override {
+        const std::string& query_json,
+        uint32_t principal_id = l3kv::INTERNAL_UID) override {
         std::promise<std::vector<ResultRow>> p;
         std::vector<ResultRow> results;
         

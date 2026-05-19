@@ -104,7 +104,7 @@ std::shared_ptr<Node> Engine::get_swizzled(uint64_t id) {
   return nullptr;
 }
 
-std::vector<std::shared_ptr<Node>> Engine::fetch_nodes(const std::vector<uint64_t>& ids) {
+std::vector<std::shared_ptr<Node>> Engine::fetch_nodes(const std::vector<uint64_t>& ids, uint32_t principal_id) {
   std::unordered_map<lite3::NodeID, std::vector<uint64_t>> remote_requests;
   std::vector<std::shared_ptr<Node>> result;
   result.reserve(ids.size());
@@ -143,7 +143,7 @@ std::vector<std::shared_ptr<Node>> Engine::fetch_nodes(const std::vector<uint64_
 
   std::vector<std::pair<lite3::NodeID, std::future<std::unordered_map<uint64_t, std::string>>>> futures;
   for (auto& [owner, batch] : remote_requests) {
-    futures.push_back({owner, remote_client_->get_nodes_batch_async(owner, batch)});
+    futures.push_back({owner, remote_client_->get_nodes_batch_async(owner, batch, principal_id)});
   }
 
   for (auto& pair : futures) {
@@ -163,7 +163,7 @@ std::vector<std::shared_ptr<Node>> Engine::fetch_nodes(const std::vector<uint64_
   return result;
 }
 
-std::vector<std::shared_ptr<Node>> Engine::get_nodes_by_prefix(const std::string& prefix) {
+std::vector<std::shared_ptr<Node>> Engine::get_nodes_by_prefix(const std::string& prefix, uint32_t principal_id) {
   auto keys = store_->get_prefix_keys_all_shards(prefix, "", settings_.prefix_scan_limit);
   std::vector<uint64_t> ids;
   for (auto& k : keys) {
@@ -173,7 +173,7 @@ std::vector<std::shared_ptr<Node>> Engine::get_nodes_by_prefix(const std::string
           ids.push_back(std::stoull(id_str, nullptr, 16));
       }
   }
-  return fetch_nodes(ids);
+  return fetch_nodes(ids, principal_id);
 }
 
 void Engine::put_node(uint64_t id, std::string payload) {
@@ -215,94 +215,103 @@ void Engine::put_node(std::string_view uuid, std::string payload) {
 }
 
 void Engine::replicate_key(const std::string& key, std::string payload, uint16_t origin_cluster_id) {
-  // Extract node ID from key format: n:{id} or e:out:{id}:... or e:in:{id}:...
-  size_t start = key.find('{');
-  size_t end = key.find('}', start);
-  
-  if (start == std::string::npos || end == std::string::npos) {
-    store_->put(key, payload);
-    return;
-  }
-
-  uint64_t id;
-  lite3::NodeID owner;
-  try {
-    std::string id_str = key.substr(start + 1, end - start - 1);
-    id = std::stoull(id_str, nullptr, 16);
-    owner = resolver_.get_node_owner(id);
-
-    if (owner != resolver_.get_local_node_id()) {
-      remote_client_->replicate_async(owner, key, payload, origin_cluster_id);
-      return;
+    if (key.starts_with("sys:")) {
+        store_->put(key, std::move(payload));
+        return;
     }
-  } catch (...) {
-    store_->put(key, payload);
-    return;
-  }
 
-  // Conflict Resolution: Last-Writer-Wins using HLC
-  try {
-      std::string incoming_json_str;
-      const uint8_t* in_ptr = reinterpret_cast<const uint8_t*>(payload.data());
-      if (payload.size() > 8 && (in_ptr[0] == 0x06 || in_ptr[0] == 0x07)) {
-          try {
-              lite3cpp::Buffer in_buf(std::vector<uint8_t>(in_ptr, in_ptr + payload.size()));
-              incoming_json_str = lite3cpp::lite3_json::to_json_string(in_buf, 0);
-          } catch (...) { incoming_json_str = payload; }
-      } else {
-          incoming_json_str = payload;
-      }
+    try {
+        // Extract node ID from key format: n:{id} or e:out:{id}:... or e:in:{id}:...
+        size_t start = key.find('{');
+        size_t end = key.find('}', start);
+        
+        if (start == std::string::npos || end == std::string::npos) {
+          store_->put(key, payload);
+          return;
+        }
 
-      json incoming = json::parse(incoming_json_str);
-      if (incoming.contains("_hlc")) {
-          HLCTimestamp remote_ts = HLCTimestamp::from_json(incoming["_hlc"]);
-          hlc_.update(remote_ts);
+        uint64_t id;
+        lite3::NodeID owner;
+        try {
+          std::string id_str = key.substr(start + 1, end - start - 1);
+          id = std::stoull(id_str, nullptr, 16);
+          owner = resolver_.get_local_shard_owner(id);
 
-          auto local_data = store_->get(key);
-          if (local_data.size() > 0) {
-              std::string local_json_str;
-              const uint8_t* loc_ptr = reinterpret_cast<const uint8_t*>(local_data.data());
-              if (local_data.size() > 8 && (loc_ptr[0] == 0x06 || loc_ptr[0] == 0x07)) {
-                  try {
-                      local_json_str = lite3cpp::lite3_json::to_json_string(local_data, 0);
-                  } catch (...) { 
-                      local_json_str = std::string(reinterpret_cast<const char*>(loc_ptr), local_data.size());
-                  }
-              } else {
-                  local_json_str = std::string(reinterpret_cast<const char*>(loc_ptr), local_data.size());
-              }
-
-              try {
-                  json local_json = json::parse(local_json_str);
-                  if (local_json.contains("_hlc")) {
-                      HLCTimestamp local_ts = HLCTimestamp::from_json(local_json["_hlc"]);
-                      if (!(remote_ts > local_ts)) {
-                          // Stale update, ignore
-                          return;
-                      }
-                  }
-              } catch (...) {}
+          if (owner != resolver_.get_local_node_id()) {
+            remote_client_->replicate_async(owner, key, payload, origin_cluster_id);
+            return;
           }
-      }
-  } catch (...) {}
+        } catch (...) {
+          store_->put(key, payload);
+          return;
+        }
 
-  // Final payload preparation: ensure it's in Lite3 binary format
-  std::string binary_payload;
-  const uint8_t* in_ptr = reinterpret_cast<const uint8_t*>(payload.data());
-  if (payload.size() > 8 && (in_ptr[0] == 0x06 || in_ptr[0] == 0x00)) {
-      binary_payload = std::move(payload);
-  } else {
-      try {
-          lite3cpp::Buffer buf = lite3cpp::lite3_json::from_json_string(payload);
-          binary_payload = std::string(reinterpret_cast<const char*>(buf.data()), buf.size());
-      } catch (...) {
-          binary_payload = std::move(payload);
-      }
-  }
+        // Conflict Resolution: Last-Writer-Wins using HLC
+        try {
+            std::string incoming_json_str;
+            const uint8_t* in_ptr = reinterpret_cast<const uint8_t*>(payload.data());
+            if (payload.size() > 8 && (in_ptr[0] == 0x06 || in_ptr[0] == 0x07)) {
+                try {
+                    lite3cpp::Buffer in_buf(std::vector<uint8_t>(in_ptr, in_ptr + payload.size()));
+                    incoming_json_str = lite3cpp::lite3_json::to_json_string(in_buf, 0);
+                } catch (...) { incoming_json_str = payload; }
+            } else {
+                incoming_json_str = payload;
+            }
 
-  store_->del(key);
-  store_->put(key, std::move(binary_payload));
-  store_->wait_all_shards();
+            json incoming = json::parse(incoming_json_str);
+            if (incoming.contains("_hlc")) {
+                HLCTimestamp remote_ts = HLCTimestamp::from_json(incoming["_hlc"]);
+                hlc_.update(remote_ts);
+
+                auto local_data = store_->get(key);
+                if (local_data.size() > 0) {
+                    std::string local_json_str;
+                    const uint8_t* loc_ptr = reinterpret_cast<const uint8_t*>(local_data.data());
+                    if (local_data.size() > 8 && (loc_ptr[0] == 0x06 || loc_ptr[0] == 0x07)) {
+                        try {
+                            local_json_str = lite3cpp::lite3_json::to_json_string(local_data, 0);
+                        } catch (...) { 
+                            local_json_str = std::string(reinterpret_cast<const char*>(loc_ptr), local_data.size());
+                        }
+                    } else {
+                        local_json_str = std::string(reinterpret_cast<const char*>(loc_ptr), local_data.size());
+                    }
+
+                    try {
+                        json local_json = json::parse(local_json_str);
+                        if (local_json.contains("_hlc")) {
+                            HLCTimestamp local_ts = HLCTimestamp::from_json(local_json["_hlc"]);
+                            if (!(remote_ts > local_ts)) {
+                                // Stale update, ignore
+                                return;
+                            }
+                        }
+                    } catch (...) {}
+                }
+            }
+        } catch (...) {}
+
+        // Final payload preparation: ensure it's in Lite3 binary format
+        std::string binary_payload;
+        const uint8_t* in_ptr = reinterpret_cast<const uint8_t*>(payload.data());
+        if (payload.size() > 8 && (in_ptr[0] == 0x06 || in_ptr[0] == 0x00)) {
+            binary_payload = std::move(payload);
+        } else {
+            try {
+                lite3cpp::Buffer buf = lite3cpp::lite3_json::from_json_string(payload);
+                binary_payload = std::string(reinterpret_cast<const char*>(buf.data()), buf.size());
+            } catch (...) {
+                binary_payload = std::move(payload);
+            }
+        }
+
+        store_->del(key);
+        store_->put(key, std::move(binary_payload));
+        store_->wait_all_shards();
+    } catch (...) {
+        store_->put(key, payload);
+    }
 }
 
 void Engine::broadcast_replication(const std::string& key, const std::string& payload, uint16_t origin_cluster_id) {
@@ -315,6 +324,25 @@ void Engine::broadcast_replication(const std::string& key, const std::string& pa
     for (auto cluster_id : remote_clusters) {
         remote_client_->replicate_async(cluster_id, key, payload, origin_cluster_id);
     }
+}
+
+void Engine::put_system_key(const std::string& key, const std::string& payload, uint32_t principal_id) {
+    // Authorization: only ADMIN can write system keys
+    if (principal_id != ADMIN_UID) {
+        throw std::runtime_error("Unauthorized: Only ADMIN can modify system metadata");
+    }
+
+    // System keys (sys:) are special. We want them on ALL nodes eventually.
+    // We broadcast to all known peers (local and remote)
+    auto peers = resolver_.get_all_node_ids();
+    for (auto node_id : peers) {
+        if (node_id != resolver_.get_local_node_id()) {
+            remote_client_->replicate_async(node_id, key, payload, resolver_.get_local_cluster_id());
+        }
+    }
+    
+    store_->put(key, payload);
+    store_->wait_all_shards();
 }
 
 void Engine::del_node(uint64_t id) {

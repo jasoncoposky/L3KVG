@@ -4,8 +4,12 @@
 
 namespace l3kvg {
 
+static constexpr uint32_t INTERNAL_UID = 0xFFFFFFFF;
+static constexpr uint32_t ADMIN_UID = 0;
+
 struct Settings {
   uint32_t node_id = 1;
+  uint32_t default_principal_id = INTERNAL_UID;
   size_t node_cache_size_per_shard = 2000;
   size_t node_cache_shards = 8;
   size_t edge_write_shards = 8;

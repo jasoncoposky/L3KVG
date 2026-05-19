@@ -279,12 +279,21 @@ std::vector<ResultRow> Query::execute() {
 
   {
       std::vector<uint64_t> filtered;
-      for (const auto& id : frontier) {
-          auto node = engine_->get_node(id);
-          if (!node) continue;
+      // Use principal_id_ for initial node fetch
+      auto nodes = engine_->fetch_nodes(frontier, principal_id_);
+      for (auto& node : nodes) {
+          if (!node || !node->is_loaded()) continue;
+          
+          // Re-verify ACL even if node was already cached/loaded
+          std::string key = std::string(KeyBuilder::node_key(node->get_id()));
+          auto perm = engine_->get_store()->credentials().check_permission(principal_id_, key);
+          if (!(perm & l3kv::Permission::READ) && !(perm & l3kv::Permission::ADMIN)) {
+              continue;
+          }
+
           std::unordered_map<std::string, std::shared_ptr<Node>> available;
           available[root_alias_] = node;
-          if (evaluate_group(root_filters_, available, root_alias_, engine_)) filtered.push_back(id);
+          if (evaluate_group(root_filters_, available, root_alias_, engine_)) filtered.push_back(node->get_id());
       }
       frontier = std::move(filtered);
   }
@@ -302,7 +311,8 @@ std::vector<ResultRow> Query::execute() {
     std::visit(overloaded{
         [&](const OutStep& s) {
             for (const auto &path : paths) {
-                auto neighbors = path.alias_to_node.at(path.last_alias)->get_neighbors(s.label, s.min_weight);
+                auto node = path.alias_to_node.at(path.last_alias);
+                auto neighbors = node->get_neighbors(s.label, s.min_weight, principal_id_);
                 std::unordered_set<uint64_t> unique_neighbors(neighbors.begin(), neighbors.end());
                 for (const auto& neighbor_id : unique_neighbors) {
                     uint16_t cluster_id = FederationID::get_cluster(neighbor_id);
@@ -320,7 +330,8 @@ std::vector<ResultRow> Query::execute() {
         },
         [&](const InStep& s) {
             for (const auto &path : paths) {
-                auto neighbors = path.alias_to_node.at(path.last_alias)->get_in_neighbors(s.label);
+                auto node = path.alias_to_node.at(path.last_alias);
+                auto neighbors = node->get_in_neighbors(s.label, principal_id_);
                 std::unordered_set<uint64_t> unique_neighbors(neighbors.begin(), neighbors.end());
                 for (const auto& neighbor_id : unique_neighbors) {
                     uint16_t cluster_id = FederationID::get_cluster(neighbor_id);
@@ -347,6 +358,7 @@ std::vector<ResultRow> Query::execute() {
       for (auto& b : branches) {
           json j_sub;
           j_sub["root_alias"] = b.second.first;
+          j_sub["principal_id"] = principal_id_;
           json j_steps = json::array();
           for (const auto& step : b.second.second) {
               std::visit(overloaded{
@@ -369,7 +381,7 @@ std::vector<ResultRow> Query::execute() {
           groups[j_sub.dump()].push_back(b.first);
       }
       for (auto& [query_json, nodes] : groups) {
-          remote_futures.push_back(engine_->get_remote_client().resume_query_async(cluster_id, nodes, query_json));
+          remote_futures.push_back(engine_->get_remote_client().resume_query_async(cluster_id, nodes, query_json, principal_id_));
       }
   }
 
@@ -496,6 +508,9 @@ Query &Query::resume(const std::vector<uint64_t>& starting_nodes, std::string_vi
         json j = json::parse(query_json);
         if (j.contains("root_alias")) {
             root_alias_ = j["root_alias"];
+        }
+        if (j.contains("principal_id")) {
+            principal_id_ = j["principal_id"];
         }
         if (j.contains("steps")) {
             for (const auto& sj : j["steps"]) {

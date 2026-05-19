@@ -37,17 +37,17 @@ void run_mock_server(uint16_t port, uint16_t cluster_id, const std::string& db_p
             continue;
         }
 
-        if (recv_msgs.size() < 4) {
+        if (recv_msgs.size() < 5) {
             continue;
         }
 
         auto& identity = recv_msgs[0];
-        auto opcode = recv_msgs[2].to_string();
+        auto opcode = recv_msgs[3].to_string();
 
         if (opcode == "R") {
             try {
-                std::vector<uint64_t> nodes = json::parse(recv_msgs[3].to_string());
-                std::string query_json = recv_msgs[4].to_string();
+                std::vector<uint64_t> nodes = json::parse(recv_msgs[4].to_string());
+                std::string query_json = recv_msgs[5].to_string();
 
                 auto results = engine->query().resume(nodes, query_json).execute();
 

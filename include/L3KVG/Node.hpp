@@ -10,6 +10,7 @@
 #include <cstdint>
 #include "L3KVG/Edge.hpp"
 #include "L3KVG/KeyBuilder.hpp"
+#include "engine/credential_manager.hpp"
 
 namespace l3kvg {
 
@@ -41,12 +42,15 @@ public:
   template <typename T> T get_attribute(std::string_view key);
 
   std::vector<uint64_t> get_neighbors(std::string_view label,
-                                         double min_weight = -999999.0);
+                                         double min_weight = -999999.0,
+                                         uint32_t principal_id = l3kv::INTERNAL_UID);
 
-  std::vector<uint64_t> get_in_neighbors(std::string_view label);
+  std::vector<uint64_t> get_in_neighbors(std::string_view label,
+                                            uint32_t principal_id = l3kv::INTERNAL_UID);
 
   std::vector<std::shared_ptr<Edge>> get_edges(std::string_view label,
-                                               double min_weight = -999999.0);
+                                               double min_weight = -999999.0,
+                                               uint32_t principal_id = l3kv::INTERNAL_UID);
 
   uint64_t get_id() const { return id_; }
 

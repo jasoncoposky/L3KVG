@@ -16,6 +16,7 @@
 #include "L3KVG/ThreadPool.hpp"
 #include "L3KVG/Settings.hpp"
 #include "L3KVG/HLC.hpp"
+#include "engine/credential_manager.hpp"
 
 namespace l3kv {
 class Engine;
@@ -52,15 +53,16 @@ public:
   std::shared_ptr<Node> get_node(uint64_t id);
   std::shared_ptr<Node> get_node(std::string_view uuid);
   
-  std::vector<std::shared_ptr<Node>> fetch_nodes(const std::vector<uint64_t>& ids);
-  std::vector<std::shared_ptr<Node>> get_nodes_by_prefix(const std::string& prefix);
+  std::vector<std::shared_ptr<Node>> fetch_nodes(const std::vector<uint64_t>& ids, uint32_t principal_id = l3kv::INTERNAL_UID);
+  std::vector<std::shared_ptr<Node>> get_nodes_by_prefix(const std::string& prefix, uint32_t principal_id = l3kv::INTERNAL_UID);
   
   void put_node(uint64_t id, std::string payload);
   void put_node(std::string_view uuid, std::string payload);
   
-  // Replication Interface
+  // Replication & Security Interface
   void replicate_key(const std::string& key, std::string payload, uint16_t origin_cluster_id);
   void broadcast_replication(const std::string& key, const std::string& payload, uint16_t origin_cluster_id = 0);
+  void put_system_key(const std::string& key, const std::string& payload, uint32_t principal_id = ADMIN_UID);
 
   void del_node(uint64_t id);
   void flush();

@@ -34,17 +34,18 @@ public:
         std::string auth_secret;
         std::unordered_map<std::string, uint32_t> sessions;
         zmq::context_t ctx{1};
+NodeHandle(uint32_t id, uint16_t cid, uint16_t port, std::string db, std::shared_ptr<lite3::ConsistentHash> r, Settings settings, std::string secret = "")
+    : node_id(id), cluster_id(cid), zmq_port(port), db_path(db), ring(r), auth_secret(secret) {
+    engine = std::make_unique<Engine>(db_path, node_id, ring, 4, settings);
+    engine->get_resolver().register_local_cluster("cluster_" + std::to_string(cluster_id), cluster_id);
+    if (!auth_secret.empty()) {
+        engine->set_auth_secret(auth_secret);
+        // Self-trust
+        engine->get_store()->credentials().register_user(id, "node", "key"); 
+        engine->get_store()->credentials().set_acl(id, "", l3kv::Permission::ADMIN);
+    }
+}
 
-        NodeHandle(uint32_t id, uint16_t cid, uint16_t port, std::string db, std::shared_ptr<lite3::ConsistentHash> r, Settings settings, std::string secret = "")
-            : node_id(id), cluster_id(cid), zmq_port(port), db_path(db), ring(r), auth_secret(secret) {
-            engine = std::make_unique<Engine>(db_path, node_id, ring, 4, settings);
-            engine->get_resolver().register_local_cluster("cluster_" + std::to_string(cluster_id), cluster_id);
-            if (!auth_secret.empty()) {
-                engine->set_auth_secret(auth_secret);
-                engine->get_store()->credentials().register_user(id, "node", "key"); 
-                engine->get_store()->credentials().set_acl(id, "*", l3kv::Permission::ADMIN);
-            }
-        }
 
         void start() {
             server_thread = std::thread([this]() {
@@ -63,11 +64,17 @@ public:
 
                         auto identity = std::move(recv_msgs[0]);
                         auto identity_str = identity.to_string();
-                        auto opcode = recv_msgs[2].to_string();
+                        
+                        uint32_t effective_uid = 0;
+                        if (recv_msgs[2].size() == 4) {
+                            effective_uid = *static_cast<uint32_t*>(recv_msgs[2].data());
+                        }
+                        
+                        auto opcode = recv_msgs[3].to_string();
 
-                        if (opcode == "A" && recv_msgs.size() >= 5) {
-                            uint32_t uid = std::stoul(recv_msgs[3].to_string());
-                            std::string secret = recv_msgs[4].to_string();
+                        if (opcode == "A" && recv_msgs.size() >= 6) {
+                            uint32_t uid = std::stoul(recv_msgs[4].to_string());
+                            std::string secret = recv_msgs[5].to_string();
                             if (auth_secret.empty() || secret == auth_secret) {
                                 sessions[identity_str] = uid;
                                 sock.send(identity, zmq::send_flags::sndmore);
@@ -88,12 +95,21 @@ public:
                             continue;
                         }
 
+                        uint32_t session_uid = sessions.contains(identity_str) ? sessions[identity_str] : 0;
+                        uint32_t current_uid = session_uid;
+
+                        // If session has ADMIN perms, allow Principal Propagation
+                        auto session_perm = engine->get_store()->credentials().check_permission(session_uid, "");
+                        if (session_perm & l3kv::Permission::ADMIN) {
+                            current_uid = effective_uid;
+                        }
+
                         if (opcode == "S") {
-                            std::string key = recv_msgs[3].to_string();
-                            std::string payload = recv_msgs[4].to_string();
+                            std::string key = recv_msgs[4].to_string();
+                            std::string payload = recv_msgs[5].to_string();
                             uint16_t origin = 0;
-                            if (recv_msgs.size() >= 6) {
-                                try { origin = static_cast<uint16_t>(std::stoi(recv_msgs[5].to_string())); } catch (...) {}
+                            if (recv_msgs.size() >= 7) {
+                                try { origin = static_cast<uint16_t>(std::stoi(recv_msgs[6].to_string())); } catch (...) {}
                             }
                             engine->replicate_key(key, payload, origin);
                             sock.send(identity, zmq::send_flags::sndmore);
@@ -101,10 +117,20 @@ public:
                             sock.send(zmq::message_t("OK", 2), zmq::send_flags::none);
                         } else if (opcode == "N") {
                             try {
-                                uint64_t target_id = std::stoull(recv_msgs[3].to_string(), nullptr, 16);
-                                std::string label = recv_msgs[4].to_string();
+                                uint64_t target_id = std::stoull(recv_msgs[4].to_string(), nullptr, 16);
+                                std::string label = recv_msgs[5].to_string();
                                 double min_weight = 0.0;
-                                if (recv_msgs.size() >= 6) min_weight = std::stod(recv_msgs[5].to_string());
+                                if (recv_msgs.size() >= 7) min_weight = std::stod(recv_msgs[6].to_string());
+                                
+                                // Authorization Check
+                                auto perm = engine->get_store()->credentials().check_permission(current_uid, std::string(KeyBuilder::node_key(target_id)));
+                                if (!(perm & l3kv::Permission::READ) && !(perm & l3kv::Permission::ADMIN)) {
+                                    sock.send(identity, zmq::send_flags::sndmore);
+                                    sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                                    sock.send(zmq::message_t("[]", 2), zmq::send_flags::none);
+                                    continue;
+                                }
+
                                 auto node = engine->get_node(target_id);
                                 auto neighbors = node->get_neighbors(label, min_weight);
                                 json j_neighs = json::array();
@@ -122,10 +148,27 @@ public:
                                 sock.send(zmq::message_t(), zmq::send_flags::sndmore);
                                 sock.send(zmq::message_t("[]", 2), zmq::send_flags::none);
                             }
+                        } else if (opcode == "M") {
+                            // MULTI-GET [Key1] [Key2] ...
+                            lite3cpp::Buffer res_buf;
+                            res_buf.init_object();
+                            for (size_t i = 4; i < recv_msgs.size(); ++i) {
+                                std::string key = recv_msgs[i].to_string();
+                                auto perm = engine->get_store()->credentials().check_permission(current_uid, key);
+                                if ((perm & l3kv::Permission::READ) || (perm & l3kv::Permission::ADMIN)) {
+                                    auto val = engine->get_store()->get(key);
+                                    if (val.size() > 0) {
+                                        res_buf.set_bytes(0, key, std::span<const std::byte>(reinterpret_cast<const std::byte*>(val.data()), val.size()));
+                                    }
+                                }
+                            }
+                            sock.send(identity, zmq::send_flags::sndmore);
+                            sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                            sock.send(zmq::message_t(res_buf.data(), res_buf.size()), zmq::send_flags::none);
                         } else if (opcode == "R") {
                             try {
-                                std::vector<uint64_t> nodes = json::parse(recv_msgs[3].to_string());
-                                std::string query_json = recv_msgs[4].to_string();
+                                std::vector<uint64_t> nodes = json::parse(recv_msgs[4].to_string());
+                                std::string query_json = recv_msgs[5].to_string();
                                 auto results = engine->query().resume(nodes, query_json).execute();
                                 json j_res = json::array();
                                 for (const auto& row : results) {
@@ -144,8 +187,18 @@ public:
                             }
                         } else if (opcode == "G") {
                             try {
-                                uint64_t id = std::stoull(recv_msgs[3].to_string(), nullptr, 16);
+                                uint64_t id = std::stoull(recv_msgs[4].to_string(), nullptr, 16);
                                 std::string key = std::string(KeyBuilder::node_key(id));
+                                
+                                // Authorization Check
+                                auto perm = engine->get_store()->credentials().check_permission(current_uid, key);
+                                if (!(perm & l3kv::Permission::READ) && !(perm & l3kv::Permission::ADMIN)) {
+                                    sock.send(identity, zmq::send_flags::sndmore);
+                                    sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                                    sock.send(zmq::message_t("", 0), zmq::send_flags::none);
+                                    continue;
+                                }
+
                                 auto buf = engine->get_store()->get(key);
                                 sock.send(identity, zmq::send_flags::sndmore);
                                 sock.send(zmq::message_t(), zmq::send_flags::sndmore);
@@ -157,8 +210,18 @@ public:
                                 sock.send(zmq::message_t("", 0), zmq::send_flags::none);
                             }
                         } else if (opcode == "P") {
-                            std::string key = recv_msgs[3].to_string();
-                            std::string payload = recv_msgs[4].to_string();
+                            std::string key = recv_msgs[4].to_string();
+                            std::string payload = recv_msgs[5].to_string();
+                            
+                            // Authorization Check
+                            auto perm = engine->get_store()->credentials().check_permission(current_uid, key);
+                            if (!(perm & l3kv::Permission::WRITE) && !(perm & l3kv::Permission::ADMIN)) {
+                                sock.send(identity, zmq::send_flags::sndmore);
+                                sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                                sock.send(zmq::message_t("ERR_FORBIDDEN", 13), zmq::send_flags::none);
+                                continue;
+                            }
+
                             engine->get_store()->put(key, payload);
                             sock.send(identity, zmq::send_flags::sndmore);
                             sock.send(zmq::message_t(), zmq::send_flags::sndmore);
@@ -249,10 +312,26 @@ TEST_F(UltimateMeshTest, ComprehensiveScenario) {
     harness.get_engine(202)->get_remote_client().add_peer(201, "tcp://127.0.0.1:9201");
 
     // Networking: Inter-cluster Replication (US <-> EU)
+    // Map ClusterIDs to entry-point NodeIDs for replication
     harness.get_engine(101)->get_remote_client().add_peer(2, "tcp://127.0.0.1:9201");
     harness.get_engine(102)->get_remote_client().add_peer(2, "tcp://127.0.0.1:9201");
     harness.get_engine(201)->get_remote_client().add_peer(1, "tcp://127.0.0.1:9101");
     harness.get_engine(202)->get_remote_client().add_peer(1, "tcp://127.0.0.1:9101");
+
+    // TRUST DELEGATION: Register all nodes (including Cluster IDs) as ADMIN peers in all nodes
+    for (auto const& [src_id, src_n] : harness.nodes) {
+        for (auto const& [dst_id, dst_n] : harness.nodes) {
+            if (src_id != dst_id) {
+                dst_n->engine->get_store()->credentials().register_user(src_id, "peer", "key");
+                dst_n->engine->get_store()->credentials().set_acl(src_id, "", l3kv::Permission::ADMIN);
+            }
+        }
+        // Also trust Cluster IDs for replication
+        for (uint16_t cid : {1, 2, 3}) {
+            src_n->engine->get_store()->credentials().register_user(cid, "cluster", "key");
+            src_n->engine->get_store()->credentials().set_acl(cid, "", l3kv::Permission::ADMIN);
+        }
+    }
 
     harness.get_engine(101)->get_resolver().register_federation("eu", 2, {"tcp://127.0.0.1:9201"});
     harness.get_engine(102)->get_resolver().register_federation("eu", 2, {"tcp://127.0.0.1:9201"});
@@ -267,7 +346,16 @@ TEST_F(UltimateMeshTest, ComprehensiveScenario) {
     harness.get_engine(102)->get_resolver().register_federation("cloud", 3, {"tcp://127.0.0.1:9301"});
 
     harness.start_all();
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+
+    // --- FOUNDATIONAL SECURITY: Register Global User ---
+    uint32_t user_id = 888;
+    std::cout << "[Test] Registering global user 888 on Node 101..." << std::endl;
+    harness.get_engine(101)->put_system_key("sys:u:888", "{\"name\":\"MeshUser\"}", ADMIN_UID);
+    harness.get_engine(101)->put_system_key("sys:acl:888:", "READ", ADMIN_UID); // Global Read
+
+    std::cout << "[Test] Waiting for global security replication..." << std::endl;
+    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
 
     // --- PHASE 1: Sharding & Local Consistency ---
     std::cout << "--- PHASE 1: Sharding ---" << std::endl;
@@ -320,6 +408,7 @@ TEST_F(UltimateMeshTest, ComprehensiveScenario) {
 
     std::this_thread::sleep_for(std::chrono::milliseconds(1000));
     auto results = harness.get_engine(101)->query()
+        .set_principal_id(user_id)
         .match_id(nodeA_id, "a")
         .out("knows").as("b")
         .out("depends").as("target")

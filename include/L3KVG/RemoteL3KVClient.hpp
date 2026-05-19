@@ -15,6 +15,7 @@
 #include "L3KVG/QueryResult.hpp"
 #include "L3KVG/ThreadPool.hpp"
 #include "L3KVG/Settings.hpp"
+#include "engine/credential_manager.hpp"
 
 
 namespace l3kvg {
@@ -45,46 +46,73 @@ public:
         lite3::NodeID owner_id,
         uint64_t target_node_id, 
         const std::string& label,
-        double min_weight
+        double min_weight,
+        uint32_t principal_id = l3kv::INTERNAL_UID
+    );
+
+    std::future<std::vector<uint64_t>> get_in_neighbors_async(
+        lite3::NodeID owner_id,
+        uint64_t target_node_id, 
+        const std::string& label,
+        uint32_t principal_id = l3kv::INTERNAL_UID
     );
 
     virtual std::future<std::vector<ResultRow>> resume_query_async(
         uint16_t cluster_id,
         const std::vector<uint64_t>& starting_nodes,
-        const std::string& query_json
+        const std::string& query_json,
+        uint32_t principal_id = l3kv::INTERNAL_UID
     );
 
     std::future<bool> put_edge_async(
         lite3::NodeID owner_id,
         const std::string& edge_key, 
-        const std::string& json_payload
+        const std::string& json_payload,
+        uint32_t principal_id = l3kv::INTERNAL_UID
     );
 
     std::future<std::string> get_node_payload_async(
         lite3::NodeID owner_id,
-        uint64_t target_node_id
+        uint64_t target_node_id,
+        uint32_t principal_id = l3kv::INTERNAL_UID
     );
 
     // Batch Fetch: Reduces network roundtrips by coalescing requests to the same peer.
     std::future<std::unordered_map<uint64_t, std::string>> get_nodes_batch_async(
         lite3::NodeID owner_id,
-        const std::vector<uint64_t>& node_ids
+        const std::vector<uint64_t>& node_ids,
+        uint32_t principal_id = l3kv::INTERNAL_UID
     );
 
     std::future<bool> put_node_async(
         lite3::NodeID owner_id,
         uint64_t target_node_id, 
-        const std::string& json_payload
+        const std::string& json_payload,
+        uint32_t principal_id = l3kv::INTERNAL_UID
+    );
+
+    std::future<bool> del_node_async(
+        lite3::NodeID owner_id,
+        uint64_t target_node_id,
+        uint32_t principal_id = l3kv::INTERNAL_UID
+    );
+
+    std::future<bool> del_edge_async(
+        lite3::NodeID owner_id,
+        const std::string& edge_key,
+        uint32_t principal_id = l3kv::INTERNAL_UID
     );
     
     std::future<bool> put_batch_async(
         lite3::NodeID owner_id,
-        const std::unordered_map<uint64_t, std::string>& batch
+        const std::unordered_map<uint64_t, std::string>& batch,
+        uint32_t principal_id = l3kv::INTERNAL_UID
     );
 
     std::future<bool> put_batch_binary_async(
         lite3::NodeID owner_id,
-        const lite3cpp::Buffer& batch_buffer
+        const lite3cpp::Buffer& batch_buffer,
+        uint32_t principal_id = l3kv::INTERNAL_UID
     );
 
     // Replication API
@@ -92,7 +120,8 @@ public:
         uint16_t cluster_id,
         const std::string& key,
         const std::string& payload,
-        uint16_t origin_cluster_id
+        uint16_t origin_cluster_id,
+        uint32_t principal_id = l3kv::INTERNAL_UID
     );
 
     // Diagnostics

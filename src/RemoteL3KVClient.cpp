@@ -80,6 +80,10 @@ void RemoteL3KVClient::ensure_authenticated(std::shared_ptr<Session> session, li
 
         session->socket->send(zmq::message_t(), zmq::send_flags::sndmore);
 
+        // EffectiveUID frame for Auth (dummy 0)
+        uint32_t dummy_uid = 0;
+        session->socket->send(zmq::message_t(&dummy_uid, 4), zmq::send_flags::sndmore);
+
         session->socket->send(zmq::message_t("A", 1), zmq::send_flags::sndmore);
         session->socket->send(zmq::message_t(uid_str.data(), uid_str.size()), zmq::send_flags::sndmore);
         session->socket->send(zmq::message_t(auth_secret_.data(), auth_secret_.size()), zmq::send_flags::none);
@@ -169,7 +173,7 @@ void RemoteL3KVClient::run_health_check_loop() {
     }
 }
 
-std::future<bool> RemoteL3KVClient::put_batch_binary_async(lite3::NodeID owner_id, const lite3cpp::Buffer& batch_buffer) {
+std::future<bool> RemoteL3KVClient::put_batch_binary_async(lite3::NodeID owner_id, const lite3cpp::Buffer& batch_buffer, uint32_t principal_id) {
     auto session = get_session(owner_id);
     if (!session) {
         std::promise<bool> p; p.set_value(false); return p.get_future();
@@ -177,30 +181,41 @@ std::future<bool> RemoteL3KVClient::put_batch_binary_async(lite3::NodeID owner_i
     
     try {
         check_circuit(session);
+        ensure_authenticated(session, owner_id);
     } catch (...) {
         std::promise<bool> p; p.set_exception(std::current_exception()); return p.get_future();
     }
 
-    std::lock_guard<std::recursive_mutex> lock(session->mu);
-    try {
-        session->socket->send(zmq::message_t(), zmq::send_flags::sndmore);
-        session->socket->send(zmq::message_t("B", 1), zmq::send_flags::sndmore);
-        session->socket->send(zmq::message_t(batch_buffer.data(), batch_buffer.size()), zmq::send_flags::none);
-        std::promise<bool> p; p.set_value(true); return p.get_future();
-    } catch (...) {
-        report_failure(owner_id);
-        std::promise<bool> p; p.set_value(false); return p.get_future();
-    }
+    return task_pool_->enqueue([this, owner_id, session, &batch_buffer, principal_id]() -> bool {
+        std::lock_guard<std::recursive_mutex> lock(session->mu);
+        try {
+            session->socket->send(zmq::message_t(), zmq::send_flags::sndmore);
+            session->socket->send(zmq::message_t(&principal_id, 4), zmq::send_flags::sndmore);
+            session->socket->send(zmq::message_t("B", 1), zmq::send_flags::sndmore);
+            session->socket->send(zmq::message_t(batch_buffer.data(), batch_buffer.size()), zmq::send_flags::none);
+            
+            std::vector<zmq::message_t> recv_msgs;
+            auto res = zmq::recv_multipart(*session->socket, std::back_inserter(recv_msgs));
+            if (res && recv_msgs.size() >= 2 && recv_msgs[1].to_string() == "OK") {
+                report_success(owner_id);
+                return true;
+            }
+            return false;
+        } catch (...) {
+            report_failure(owner_id);
+            return false;
+        }
+    });
 }
 
-std::future<bool> RemoteL3KVClient::replicate_async(uint16_t cluster_id, const std::string& key, const std::string& payload, uint16_t origin_cluster_id) {
+std::future<bool> RemoteL3KVClient::replicate_async(uint16_t cluster_id, const std::string& key, const std::string& payload, uint16_t origin_cluster_id, uint32_t principal_id) {
     // Note: for now we map ClusterID directly to NodeID for peer lookups
     auto session = get_session(cluster_id);
     if (!session || !task_pool_) {
         std::promise<bool> p; p.set_value(false); return p.get_future();
     }
 
-    return task_pool_->enqueue([this, cluster_id, key, payload, origin_cluster_id]() -> bool {
+    return task_pool_->enqueue([this, cluster_id, key, payload, origin_cluster_id, principal_id]() -> bool {
         auto session = get_session(cluster_id);
         if (!session) return false;
 
@@ -214,6 +229,7 @@ std::future<bool> RemoteL3KVClient::replicate_async(uint16_t cluster_id, const s
         std::lock_guard<std::recursive_mutex> lock(session->mu);
         try {
             session->socket->send(zmq::message_t(), zmq::send_flags::sndmore);
+            session->socket->send(zmq::message_t(&principal_id, 4), zmq::send_flags::sndmore);
             session->socket->send(zmq::message_t("S", 1), zmq::send_flags::sndmore);
             session->socket->send(zmq::message_t(key.data(), key.size()), zmq::send_flags::sndmore);
             session->socket->send(zmq::message_t(payload.data(), payload.size()), zmq::send_flags::sndmore);
@@ -251,6 +267,8 @@ std::future<bool> RemoteL3KVClient::ping_peer(lite3::NodeID node_id) {
         std::lock_guard<std::recursive_mutex> lock(session->mu);
         try {
             session->socket->send(zmq::message_t(), zmq::send_flags::sndmore);
+            uint32_t internal_uid = INTERNAL_UID;
+            session->socket->send(zmq::message_t(&internal_uid, 4), zmq::send_flags::sndmore);
             session->socket->send(zmq::message_t("H", 1), zmq::send_flags::sndmore);
             session->socket->send(zmq::message_t(), zmq::send_flags::none); // Dummy payload
 
@@ -266,12 +284,12 @@ std::future<bool> RemoteL3KVClient::ping_peer(lite3::NodeID node_id) {
     });
 }
 
-std::future<std::vector<uint64_t>> RemoteL3KVClient::get_neighbors_async(lite3::NodeID owner_id, uint64_t target_node_id, const std::string& label, double min_weight) {
+std::future<std::vector<uint64_t>> RemoteL3KVClient::get_neighbors_async(lite3::NodeID owner_id, uint64_t target_node_id, const std::string& label, double min_weight, uint32_t principal_id) {
     if (!task_pool_) {
         std::promise<std::vector<uint64_t>> p; p.set_value({}); return p.get_future();
     }
 
-    return task_pool_->enqueue([this, owner_id, target_node_id, label, min_weight]() -> std::vector<uint64_t> {
+    return task_pool_->enqueue([this, owner_id, target_node_id, label, min_weight, principal_id]() -> std::vector<uint64_t> {
         auto session = get_session(owner_id);
         if (!session) return {};
         
@@ -288,6 +306,7 @@ std::future<std::vector<uint64_t>> RemoteL3KVClient::get_neighbors_async(lite3::
             std::snprintf(id_buf, sizeof(id_buf), "%016llx", (unsigned long long)target_node_id);
             
             session->socket->send(zmq::message_t(), zmq::send_flags::sndmore);
+            session->socket->send(zmq::message_t(&principal_id, 4), zmq::send_flags::sndmore);
             session->socket->send(zmq::message_t("N", 1), zmq::send_flags::sndmore);
             session->socket->send(zmq::message_t(id_buf, 16), zmq::send_flags::sndmore);
             session->socket->send(zmq::message_t(label.data(), label.size()), zmq::send_flags::sndmore);
@@ -316,12 +335,12 @@ std::future<std::vector<uint64_t>> RemoteL3KVClient::get_neighbors_async(lite3::
     });
 }
 
-std::future<std::vector<ResultRow>> RemoteL3KVClient::resume_query_async(uint16_t cluster_id, const std::vector<uint64_t>& starting_nodes, const std::string& query_json) {
+std::future<std::vector<ResultRow>> RemoteL3KVClient::resume_query_async(uint16_t cluster_id, const std::vector<uint64_t>& starting_nodes, const std::string& query_json, uint32_t principal_id) {
     if (!task_pool_) {
         std::promise<std::vector<ResultRow>> p; p.set_value({}); return p.get_future();
     }
 
-    return task_pool_->enqueue([this, cluster_id, starting_nodes, query_json]() -> std::vector<ResultRow> {
+    return task_pool_->enqueue([this, cluster_id, starting_nodes, query_json, principal_id]() -> std::vector<ResultRow> {
         auto session = get_session(cluster_id);
         if (!session) return {};
         
@@ -338,6 +357,7 @@ std::future<std::vector<ResultRow>> RemoteL3KVClient::resume_query_async(uint16_
             std::string nodes_json = j_nodes.dump();
             
             session->socket->send(zmq::message_t(), zmq::send_flags::sndmore);
+            session->socket->send(zmq::message_t(&principal_id, 4), zmq::send_flags::sndmore);
             session->socket->send(zmq::message_t("R", 1), zmq::send_flags::sndmore);
             session->socket->send(zmq::message_t(nodes_json.data(), nodes_json.size()), zmq::send_flags::sndmore);
             session->socket->send(zmq::message_t(query_json.data(), query_json.size()), zmq::send_flags::none);
@@ -379,7 +399,7 @@ std::future<std::vector<ResultRow>> RemoteL3KVClient::resume_query_async(uint16_
     });
 }
 
-std::future<bool> RemoteL3KVClient::put_edge_async(lite3::NodeID owner_id, const std::string& edge_key, const std::string& json_payload) {
+std::future<bool> RemoteL3KVClient::put_edge_async(lite3::NodeID owner_id, const std::string& edge_key, const std::string& json_payload, uint32_t principal_id) {
     auto session = get_session(owner_id);
     if (!session) {
         std::promise<bool> p; p.set_value(false); return p.get_future();
@@ -392,10 +412,11 @@ std::future<bool> RemoteL3KVClient::put_edge_async(lite3::NodeID owner_id, const
         std::promise<bool> p; p.set_exception(std::current_exception()); return p.get_future();
     }
 
-    return task_pool_->enqueue([this, owner_id, session, edge_key, json_payload]() -> bool {
+    return task_pool_->enqueue([this, owner_id, session, edge_key, json_payload, principal_id]() -> bool {
         std::lock_guard<std::recursive_mutex> lock(session->mu);
         try {
             session->socket->send(zmq::message_t(), zmq::send_flags::sndmore);
+            session->socket->send(zmq::message_t(&principal_id, 4), zmq::send_flags::sndmore);
             session->socket->send(zmq::message_t("P", 1), zmq::send_flags::sndmore);
             session->socket->send(zmq::message_t(edge_key.data(), edge_key.size()), zmq::send_flags::sndmore);
             session->socket->send(zmq::message_t(json_payload.data(), json_payload.size()), zmq::send_flags::none);
@@ -414,12 +435,12 @@ std::future<bool> RemoteL3KVClient::put_edge_async(lite3::NodeID owner_id, const
     });
 }
 
-std::future<std::string> RemoteL3KVClient::get_node_payload_async(lite3::NodeID owner_id, uint64_t target_node_id) {
+std::future<std::string> RemoteL3KVClient::get_node_payload_async(lite3::NodeID owner_id, uint64_t target_node_id, uint32_t principal_id) {
     if (!task_pool_) {
         std::promise<std::string> p; p.set_value(""); return p.get_future();
     }
 
-    return task_pool_->enqueue([this, owner_id, target_node_id]() -> std::string {
+    return task_pool_->enqueue([this, owner_id, target_node_id, principal_id]() -> std::string {
         auto session = get_session(owner_id);
         if (!session) return "";
 
@@ -437,6 +458,7 @@ std::future<std::string> RemoteL3KVClient::get_node_payload_async(lite3::NodeID 
             std::snprintf(id_buf, sizeof(id_buf), "%016llx", (unsigned long long)target_node_id);
             
             session->socket->send(zmq::message_t(), zmq::send_flags::sndmore);
+            session->socket->send(zmq::message_t(&principal_id, 4), zmq::send_flags::sndmore);
             session->socket->send(zmq::message_t("G", 1), zmq::send_flags::sndmore);
             session->socket->send(zmq::message_t(id_buf, 16), zmq::send_flags::none);
             
@@ -463,16 +485,109 @@ std::future<std::string> RemoteL3KVClient::get_node_payload_async(lite3::NodeID 
     });
 }
 
-std::future<std::unordered_map<uint64_t, std::string>> RemoteL3KVClient::get_nodes_batch_async(lite3::NodeID owner_id, const std::vector<uint64_t>& node_ids) {
-    std::promise<std::unordered_map<uint64_t, std::string>> p; p.set_value({}); return p.get_future();
+std::future<std::unordered_map<uint64_t, std::string>> RemoteL3KVClient::get_nodes_batch_async(lite3::NodeID owner_id, const std::vector<uint64_t>& node_ids, uint32_t principal_id) {
+    auto session = get_session(owner_id);
+    if (!session || !task_pool_) {
+        std::promise<std::unordered_map<uint64_t, std::string>> p; p.set_value({}); return p.get_future();
+    }
+
+    return task_pool_->enqueue([this, owner_id, session, node_ids, principal_id]() -> std::unordered_map<uint64_t, std::string> {
+        try {
+            check_circuit(session);
+            ensure_authenticated(session, owner_id);
+        } catch (...) {
+            return {};
+        }
+
+        std::lock_guard<std::recursive_mutex> lock(session->mu);
+        try {
+            session->socket->send(zmq::message_t(), zmq::send_flags::sndmore);
+            session->socket->send(zmq::message_t(&principal_id, 4), zmq::send_flags::sndmore);
+            session->socket->send(zmq::message_t("M", 1), zmq::send_flags::sndmore);
+            
+            for (size_t i = 0; i < node_ids.size(); ++i) {
+                std::string key = std::string(KeyBuilder::node_key(node_ids[i]));
+                session->socket->send(zmq::message_t(key.data(), key.size()), (i == node_ids.size() - 1) ? zmq::send_flags::none : zmq::send_flags::sndmore);
+            }
+            
+            std::vector<zmq::message_t> recv_msgs;
+            auto res = zmq::recv_multipart(*session->socket, std::back_inserter(recv_msgs));
+            
+            std::unordered_map<uint64_t, std::string> results;
+            if (res && recv_msgs.size() >= 2) {
+                report_success(owner_id);
+                auto& body = recv_msgs[1];
+                lite3cpp::Buffer buf(std::vector<uint8_t>((uint8_t*)body.data(), (uint8_t*)body.data() + body.size()));
+                
+                size_t root = 0;
+                for (auto it = buf.begin(root); it != buf.end(root); ++it) {
+                    std::string key(it->key);
+                    if (key.starts_with("n:{") && key.ends_with("}")) {
+                        uint64_t id = std::stoull(key.substr(3, key.size() - 4), nullptr, 16);
+                        auto type = buf.get_type(root, key);
+                        if (type == lite3cpp::Type::Bytes) {
+                            auto b = buf.get_bytes(root, key);
+                            results[id] = std::string(reinterpret_cast<const char*>(b.data()), b.size());
+                        } else if (type == lite3cpp::Type::String) {
+                            results[id] = buf.get_str(root, key);
+                        }
+                    }
+                }
+            }
+            return results;
+        } catch (...) {
+            report_failure(owner_id);
+            return {};
+        }
+    });
 }
 
-std::future<bool> RemoteL3KVClient::put_node_async(lite3::NodeID owner_id, uint64_t target_node_id, const std::string& json_payload) {
+std::future<bool> RemoteL3KVClient::put_node_async(lite3::NodeID owner_id, uint64_t target_node_id, const std::string& json_payload, uint32_t principal_id) {
     std::string key = std::string(KeyBuilder::node_key(target_node_id));
-    return put_edge_async(owner_id, key, json_payload);
+    return put_edge_async(owner_id, key, json_payload, principal_id);
 }
 
-std::future<bool> RemoteL3KVClient::put_batch_async(lite3::NodeID owner_id, const std::unordered_map<uint64_t, std::string>& batch) {
+std::future<bool> RemoteL3KVClient::del_node_async(lite3::NodeID owner_id, uint64_t target_node_id, uint32_t principal_id) {
+    std::string key = std::string(KeyBuilder::node_key(target_node_id));
+    return del_edge_async(owner_id, key, principal_id);
+}
+
+std::future<bool> RemoteL3KVClient::del_edge_async(lite3::NodeID owner_id, const std::string& edge_key, uint32_t principal_id) {
+    auto session = get_session(owner_id);
+    if (!session) {
+        std::promise<bool> p; p.set_value(false); return p.get_future();
+    }
+
+    try {
+        check_circuit(session);
+        ensure_authenticated(session, owner_id);
+    } catch (...) {
+        std::promise<bool> p; p.set_exception(std::current_exception()); return p.get_future();
+    }
+
+    return task_pool_->enqueue([this, owner_id, session, edge_key, principal_id]() -> bool {
+        std::lock_guard<std::recursive_mutex> lock(session->mu);
+        try {
+            session->socket->send(zmq::message_t(), zmq::send_flags::sndmore);
+            session->socket->send(zmq::message_t(&principal_id, 4), zmq::send_flags::sndmore);
+            session->socket->send(zmq::message_t("D", 1), zmq::send_flags::sndmore);
+            session->socket->send(zmq::message_t(edge_key.data(), edge_key.size()), zmq::send_flags::none);
+            
+            std::vector<zmq::message_t> recv_msgs;
+            auto res = zmq::recv_multipart(*session->socket, std::back_inserter(recv_msgs));
+            if (res && recv_msgs.size() >= 2 && recv_msgs[1].to_string() == "OK") {
+                report_success(owner_id);
+                return true;
+            }
+            return false;
+        } catch (...) {
+            report_failure(owner_id);
+            return false;
+        }
+    });
+}
+
+std::future<bool> RemoteL3KVClient::put_batch_async(lite3::NodeID owner_id, const std::unordered_map<uint64_t, std::string>& batch, uint32_t principal_id) {
     std::promise<bool> p; p.set_value(false); return p.get_future();
 }
 
