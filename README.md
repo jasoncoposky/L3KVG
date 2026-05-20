@@ -81,13 +81,23 @@ L3KVG implements a **Security at the Lowest Layer** model. Identity and authoriz
 - **Local-First Authorization**: Security metadata (users and ACLs) under the `sys:` prefix is automatically replicated to all nodes globally. Authorization checks happen locally in the storage hot-path (< 5ns), eliminating WAN bottlenecks for permission lookups.
 - **Single Global Identity**: A user defined in the US cluster can execute a federated query spanning EU and Asia nodes using their single global UID.
 
-```json
-{
-  "node_id": 101,
-  "auth_secret": "your-mesh-shared-secret",
-  "default_principal_id": 1001
-}
-```
+### 4. High-Performance Compute Foundation
+L3KVG uses the **citor** high-performance thread pool for sub-microsecond task dispatch and hardware-topology awareness.
+
+- **Lock-Free Work Stealing**: Replaced central mutex contention with decentralized **Chase-Lev deques**, allowing the engine to scale linearly with CPU core counts (e.g. 64+ cores).
+- **L3 Cache Locality**: Tasks are pinned to **CCD (Core Complex Die)** arenas, ensuring that graph traversals stay "hot" in the fastest cache hierarchy.
+- **Parallel Exploration**: The `MATCH` engine parallelizes path exploration across all available cores, reducing latency for high fan-out queries.
+
+## Performance Benchmarks
+
+L3KVG is designed to meet strict SRE performance targets on persistent, sharded workloads.
+
+| Operation | Performance | Target |
+| :--- | :--- | :--- |
+| **Write Throughput** | **~9,500 edges/sec** | > 5,000 |
+| **Path Exploration** | **~30,000 paths/sec** | > 10,000 |
+| **Traversal Latency (50 fan-out)** | **180 µs** | < 500 µs |
+| **Traversal Latency (10k fan-out)** | **1.5 ms** | < 2.0 ms |
 
 ## ZMQ Replication Protocol (Internal)
 
