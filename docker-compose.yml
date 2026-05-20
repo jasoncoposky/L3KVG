@@ -1,0 +1,68 @@
+version: '3.8'
+
+services:
+  l3kvg-1:
+    build:
+      context: ..
+      dockerfile: l3kvg/Dockerfile
+    container_name: l3kvg-1
+    environment:
+      - NODE_ID=101
+      - CLUSTER_NAME=us-east
+      - AUTH_SECRET=mesh-secret-key
+      - PEERS=102:l3kvg-2:8081,103:l3kvg-3:8081
+    ports:
+      - "8081:8080"
+    volumes:
+      - l3kvg-data-1:/app/data
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+
+  l3kvg-2:
+    build:
+      context: ..
+      dockerfile: l3kvg/Dockerfile
+    container_name: l3kvg-2
+    environment:
+      - NODE_ID=102
+      - CLUSTER_NAME=us-east
+      - AUTH_SECRET=mesh-secret-key
+      - PEERS=101:l3kvg-1:8081,103:l3kvg-3:8081
+    ports:
+      - "8082:8080"
+    volumes:
+      - l3kvg-data-2:/app/data
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+
+  l3kvg-3:
+    build:
+      context: ..
+      dockerfile: l3kvg/Dockerfile
+    container_name: l3kvg-3
+    environment:
+      - NODE_ID=103
+      - CLUSTER_NAME=us-east
+      - AUTH_SECRET=mesh-secret-key
+      - PEERS=101:l3kvg-1:8081,102:l3kvg-2:8081
+    ports:
+      - "8083:8080"
+    volumes:
+      - l3kvg-data-3:/app/data
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+
+volumes:
+  l3kvg-data-1:
+  l3kvg-data-2:
+  l3kvg-data-3:
+
+networks:
+  default:
+    name: l3kvg-mesh

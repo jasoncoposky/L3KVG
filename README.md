@@ -99,6 +99,36 @@ L3KVG is designed to meet strict SRE performance targets on persistent, sharded 
 | **Traversal Latency (50 fan-out)** | **180 µs** | < 500 µs |
 | **Traversal Latency (10k fan-out)** | **1.5 ms** | < 2.0 ms |
 
+## Docker & Cloud Native
+
+L3KVG is fully containerized and ready for cloud-native deployments. We provide a multi-stage `Dockerfile` and a `docker-compose.yml` for rapid cluster setup.
+
+### 1. Build the Image
+```bash
+docker build -t l3kvg:latest -f l3kvg/Dockerfile .
+```
+
+### 2. Launch a 3-Node Cluster (Compose)
+Simulate a sharded US-East cluster on your local machine:
+```bash
+cd l3kvg
+docker-compose up -d
+```
+This spins up 3 nodes (`l3kvg-1`, `l3kvg-2`, `l3kvg-3`) with automatic ZMQ peering and persistent volumes.
+
+### 3. Deploy to Swarm
+For production-like orchestration across multiple hosts:
+```bash
+docker stack deploy -c l3kvg/docker-compose.yml l3kvg_mesh
+```
+
+### Environment Variables
+The Docker entrypoint dynamically generates `config.json` from these variables:
+- `NODE_ID`: Unique ID for the node.
+- `CLUSTER_ID`: Identity of the regional cluster.
+- `AUTH_SECRET`: Shared mesh secret.
+- `PEERS`: Comma-separated list of `id:host:port`.
+
 ## ZMQ Replication Protocol (Internal)
 
 All mesh requests follow a unified structure:
