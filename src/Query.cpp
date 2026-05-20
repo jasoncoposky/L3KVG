@@ -1,10 +1,8 @@
 #include "L3KVG/Query.hpp"
-#include "L3KVG/Node.hpp"
 #include "L3KVG/Engine.hpp"
+#include "L3KVG/Node.hpp"
+#include "L3KVG/Edge.hpp"
 #include "L3KVG/FederationID.hpp"
-#include "engine/store.hpp"
-#include <variant>
-#include <regex>
 #include <iostream>
 #include <iomanip>
 #include <unordered_set>
@@ -12,6 +10,7 @@
 #include <algorithm>
 #include <mutex>
 #include <sstream>
+#include "engine/store.hpp"
 
 #ifdef IRODS_SERVER
 #include "irods/rodsLog.h"
@@ -21,11 +20,9 @@
 #define L3_LOG(level, ...) std::fprintf(stderr, "[L3KVG] " __VA_ARGS__); std::fprintf(stderr, "\n")
 #endif
 
-#include <nlohmann/json.hpp>
+namespace l3kvg {
 
 using json = nlohmann::json;
-
-namespace l3kvg {
 
 template<class... Ts> struct overloaded : Ts... { using Ts::operator()...; };
 template<class... Ts> overloaded(Ts...) -> overloaded<Ts...>;
@@ -48,88 +45,32 @@ static bool evaluate_filter(Node* node, const Query::Filter& f, Engine* engine) 
     if (!node->has_attribute(f.key)) return false;
     auto type = node->get_attribute_type(f.key);
     std::string s_val = node->get_attribute_as_string(f.key);
+
     switch (f.op) {
         case Query::Op::Eq: return s_val == f.value;
         case Query::Op::Ne: return s_val != f.value;
-        case Query::Op::Gt: 
-            if (type == lite3cpp::Type::Int64 || type == lite3cpp::Type::Float64) return std::stod(s_val) > std::stod(f.value);
+        case Query::Op::Gt: {
+            if (type == lite3cpp::Type::Int64) return std::stoll(s_val) > std::stoll(f.value);
+            if (type == lite3cpp::Type::Float64) return std::stod(s_val) > std::stod(f.value);
             return s_val > f.value;
-        case Query::Op::Ge:
-            if (type == lite3cpp::Type::Int64 || type == lite3cpp::Type::Float64) return std::stod(s_val) >= std::stod(f.value);
-            return s_val >= f.value;
-        case Query::Op::Lt:
-            if (type == lite3cpp::Type::Int64 || type == lite3cpp::Type::Float64) return std::stod(s_val) < std::stod(f.value);
-            return s_val < f.value;
-        case Query::Op::Le:
-            if (type == lite3cpp::Type::Int64 || type == lite3cpp::Type::Float64) return std::stod(s_val) <= std::stod(f.value);
-            return s_val <= f.value;
-        case Query::Op::Like: {
-            std::string pattern = f.value; size_t pos = 0;
-            while ((pos = pattern.find('%', pos)) != std::string::npos) { pattern.replace(pos, 1, ".*"); pos += 2; }
-            pos = 0; while ((pos = pattern.find('_', pos)) != std::string::npos) { pattern.replace(pos, 1, "."); pos += 1; }
-            try { std::regex re(pattern); return std::regex_match(s_val, re); } catch(...) { return false; }
         }
+        case Query::Op::Ge: {
+            if (type == lite3cpp::Type::Int64) return std::stoll(s_val) >= std::stoll(f.value);
+            if (type == lite3cpp::Type::Float64) return std::stod(s_val) >= std::stod(f.value);
+            return s_val >= f.value;
+        }
+        case Query::Op::Lt: {
+            if (type == lite3cpp::Type::Int64) return std::stoll(s_val) < std::stoll(f.value);
+            if (type == lite3cpp::Type::Float64) return std::stod(s_val) < std::stod(f.value);
+            return s_val < f.value;
+        }
+        case Query::Op::Le: {
+            if (type == lite3cpp::Type::Int64) return std::stoll(s_val) <= std::stoll(f.value);
+            if (type == lite3cpp::Type::Float64) return std::stod(s_val) <= std::stod(f.value);
+            return s_val <= f.value;
+        }
+        default: return false;
     }
-    return false;
-}
-
-Query::Query(Engine *engine) : engine_(engine) {}
-
-Query &Query::match(std::string_view node_alias) {
-  initial_match_ = MatchStep{std::string(node_alias)};
-  root_alias_ = std::string(node_alias);
-  return *this;
-}
-
-Query &Query::match_id(uint64_t id, std::string_view alias) {
-    starting_nodes_ = {id};
-    initial_match_ = MatchStep{std::string(alias)};
-    root_alias_ = std::string(alias);
-    return *this;
-}
-
-Query::FilterGroup& Query::FilterGroup::where(std::string_view alias, std::string_view key, Query::Op op, std::string_view value) {
-    nodes.push_back({Query::Filter{std::string(alias), std::string(key), op, std::string(value)}, Query::LogicalOp::And});
-    return *this;
-}
-
-Query::FilterGroup& Query::FilterGroup::or_where(std::string_view alias, std::string_view key, Query::Op op, std::string_view value) {
-    nodes.push_back({Query::Filter{std::string(alias), std::string(key), op, std::string(value)}, Query::LogicalOp::Or});
-    return *this;
-}
-
-Query::FilterGroup& Query::FilterGroup::where_group(std::function<void(FilterGroup&)> cb) {
-    auto group = std::make_shared<FilterGroup>();
-    cb(*group);
-    nodes.push_back({group, Query::LogicalOp::And});
-    return *this;
-}
-
-Query::FilterGroup& Query::FilterGroup::or_where_group(std::function<void(FilterGroup&)> cb) {
-    auto group = std::make_shared<FilterGroup>();
-    cb(*group);
-    nodes.push_back({group, Query::LogicalOp::Or});
-    return *this;
-}
-
-Query &Query::where(std::string_view alias, std::string_view key, Op op, std::string_view value) {
-  root_filters_.where(alias, key, op, value);
-  return *this;
-}
-
-Query &Query::or_where(std::string_view alias, std::string_view key, Op op, std::string_view value) {
-  root_filters_.or_where(alias, key, op, value);
-  return *this;
-}
-
-Query &Query::where_group(std::function<void(FilterGroup&)> cb) {
-  root_filters_.where_group(cb);
-  return *this;
-}
-
-Query &Query::or_where_group(std::function<void(FilterGroup&)> cb) {
-  root_filters_.or_where_group(cb);
-  return *this;
 }
 
 static bool evaluate_group(const Query::FilterGroup& g, const std::unordered_map<std::string, std::shared_ptr<Node>>& available_nodes, std::string_view current_alias, Engine* engine) {
@@ -151,48 +92,86 @@ static bool evaluate_group(const Query::FilterGroup& g, const std::unordered_map
     return result;
 }
 
-Query &Query::where_has(std::string_view alias, std::string_view key, std::string_view value_type) {
-  filters_has_.push_back({std::string(alias), std::string(key), std::string(value_type)});
+Query::FilterGroup& Query::FilterGroup::where(std::string_view alias, std::string_view key, Op op, std::string_view value) {
+    nodes.push_back({Filter{std::string(alias), std::string(key), op, std::string(value)}, LogicalOp::And});
+    return *this;
+}
+Query::FilterGroup& Query::FilterGroup::or_where(std::string_view alias, std::string_view key, Op op, std::string_view value) {
+    nodes.push_back({Filter{std::string(alias), std::string(key), op, std::string(value)}, LogicalOp::Or});
+    return *this;
+}
+Query::FilterGroup& Query::FilterGroup::where_group(std::function<void(FilterGroup&)> cb) {
+    auto sub = std::make_shared<FilterGroup>();
+    cb(*sub);
+    nodes.push_back({sub, LogicalOp::And});
+    return *this;
+}
+Query::FilterGroup& Query::FilterGroup::or_where_group(std::function<void(FilterGroup&)> cb) {
+    auto sub = std::make_shared<FilterGroup>();
+    cb(*sub);
+    nodes.push_back({sub, LogicalOp::Or});
+    return *this;
+}
+
+Query::Query(Engine *engine) : engine_(engine) {}
+
+Query &Query::match(std::string_view node_alias) {
+  initial_match_ = {std::string(node_alias)};
+  return *this;
+}
+
+Query &Query::match_id(uint64_t id, std::string_view alias) {
+  initial_match_ = {std::string(alias)};
+  char buf[24];
+  std::snprintf(buf, sizeof(buf), "%016llx", (unsigned long long)id);
+  root_filters_.where(alias, "id", Op::Eq, std::string(buf));
+  return *this;
+}
+
+Query &Query::match_id(std::string_view uuid, std::string_view alias) {
+  initial_match_ = {std::string(alias)};
+  root_filters_.where(alias, "id", Op::Eq, std::string(uuid));
+  return *this;
+}
+
+Query &Query::where(std::string_view node_alias, std::string_view key, Op op,
+                    std::string_view value) {
+  root_filters_.where(node_alias, key, op, value);
+  return *this;
+}
+
+Query &Query::where_group(std::function<void(FilterGroup&)> cb) {
+  root_filters_.where_group(cb);
+  return *this;
+}
+
+Query &Query::or_where(std::string_view node_alias, std::string_view key, Op op,
+                       std::string_view value) {
+  root_filters_.or_where(node_alias, key, op, value);
+  return *this;
+}
+
+Query &Query::or_where_group(std::function<void(FilterGroup&)> cb) {
+  root_filters_.or_where_group(cb);
   return *this;
 }
 
 Query::OutEdgeBuilder Query::out(std::string_view edge_label, double min_weight) {
-  return OutEdgeBuilder(*this, edge_label, min_weight);
+    return OutEdgeBuilder(*this, edge_label, min_weight);
 }
-
-Query &Query::OutEdgeBuilder::as(std::string_view dest_alias) {
-  q_.steps_.push_back(Query::OutStep{std::string(label_), weight_, std::string(dest_alias)});
-  return q_;
-}
-
 Query::InEdgeBuilder Query::in(std::string_view edge_label) {
-  return InEdgeBuilder(*this, edge_label);
+    return InEdgeBuilder(*this, edge_label);
 }
-
-Query &Query::InEdgeBuilder::as(std::string_view dest_alias) {
-  q_.steps_.push_back(Query::InStep{std::string(label_), std::string(dest_alias)});
-  return q_;
+Query& Query::OutEdgeBuilder::as(std::string_view dest_alias) {
+    q_.steps_.push_back(OutStep{label_, weight_, std::string(dest_alias)});
+    return q_;
 }
-
-Query &Query::return_(std::string_view alias, std::string_view property, AggOp agg) {
-  projections_.push_back({std::string(alias), std::string(property), agg});
-  return *this;
+Query& Query::InEdgeBuilder::as(std::string_view dest_alias) {
+    q_.steps_.push_back(InStep{label_, std::string(dest_alias)});
+    return q_;
 }
-
-Query &Query::order_by(std::string_view alias, std::string_view property, bool ascending) {
-    sorts_.push_back({std::string(alias), std::string(property), ascending});
-    return *this;
-}
-
-Query &Query::limit(size_t limit) { limit_ = limit; return *this; }
-Query &Query::offset(size_t offset) { offset_ = offset; return *this; }
-Query &Query::group_by(std::string_view alias, std::string_view property) {
-    groups_.push_back({std::string(alias), std::string(property)});
-    return *this;
-}
-
-Query &Query::distinct(bool enable) {
-    distinct_ = enable;
+Query& Query::return_(std::string_view alias, std::string_view property, AggOp agg) {
+    projections_.push_back(ReturnStep{std::string(alias), std::string(property), agg});
     return *this;
 }
 
@@ -311,8 +290,8 @@ std::vector<ResultRow> Query::execute() {
     std::vector<Path> next_paths;
     std::mutex result_mu;
 
-    // Parallel Path Exploration via Citor
-    engine_->get_thread_pool().get_citor_pool().template parallelFor<citor::HintsDefaults>(0, paths.size(), [&](size_t first, size_t last) {
+    // Parallel Path Exploration via Citor abstraction
+    engine_->get_thread_pool().parallel_for(0, paths.size(), [&](size_t first, size_t last) {
         std::vector<Path> local_next_paths;
         std::unordered_map<uint16_t, std::vector<std::pair<uint64_t, std::pair<std::string, std::vector<Step>>>>> local_suspended;
 
@@ -324,16 +303,20 @@ std::vector<ResultRow> Query::execute() {
                     auto neighbors = node->get_neighbors(s.label, s.min_weight, principal_id_);
                     std::unordered_set<uint64_t> unique_neighbors(neighbors.begin(), neighbors.end());
                     for (const auto& neighbor_id : unique_neighbors) {
-                        uint16_t cluster_id = FederationID::get_cluster(neighbor_id);
-                        if (!engine_->get_resolver().is_local_cluster(cluster_id)) {
-                            std::vector<Step> remaining(steps_.begin() + i + 1, steps_.end());
-                            local_suspended[cluster_id].push_back({neighbor_id, {s.target_alias, remaining}});
-                            continue;
-                        }
-                        auto neighbor_node = engine_->get_node(neighbor_id);
-                        if (!neighbor_node) continue;
-                        Path new_path = path; new_path.alias_to_node[s.target_alias] = neighbor_node; new_path.last_alias = s.target_alias;
-                        if (evaluate_group(root_filters_, new_path.alias_to_node, s.target_alias, engine_)) local_next_paths.push_back(std::move(new_path));
+                        try {
+                            uint16_t cluster_id = FederationID::get_cluster(neighbor_id);
+                            if (!engine_->get_resolver().is_local_cluster(cluster_id)) {
+                                std::vector<Step> remaining(steps_.begin() + i + 1, steps_.end());
+                                local_suspended[cluster_id].push_back({neighbor_id, {s.target_alias, remaining}});
+                                continue;
+                            }
+                            auto neighbor_node = engine_->get_node(neighbor_id);
+                            if (!neighbor_node) continue;
+                            Path new_path = path; new_path.alias_to_node[s.target_alias] = neighbor_node; new_path.last_alias = s.target_alias;
+                            if (evaluate_group(root_filters_, new_path.alias_to_node, s.target_alias, engine_)) {
+                                local_next_paths.push_back(std::move(new_path));
+                            }
+                        } catch (...) {}
                     }
                 },
                 [&](const InStep& s) {
@@ -341,16 +324,20 @@ std::vector<ResultRow> Query::execute() {
                     auto neighbors = node->get_in_neighbors(s.label, principal_id_);
                     std::unordered_set<uint64_t> unique_neighbors(neighbors.begin(), neighbors.end());
                     for (const auto& neighbor_id : unique_neighbors) {
-                        uint16_t cluster_id = FederationID::get_cluster(neighbor_id);
-                        if (!engine_->get_resolver().is_local_cluster(cluster_id)) {
-                            std::vector<Step> remaining(steps_.begin() + i + 1, steps_.end());
-                            local_suspended[cluster_id].push_back({neighbor_id, {s.target_alias, remaining}});
-                            continue;
-                        }
-                        auto neighbor_node = engine_->get_node(neighbor_id);
-                        if (!neighbor_node) continue;
-                        Path new_path = path; new_path.alias_to_node[s.target_alias] = neighbor_node; new_path.last_alias = s.target_alias;
-                        if (evaluate_group(root_filters_, new_path.alias_to_node, s.target_alias, engine_)) local_next_paths.push_back(std::move(new_path));
+                        try {
+                            uint16_t cluster_id = FederationID::get_cluster(neighbor_id);
+                            if (!engine_->get_resolver().is_local_cluster(cluster_id)) {
+                                std::vector<Step> remaining(steps_.begin() + i + 1, steps_.end());
+                                local_suspended[cluster_id].push_back({neighbor_id, {s.target_alias, remaining}});
+                                continue;
+                            }
+                            auto neighbor_node = engine_->get_node(neighbor_id);
+                            if (!neighbor_node) continue;
+                            Path new_path = path; new_path.alias_to_node[s.target_alias] = neighbor_node; new_path.last_alias = s.target_alias;
+                            if (evaluate_group(root_filters_, new_path.alias_to_node, s.target_alias, engine_)) {
+                                local_next_paths.push_back(std::move(new_path));
+                            }
+                        } catch (...) {}
                     }
                 }
             }, step);
@@ -453,6 +440,7 @@ std::vector<ResultRow> Query::execute() {
               partitions[g_key].push_back(std::move(row));
           }
       }
+
       std::vector<ResultRow> final_res;
       for (auto& pair : partitions) {
           auto& part = pair.second; ResultRow agg_row;
