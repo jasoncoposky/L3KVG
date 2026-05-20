@@ -1,43 +1,50 @@
 #pragma once
 
 #include <vector>
-#include <queue>
 #include <thread>
-#include <mutex>
-#include <condition_variable>
 #include <functional>
 #include <future>
 #include <atomic>
+#include <memory>
+#include <stdexcept>
+
+// Citor: High-Performance, Topology-Aware Compute Engine
+#include <citor.hpp>
+
+// Moodycamel: Lock-Free Concurrent Queue for minimal handoff latency
+#include <concurrentqueue.h>
 
 namespace l3kvg {
 
 class ThreadPool {
 public:
-    explicit ThreadPool(size_t threads) : stop_(false) {
-        for(size_t i = 0; i < threads; ++i) {
-            workers_.emplace_back([this] {
-                for(;;) {
-                    std::function<void()> task;
-                    {
-                        std::unique_lock<std::mutex> lock(this->queue_mutex_);
-                        this->condition_.wait(lock, [this]{ return this->stop_ || !this->tasks_.empty(); });
-                        if(this->stop_ && this->tasks_.empty()) return;
-                        task = std::move(this->tasks_.front());
-                        this->tasks_.pop();
-                    }
-                    task();
+    explicit ThreadPool(size_t threads) 
+        : pool_(threads + 1), // +1 for the local producer/driver
+          stop_(false) {
+        
+        // Driver Thread: Drains the async queue and dispatches to citor workers
+        driver_thread_ = std::thread([this] {
+            std::function<void()> task;
+            while (!stop_.load(std::memory_order_relaxed)) {
+                if (queue_.try_dequeue(task)) {
+                    // Dispatch to citor. Using parallelFor with 1 item 
+                    // allows citor to handle the worker handoff with sub-microsecond latency.
+                    pool_.template parallelFor<citor::HintsDefaults>(0, 1, [&](size_t, size_t) {
+                        task();
+                    });
+                } else {
+                    // Adaptive backoff for idle driver
+                    std::this_thread::yield();
                 }
-            });
-        }
+            }
+        });
     }
 
     template<class F, class... Args>
     auto enqueue(F&& f, Args&&... args) -> std::future<typename std::invoke_result<F, Args...>::type> {
         using return_type = typename std::invoke_result<F, Args...>::type;
         
-        // Use shared_ptr to wrap move-only types to satisfy potential copy requirements in some compiler implementations
         auto task_fn = std::make_shared<std::decay_t<F>>(std::forward<F>(f));
-        
         auto task = std::make_shared<std::packaged_task<return_type()>>(
             [task_fn, ...args = std::forward<Args>(args)]() mutable {
                 return std::invoke(std::move(*task_fn), std::move(args)...);
@@ -45,32 +52,30 @@ public:
         );
         
         std::future<return_type> res = task->get_future();
-        {
-            std::unique_lock<std::mutex> lock(queue_mutex_);
-            if(stop_) throw std::runtime_error("enqueue on stopped ThreadPool");
-            tasks_.emplace([task](){ (*task)(); });
+        
+        if (stop_.load(std::memory_order_relaxed)) {
+            throw std::runtime_error("enqueue on stopped ThreadPool");
         }
-        condition_.notify_one();
+
+        // Lock-free push: minimal latency for the producer thread (e.g. ZMQ loop)
+        queue_.enqueue([task](){ (*task)(); });
+        
         return res;
     }
 
     ~ThreadPool() {
-        {
-            std::unique_lock<std::mutex> lock(queue_mutex_);
-            stop_ = true;
-        }
-        condition_.notify_all();
-        for(std::thread &worker: workers_) {
-            if (worker.joinable()) worker.join();
-        }
+        stop_ = true;
+        if (driver_thread_.joinable()) driver_thread_.join();
     }
 
+    // Access to the underlying citor pool for direct parallel operations
+    citor::ThreadPool& get_citor_pool() { return pool_; }
+
 private:
-    std::vector<std::thread> workers_;
-    std::queue<std::function<void()>> tasks_;
-    std::mutex queue_mutex_;
-    std::condition_variable condition_;
-    bool stop_;
+    citor::ThreadPool pool_;
+    moodycamel::ConcurrentQueue<std::function<void()>> queue_;
+    std::thread driver_thread_;
+    std::atomic<bool> stop_;
 };
 
 } // namespace l3kvg

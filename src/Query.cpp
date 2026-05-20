@@ -10,6 +10,7 @@
 #include <unordered_set>
 #include <set>
 #include <algorithm>
+#include <mutex>
 #include <sstream>
 
 #ifdef IRODS_SERVER
@@ -308,46 +309,62 @@ std::vector<ResultRow> Query::execute() {
   for (size_t i = 0; i < steps_.size(); ++i) {
     const auto& step = steps_[i];
     std::vector<Path> next_paths;
-    std::visit(overloaded{
-        [&](const OutStep& s) {
-            for (const auto &path : paths) {
-                auto node = path.alias_to_node.at(path.last_alias);
-                auto neighbors = node->get_neighbors(s.label, s.min_weight, principal_id_);
-                std::unordered_set<uint64_t> unique_neighbors(neighbors.begin(), neighbors.end());
-                for (const auto& neighbor_id : unique_neighbors) {
-                    uint16_t cluster_id = FederationID::get_cluster(neighbor_id);
-                    if (!engine_->get_resolver().is_local_cluster(cluster_id)) {
-                        std::vector<Step> remaining(steps_.begin() + i + 1, steps_.end());
-                        suspended_branches[cluster_id].push_back({neighbor_id, {s.target_alias, remaining}});
-                        continue;
+    std::mutex result_mu;
+
+    // Parallel Path Exploration via Citor
+    engine_->get_thread_pool().get_citor_pool().template parallelFor<citor::HintsDefaults>(0, paths.size(), [&](size_t first, size_t last) {
+        std::vector<Path> local_next_paths;
+        std::unordered_map<uint16_t, std::vector<std::pair<uint64_t, std::pair<std::string, std::vector<Step>>>>> local_suspended;
+
+        for (size_t p_idx = first; p_idx < last; ++p_idx) {
+            const auto &path = paths[p_idx];
+            std::visit(overloaded{
+                [&](const OutStep& s) {
+                    auto node = path.alias_to_node.at(path.last_alias);
+                    auto neighbors = node->get_neighbors(s.label, s.min_weight, principal_id_);
+                    std::unordered_set<uint64_t> unique_neighbors(neighbors.begin(), neighbors.end());
+                    for (const auto& neighbor_id : unique_neighbors) {
+                        uint16_t cluster_id = FederationID::get_cluster(neighbor_id);
+                        if (!engine_->get_resolver().is_local_cluster(cluster_id)) {
+                            std::vector<Step> remaining(steps_.begin() + i + 1, steps_.end());
+                            local_suspended[cluster_id].push_back({neighbor_id, {s.target_alias, remaining}});
+                            continue;
+                        }
+                        auto neighbor_node = engine_->get_node(neighbor_id);
+                        if (!neighbor_node) continue;
+                        Path new_path = path; new_path.alias_to_node[s.target_alias] = neighbor_node; new_path.last_alias = s.target_alias;
+                        if (evaluate_group(root_filters_, new_path.alias_to_node, s.target_alias, engine_)) local_next_paths.push_back(std::move(new_path));
                     }
-                    auto neighbor_node = engine_->get_node(neighbor_id);
-                    if (!neighbor_node) continue;
-                    Path new_path = path; new_path.alias_to_node[s.target_alias] = neighbor_node; new_path.last_alias = s.target_alias;
-                    if (evaluate_group(root_filters_, new_path.alias_to_node, s.target_alias, engine_)) next_paths.push_back(std::move(new_path));
-                }
-            }
-        },
-        [&](const InStep& s) {
-            for (const auto &path : paths) {
-                auto node = path.alias_to_node.at(path.last_alias);
-                auto neighbors = node->get_in_neighbors(s.label, principal_id_);
-                std::unordered_set<uint64_t> unique_neighbors(neighbors.begin(), neighbors.end());
-                for (const auto& neighbor_id : unique_neighbors) {
-                    uint16_t cluster_id = FederationID::get_cluster(neighbor_id);
-                    if (!engine_->get_resolver().is_local_cluster(cluster_id)) {
-                        std::vector<Step> remaining(steps_.begin() + i + 1, steps_.end());
-                        suspended_branches[cluster_id].push_back({neighbor_id, {s.target_alias, remaining}});
-                        continue;
+                },
+                [&](const InStep& s) {
+                    auto node = path.alias_to_node.at(path.last_alias);
+                    auto neighbors = node->get_in_neighbors(s.label, principal_id_);
+                    std::unordered_set<uint64_t> unique_neighbors(neighbors.begin(), neighbors.end());
+                    for (const auto& neighbor_id : unique_neighbors) {
+                        uint16_t cluster_id = FederationID::get_cluster(neighbor_id);
+                        if (!engine_->get_resolver().is_local_cluster(cluster_id)) {
+                            std::vector<Step> remaining(steps_.begin() + i + 1, steps_.end());
+                            local_suspended[cluster_id].push_back({neighbor_id, {s.target_alias, remaining}});
+                            continue;
+                        }
+                        auto neighbor_node = engine_->get_node(neighbor_id);
+                        if (!neighbor_node) continue;
+                        Path new_path = path; new_path.alias_to_node[s.target_alias] = neighbor_node; new_path.last_alias = s.target_alias;
+                        if (evaluate_group(root_filters_, new_path.alias_to_node, s.target_alias, engine_)) local_next_paths.push_back(std::move(new_path));
                     }
-                    auto neighbor_node = engine_->get_node(neighbor_id);
-                    if (!neighbor_node) continue;
-                    Path new_path = path; new_path.alias_to_node[s.target_alias] = neighbor_node; new_path.last_alias = s.target_alias;
-                    if (evaluate_group(root_filters_, new_path.alias_to_node, s.target_alias, engine_)) next_paths.push_back(std::move(new_path));
                 }
-            }
+            }, step);
         }
-    }, step);
+
+        // Combine local results
+        std::lock_guard<std::mutex> lock(result_mu);
+        next_paths.insert(next_paths.end(), std::make_move_iterator(local_next_paths.begin()), std::make_move_iterator(local_next_paths.end()));
+        for (auto& [cluster_id, branches] : local_suspended) {
+            auto& target = suspended_branches[cluster_id];
+            target.insert(target.end(), std::make_move_iterator(branches.begin()), std::make_move_iterator(branches.end()));
+        }
+    });
+
     paths = std::move(next_paths);
     if (paths.empty() && suspended_branches.empty()) break;
   }

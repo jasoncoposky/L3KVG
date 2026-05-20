@@ -7,6 +7,14 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Include L3KV, which transitively includes lite3-cpp and now ZeroMQ via FetchContent
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../L3KV ${CMAKE_CURRENT_BINARY_DIR}/L3KV)
 
+include(FetchContent)
+FetchContent_Declare(
+  citor
+  GIT_REPOSITORY https://github.com/Lallapallooza/citor.git
+  GIT_TAG        main
+)
+FetchContent_MakeAvailable(citor)
+
 
 
 add_library(l3kvg_engine STATIC
@@ -23,7 +31,10 @@ target_include_directories(l3kvg_engine PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     "${CMAKE_CURRENT_SOURCE_DIR}/../lib/boost_1_89_0"
     "${CMAKE_CURRENT_SOURCE_DIR}/../L3KV/src"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../L3KV/lib/concurrentqueue"
     "${CMAKE_CURRENT_SOURCE_DIR}/../lib/liblite3client/external"
+    ${citor_SOURCE_DIR}/single_include
+    ${citor_SOURCE_DIR}/include
 )
 
 if(MSVC)
