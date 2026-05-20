@@ -220,15 +220,20 @@ int main(int argc, char *argv[]) {
         while (true) {
             std::vector<zmq::message_t> recv_msgs;
             auto result = zmq::recv_multipart(sock, std::back_inserter(recv_msgs));
-            if (!result || recv_msgs.size() < 4) continue;
+            if (!result || recv_msgs.size() < 5) continue;
 
             auto& identity = recv_msgs[0];
-            auto opcode = recv_msgs[2].to_string();
+            // recv_msgs[1] is delimiter
+            uint32_t principal_id = 0;
+            if (recv_msgs[2].size() == 4) {
+                std::memcpy(&principal_id, recv_msgs[2].data(), 4);
+            }
+            auto opcode = recv_msgs[3].to_string();
 
             if (opcode == "R") {
                 try {
-                    std::vector<uint64_t> nodes = json::parse(recv_msgs[3].to_string());
-                    std::string query_json = recv_msgs[4].to_string();
+                    std::vector<uint64_t> nodes = json::parse(recv_msgs[4].to_string());
+                    std::string query_json = recv_msgs[5].to_string();
 
                     auto results = engine->query().resume(nodes, query_json).execute();
 
@@ -251,13 +256,38 @@ int main(int argc, char *argv[]) {
             } else if (opcode == "N") {
                 // GET neighbors
                 try {
-                    uint64_t target_id = std::stoull(recv_msgs[3].to_string(), nullptr, 16);
-                    std::string label = recv_msgs[4].to_string();
+                    uint64_t target_id = std::stoull(recv_msgs[4].to_string(), nullptr, 16);
+                    std::string label = recv_msgs[5].to_string();
                     double min_weight = 0.0;
-                    if (recv_msgs.size() >= 6) min_weight = std::stod(recv_msgs[5].to_string());
+                    if (recv_msgs.size() >= 7) min_weight = std::stod(recv_msgs[6].to_string());
                     
                     auto node = engine->get_node(target_id);
-                    auto neighbors = node->get_neighbors(label, min_weight);
+                    auto neighbors = node->get_neighbors(label, min_weight, principal_id);
+                    
+                    json j_neighs = json::array();
+                    for (auto id : neighbors) {
+                        char id_buf[17];
+                        std::snprintf(id_buf, sizeof(id_buf), "%016llx", (unsigned long long)id);
+                        j_neighs.push_back(std::string(id_buf));
+                    }
+                    
+                    std::string resp_json = j_neighs.dump();
+                    sock.send(identity, zmq::send_flags::sndmore);
+                    sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                    sock.send(zmq::message_t(resp_json.data(), resp_json.size()), zmq::send_flags::none);
+                } catch (...) {
+                    sock.send(identity, zmq::send_flags::sndmore);
+                    sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                    sock.send(zmq::message_t("[]", 2), zmq::send_flags::none);
+                }
+            } else if (opcode == "I") {
+                // GET in-neighbors
+                try {
+                    uint64_t target_id = std::stoull(recv_msgs[4].to_string(), nullptr, 16);
+                    std::string label = recv_msgs[5].to_string();
+                    
+                    auto node = engine->get_node(target_id);
+                    auto neighbors = node->get_in_neighbors(label, principal_id);
                     
                     json j_neighs = json::array();
                     for (auto id : neighbors) {
@@ -278,7 +308,7 @@ int main(int argc, char *argv[]) {
             } else if (opcode == "G") {
                 // GET node
                 try {
-                    uint64_t id = std::stoull(recv_msgs[3].to_string(), nullptr, 16);
+                    uint64_t id = std::stoull(recv_msgs[4].to_string(), nullptr, 16);
                     std::string key = std::string(l3kvg::KeyBuilder::node_key(id));
                     auto buf = engine->get_store()->get(key);
                     
@@ -297,9 +327,23 @@ int main(int argc, char *argv[]) {
             } else if (opcode == "P") {
                 // PUT node/edge (key based)
                 try {
-                    std::string key = recv_msgs[3].to_string();
-                    std::string payload = recv_msgs[4].to_string();
+                    std::string key = recv_msgs[4].to_string();
+                    std::string payload = recv_msgs[5].to_string();
                     engine->get_store()->put(key, payload);
+                    
+                    sock.send(identity, zmq::send_flags::sndmore);
+                    sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                    sock.send(zmq::message_t("OK", 2), zmq::send_flags::none);
+                } catch (...) {
+                    sock.send(identity, zmq::send_flags::sndmore);
+                    sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                    sock.send(zmq::message_t("ERR", 3), zmq::send_flags::none);
+                }
+            } else if (opcode == "D") {
+                // DELETE node/edge (key based)
+                try {
+                    std::string key = recv_msgs[4].to_string();
+                    engine->get_store()->del(key);
                     
                     sock.send(identity, zmq::send_flags::sndmore);
                     sock.send(zmq::message_t(), zmq::send_flags::sndmore);
@@ -312,8 +356,8 @@ int main(int argc, char *argv[]) {
             } else if (opcode == "B") {
                 // BATCH PUT (binary buffer)
                 try {
-                    std::vector<uint8_t> data(reinterpret_cast<const uint8_t*>(recv_msgs[3].data()), 
-                                             reinterpret_cast<const uint8_t*>(recv_msgs[3].data()) + recv_msgs[3].size());
+                    std::vector<uint8_t> data(reinterpret_cast<const uint8_t*>(recv_msgs[4].data()), 
+                                             reinterpret_cast<const uint8_t*>(recv_msgs[4].data()) + recv_msgs[4].size());
                     lite3cpp::Buffer batch_buf(std::move(data));
                     for (auto it = batch_buf.begin(0); it != batch_buf.end(0); ++it) {
                         std::string key_str(it->key);

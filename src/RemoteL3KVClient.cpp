@@ -335,6 +335,54 @@ std::future<std::vector<uint64_t>> RemoteL3KVClient::get_neighbors_async(lite3::
     });
 }
 
+std::future<std::vector<uint64_t>> RemoteL3KVClient::get_in_neighbors_async(lite3::NodeID owner_id, uint64_t target_node_id, const std::string& label, uint32_t principal_id) {
+    if (!task_pool_) {
+        std::promise<std::vector<uint64_t>> p; p.set_value({}); return p.get_future();
+    }
+
+    return task_pool_->enqueue([this, owner_id, target_node_id, label, principal_id]() -> std::vector<uint64_t> {
+        auto session = get_session(owner_id);
+        if (!session) return {};
+        
+        try {
+            check_circuit(session);
+            ensure_authenticated(session, owner_id);
+        } catch (...) {
+            return {};
+        }
+
+        std::lock_guard<std::recursive_mutex> lock(session->mu);
+        try {
+            char id_buf[17];
+            std::snprintf(id_buf, sizeof(id_buf), "%016llx", (unsigned long long)target_node_id);
+            
+            session->socket->send(zmq::message_t(), zmq::send_flags::sndmore);
+            session->socket->send(zmq::message_t(&principal_id, 4), zmq::send_flags::sndmore);
+            session->socket->send(zmq::message_t("I", 1), zmq::send_flags::sndmore);
+            session->socket->send(zmq::message_t(id_buf, 16), zmq::send_flags::sndmore);
+            session->socket->send(zmq::message_t(label.data(), label.size()), zmq::send_flags::none);
+            
+            std::vector<zmq::message_t> recv_msgs;
+            auto res = zmq::recv_multipart(*session->socket, std::back_inserter(recv_msgs));
+            
+            if (res && recv_msgs.size() >= 2) {
+                report_success(owner_id);
+                nlohmann::json j_neighs = nlohmann::json::parse(recv_msgs[1].to_string());
+                std::vector<uint64_t> results;
+                for (const auto& item : j_neighs) {
+                    results.push_back(std::stoull(item.get<std::string>(), nullptr, 16));
+                }
+                return results;
+            } else {
+                throw FederationTimeoutException("In-Neighbor fetch timed out");
+            }
+        } catch (...) {
+            report_failure(owner_id);
+            throw;
+        }
+    });
+}
+
 std::future<std::vector<ResultRow>> RemoteL3KVClient::resume_query_async(uint16_t cluster_id, const std::vector<uint64_t>& starting_nodes, const std::string& query_json, uint32_t principal_id) {
     if (!task_pool_) {
         std::promise<std::vector<ResultRow>> p; p.set_value({}); return p.get_future();
