@@ -36,3 +36,4 @@ test_local_db_proj/
 test_db_cluster1/
 test_db_cluster2/
 test_db_cluster3/
+.worktrees/
