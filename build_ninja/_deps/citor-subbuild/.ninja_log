@@ -1,0 +1,21 @@
+# ninja log v5
+1	26	1779921497449339594	citor-populate-prefix/src/citor-populate-stamp/citor-populate-mkdir	8f1595c8572f8450
+1	26	1779921497449339594	/home/darkfell/dev/l3kvg/build_ninja/_deps/citor-subbuild/citor-populate-prefix/src/citor-populate-stamp/citor-populate-mkdir	8f1595c8572f8450
+26	1212	1779921498635349231	citor-populate-prefix/src/citor-populate-stamp/citor-populate-download	734d5809ec002370
+26	1212	1779921498635349231	/home/darkfell/dev/l3kvg/build_ninja/_deps/citor-subbuild/citor-populate-prefix/src/citor-populate-stamp/citor-populate-download	734d5809ec002370
+1212	1498	0	citor-populate-prefix/src/citor-populate-stamp/citor-populate-update	53d008508a79a8ce
+1212	1498	0	/home/darkfell/dev/l3kvg/build_ninja/_deps/citor-subbuild/citor-populate-prefix/src/citor-populate-stamp/citor-populate-update	53d008508a79a8ce
+1498	1522	1779921498945351751	citor-populate-prefix/src/citor-populate-stamp/citor-populate-patch	c97d47765593aa56
+1498	1522	1779921498945351751	/home/darkfell/dev/l3kvg/build_ninja/_deps/citor-subbuild/citor-populate-prefix/src/citor-populate-stamp/citor-populate-patch	c97d47765593aa56
+1522	1545	1779921498968351937	citor-populate-prefix/src/citor-populate-stamp/citor-populate-configure	7dfabde52a57d3fb
+1522	1545	1779921498968351937	/home/darkfell/dev/l3kvg/build_ninja/_deps/citor-subbuild/citor-populate-prefix/src/citor-populate-stamp/citor-populate-configure	7dfabde52a57d3fb
+1545	1568	1779921498991352124	citor-populate-prefix/src/citor-populate-stamp/citor-populate-build	ceb8848504684bf4
+1545	1568	1779921498991352124	/home/darkfell/dev/l3kvg/build_ninja/_deps/citor-subbuild/citor-populate-prefix/src/citor-populate-stamp/citor-populate-build	ceb8848504684bf4
+1568	1590	1779921499013352303	citor-populate-prefix/src/citor-populate-stamp/citor-populate-install	6b71640436f24e2f
+1568	1590	1779921499013352303	/home/darkfell/dev/l3kvg/build_ninja/_deps/citor-subbuild/citor-populate-prefix/src/citor-populate-stamp/citor-populate-install	6b71640436f24e2f
+1590	1613	1779921499036352490	citor-populate-prefix/src/citor-populate-stamp/citor-populate-test	59a098b6f3d5fa0f
+1590	1613	1779921499036352490	/home/darkfell/dev/l3kvg/build_ninja/_deps/citor-subbuild/citor-populate-prefix/src/citor-populate-stamp/citor-populate-test	59a098b6f3d5fa0f
+1613	1645	1779921499069352758	CMakeFiles/citor-populate-complete	217ce238f7e566ff
+1613	1645	1779921499069352758	citor-populate-prefix/src/citor-populate-stamp/citor-populate-done	217ce238f7e566ff
+1613	1645	1779921499069352758	/home/darkfell/dev/l3kvg/build_ninja/_deps/citor-subbuild/CMakeFiles/citor-populate-complete	217ce238f7e566ff
+1613	1645	1779921499069352758	/home/darkfell/dev/l3kvg/build_ninja/_deps/citor-subbuild/citor-populate-prefix/src/citor-populate-stamp/citor-populate-done	217ce238f7e566ff

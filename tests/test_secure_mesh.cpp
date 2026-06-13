@@ -107,11 +107,26 @@ struct NodeHandle {
 
                     if (opcode == "G") {
                         try {
-                            uint64_t id = std::stoull(recv_msgs[4].to_string(), nullptr, 16);
-                            std::string key = std::string(KeyBuilder::node_key(id));
+                            std::string key = recv_msgs[4].to_string();
+                            uint64_t id = 0;
+                            if (key.starts_with("n:{") && key.size() >= 19) {
+                                id = std::stoull(key.substr(3, 16), nullptr, 16);
+                            } else if (key.size() == 16) {
+                                id = std::stoull(key, nullptr, 16);
+                            } else {
+                                // Assume it's a raw key
+                                auto buf = engine->get_store()->get(key);
+                                sock.send(identity, zmq::send_flags::sndmore);
+                                sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                                if (buf.size() > 0) sock.send(zmq::message_t(buf.data(), buf.size()), zmq::send_flags::none);
+                                else sock.send(zmq::message_t("", 0), zmq::send_flags::none);
+                                continue;
+                            }
 
+                            std::string node_key = std::string(KeyBuilder::node_key(id));
+                            
                             // Authorization Check
-                            auto perm = engine->get_store()->credentials().check_permission(current_uid, key);
+                            auto perm = engine->get_store()->credentials().check_permission(current_uid, node_key);
                             if (!(perm & l3kv::Permission::READ) && !(perm & l3kv::Permission::ADMIN)) {
                                 sock.send(identity, zmq::send_flags::sndmore);
                                 sock.send(zmq::message_t(), zmq::send_flags::sndmore);
@@ -119,7 +134,7 @@ struct NodeHandle {
                                 continue;
                             }
 
-                            auto buf = engine->get_store()->get(key);
+                            auto buf = engine->get_store()->get(node_key);
                             sock.send(identity, zmq::send_flags::sndmore);
                             sock.send(zmq::message_t(), zmq::send_flags::sndmore);
                             if (buf.size() > 0) sock.send(zmq::message_t(buf.data(), buf.size()), zmq::send_flags::none);

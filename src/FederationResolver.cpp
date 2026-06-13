@@ -122,6 +122,12 @@ uint64_t FederationResolver::parse_uuid(std::string_view uuid_str) const {
         cluster_id = local_cluster_id_;
     }
 
+    if (local_uuid.size() == 16 && std::all_of(local_uuid.begin(), local_uuid.end(), ::isxdigit)) {
+        try {
+            return std::stoull(std::string(local_uuid), nullptr, 16);
+        } catch (...) {}
+    }
+    
     uint64_t hash = XXH3_64bits(local_uuid.data(), local_uuid.size());
     return FederationID::pack(cluster_id, hash);
 }

@@ -90,7 +90,7 @@ TEST(CircuitBreakerTest, RecoveryViaHeartbeat) {
             auto res = zmq::recv_multipart(sock, std::back_inserter(recv_msgs), zmq::recv_flags::dontwait);
             if (res && recv_msgs.size() >= 4) {
                 auto identity = std::move(recv_msgs[0]);
-                auto opcode = recv_msgs[2].to_string();
+                auto opcode = recv_msgs[3].to_string();
                 if (opcode == "H") {
                     std::cout << "[MockServer] Received Heartbeat, replying OK" << std::endl;
                     sock.send(identity, zmq::send_flags::sndmore);

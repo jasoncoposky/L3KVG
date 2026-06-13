@@ -35,7 +35,7 @@ protected:
                 if (zmq::recv_multipart(sock, std::back_inserter(msgs), zmq::recv_flags::dontwait)) {
                     if (msgs.size() >= 4) {
                         auto identity = std::move(msgs[0]);
-                        auto opcode = msgs[2].to_string();
+                        auto opcode = msgs[3].to_string();
                         if (opcode == "S") {
                             counter++;
                             sock.send(identity, zmq::send_flags::sndmore);

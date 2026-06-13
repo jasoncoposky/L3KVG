@@ -47,6 +47,7 @@ target_link_libraries(l3kvg_engine PUBLIC
     lite3-cpp
     libzmq
     cppzmq
+    
     $<$<BOOL:${WIN32}>:ws2_32>
     $<$<BOOL:${WIN32}>:iphlpapi>
 )

@@ -1,0 +1,21 @@
+# ninja log v5
+1	25	1779921508454429004	cppzmq-populate-prefix/src/cppzmq-populate-stamp/cppzmq-populate-mkdir	a721ab42ec7d7487
+1	25	1779921508454429004	/home/darkfell/dev/l3kvg/build_ninja/_deps/cppzmq-subbuild/cppzmq-populate-prefix/src/cppzmq-populate-stamp/cppzmq-populate-mkdir	a721ab42ec7d7487
+25	815	1779921509244435420	cppzmq-populate-prefix/src/cppzmq-populate-stamp/cppzmq-populate-download	11da0f982e151866
+25	815	1779921509244435420	/home/darkfell/dev/l3kvg/build_ninja/_deps/cppzmq-subbuild/cppzmq-populate-prefix/src/cppzmq-populate-stamp/cppzmq-populate-download	11da0f982e151866
+815	841	0	cppzmq-populate-prefix/src/cppzmq-populate-stamp/cppzmq-populate-update	9121b28dbe23446
+815	841	0	/home/darkfell/dev/l3kvg/build_ninja/_deps/cppzmq-subbuild/cppzmq-populate-prefix/src/cppzmq-populate-stamp/cppzmq-populate-update	9121b28dbe23446
+841	865	1779921509294435826	cppzmq-populate-prefix/src/cppzmq-populate-stamp/cppzmq-populate-patch	3959a75667e3cfe0
+841	865	1779921509294435826	/home/darkfell/dev/l3kvg/build_ninja/_deps/cppzmq-subbuild/cppzmq-populate-prefix/src/cppzmq-populate-stamp/cppzmq-populate-patch	3959a75667e3cfe0
+865	888	1779921509317436013	cppzmq-populate-prefix/src/cppzmq-populate-stamp/cppzmq-populate-configure	9554ff6f626f65b1
+865	888	1779921509317436013	/home/darkfell/dev/l3kvg/build_ninja/_deps/cppzmq-subbuild/cppzmq-populate-prefix/src/cppzmq-populate-stamp/cppzmq-populate-configure	9554ff6f626f65b1
+888	911	1779921509341436208	cppzmq-populate-prefix/src/cppzmq-populate-stamp/cppzmq-populate-build	ed90523dbacdd156
+888	911	1779921509341436208	/home/darkfell/dev/l3kvg/build_ninja/_deps/cppzmq-subbuild/cppzmq-populate-prefix/src/cppzmq-populate-stamp/cppzmq-populate-build	ed90523dbacdd156
+911	933	1779921509363436387	cppzmq-populate-prefix/src/cppzmq-populate-stamp/cppzmq-populate-install	50dc2906c8acc5a7
+911	933	1779921509363436387	/home/darkfell/dev/l3kvg/build_ninja/_deps/cppzmq-subbuild/cppzmq-populate-prefix/src/cppzmq-populate-stamp/cppzmq-populate-install	50dc2906c8acc5a7
+933	955	1779921509385436566	cppzmq-populate-prefix/src/cppzmq-populate-stamp/cppzmq-populate-test	328a34c50d840ba2
+933	955	1779921509385436566	/home/darkfell/dev/l3kvg/build_ninja/_deps/cppzmq-subbuild/cppzmq-populate-prefix/src/cppzmq-populate-stamp/cppzmq-populate-test	328a34c50d840ba2
+955	987	1779921509416436817	CMakeFiles/cppzmq-populate-complete	27be8a140c20ca07
+955	987	1779921509416436817	cppzmq-populate-prefix/src/cppzmq-populate-stamp/cppzmq-populate-done	27be8a140c20ca07
+955	987	1779921509416436817	/home/darkfell/dev/l3kvg/build_ninja/_deps/cppzmq-subbuild/CMakeFiles/cppzmq-populate-complete	27be8a140c20ca07
+955	987	1779921509416436817	/home/darkfell/dev/l3kvg/build_ninja/_deps/cppzmq-subbuild/cppzmq-populate-prefix/src/cppzmq-populate-stamp/cppzmq-populate-done	27be8a140c20ca07

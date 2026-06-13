@@ -22,6 +22,7 @@ public:
   // Initial node selection
   Query &match(std::string_view node_alias);
   Query &match_id(uint64_t id, std::string_view alias = "a");
+  Query &match_id(std::string_view uuid, std::string_view alias = "a");
 
   // Filters
   enum class Op { Eq, Ne, Gt, Ge, Lt, Le, Like };

@@ -1,0 +1,21 @@
+# ninja log v5
+1	25	1779921509549437898	zstd-populate-prefix/src/zstd-populate-stamp/zstd-populate-mkdir	af4fe78697558183
+1	25	1779921509549437898	/home/darkfell/dev/l3kvg/build_ninja/_deps/zstd-subbuild/zstd-populate-prefix/src/zstd-populate-stamp/zstd-populate-mkdir	af4fe78697558183
+25	3439	1779921512964465633	zstd-populate-prefix/src/zstd-populate-stamp/zstd-populate-download	2936f3e2387dae43
+25	3439	1779921512964465633	/home/darkfell/dev/l3kvg/build_ninja/_deps/zstd-subbuild/zstd-populate-prefix/src/zstd-populate-stamp/zstd-populate-download	2936f3e2387dae43
+3439	3466	0	zstd-populate-prefix/src/zstd-populate-stamp/zstd-populate-update	561cef46d8bec9c7
+3439	3466	0	/home/darkfell/dev/l3kvg/build_ninja/_deps/zstd-subbuild/zstd-populate-prefix/src/zstd-populate-stamp/zstd-populate-update	561cef46d8bec9c7
+3466	3490	1779921513015466047	zstd-populate-prefix/src/zstd-populate-stamp/zstd-populate-patch	555964ea3754e558
+3466	3490	1779921513015466047	/home/darkfell/dev/l3kvg/build_ninja/_deps/zstd-subbuild/zstd-populate-prefix/src/zstd-populate-stamp/zstd-populate-patch	555964ea3754e558
+3490	3514	1779921513039466242	zstd-populate-prefix/src/zstd-populate-stamp/zstd-populate-configure	d4c8ab2cab1857fd
+3490	3514	1779921513039466242	/home/darkfell/dev/l3kvg/build_ninja/_deps/zstd-subbuild/zstd-populate-prefix/src/zstd-populate-stamp/zstd-populate-configure	d4c8ab2cab1857fd
+3514	3537	1779921513061466421	zstd-populate-prefix/src/zstd-populate-stamp/zstd-populate-build	ec3121aa4cb2497a
+3514	3537	1779921513061466421	/home/darkfell/dev/l3kvg/build_ninja/_deps/zstd-subbuild/zstd-populate-prefix/src/zstd-populate-stamp/zstd-populate-build	ec3121aa4cb2497a
+3537	3561	1779921513085466616	zstd-populate-prefix/src/zstd-populate-stamp/zstd-populate-install	94678df995efebaa
+3537	3561	1779921513085466616	/home/darkfell/dev/l3kvg/build_ninja/_deps/zstd-subbuild/zstd-populate-prefix/src/zstd-populate-stamp/zstd-populate-install	94678df995efebaa
+3561	3584	1779921513108466803	zstd-populate-prefix/src/zstd-populate-stamp/zstd-populate-test	247adc8c39069900
+3561	3584	1779921513108466803	/home/darkfell/dev/l3kvg/build_ninja/_deps/zstd-subbuild/zstd-populate-prefix/src/zstd-populate-stamp/zstd-populate-test	247adc8c39069900
+3584	3617	1779921513141467071	CMakeFiles/zstd-populate-complete	67cbcdfe8116b1d
+3584	3617	1779921513141467071	zstd-populate-prefix/src/zstd-populate-stamp/zstd-populate-done	67cbcdfe8116b1d
+3584	3617	1779921513141467071	/home/darkfell/dev/l3kvg/build_ninja/_deps/zstd-subbuild/CMakeFiles/zstd-populate-complete	67cbcdfe8116b1d
+3584	3617	1779921513141467071	/home/darkfell/dev/l3kvg/build_ninja/_deps/zstd-subbuild/zstd-populate-prefix/src/zstd-populate-stamp/zstd-populate-done	67cbcdfe8116b1d

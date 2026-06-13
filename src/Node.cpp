@@ -247,22 +247,26 @@ void Node::hydrate(const std::string &data) {
   std::lock_guard<std::mutex> lock(loading_mutex_);
   if (loaded_.load(std::memory_order_relaxed)) return;
   
-  if (data.empty()) {
-    payload_ = lite3cpp::Buffer(engine_->get_settings().node_initial_buffer_size);
-    payload_->init_object();
-  } else {
-    try {
-        if (data.starts_with("{")) {
-            payload_ = lite3cpp::lite3_json::from_json_string(data);
-        } else {
-            // It's binary BSON, reconstruct Buffer directly
+  try {
+      if (data.empty()) {
+        payload_ = lite3cpp::Buffer(engine_->get_settings().node_initial_buffer_size);
+        payload_->init_object();
+      } else {
+        try {
+            if (data.starts_with("{")) {
+                payload_ = lite3cpp::lite3_json::from_json_string(data);
+            } else {
+                // It's binary BSON, reconstruct Buffer directly
+                std::vector<uint8_t> vec(data.begin(), data.end());
+                payload_ = lite3cpp::Buffer(std::move(vec));
+            }
+        } catch (const std::exception& e) {
             payload_ = lite3cpp::Buffer(std::vector<uint8_t>(data.begin(), data.end()));
         }
-    } catch (...) {
-        payload_ = lite3cpp::Buffer(std::vector<uint8_t>(data.begin(), data.end()));
-    }
+      }
+      loaded_.store(true, std::memory_order_release);
+  } catch (...) {
   }
-  loaded_.store(true, std::memory_order_release);
 }
 
 bool Node::has_attribute(const std::string &key) {
@@ -277,7 +281,16 @@ lite3cpp::Type Node::get_attribute_type(std::string_view key) {
   ensure_loaded();
   if (!payload_ || payload_->size() == 0)
     return lite3cpp::Type::Invalid;
-  return payload_->get_type(0, key);
+  
+  auto type = payload_->get_type(0, key);
+  if ((type == lite3cpp::Type::Null || type == lite3cpp::Type::Invalid) && payload_->get_type(0, "_binary") == lite3cpp::Type::Bytes) {
+      auto bin = payload_->get_bytes(0, "_binary");
+      std::vector<uint8_t> vec; vec.reserve(bin.size());
+      for (auto b : bin) vec.push_back(static_cast<uint8_t>(b));
+      lite3cpp::Buffer nested(std::move(vec));
+      return nested.get_type(0, key);
+  }
+  return type;
 }
 
 std::string Node::get_attribute_as_string(std::string_view key) {
@@ -285,19 +298,33 @@ std::string Node::get_attribute_as_string(std::string_view key) {
   if (!payload_ || payload_->size() == 0)
     return "";
 
-  auto type = payload_->get_type(0, key);
-  switch (type) {
-    case lite3cpp::Type::String:
-      return std::string(payload_->get_str(0, key));
-    case lite3cpp::Type::Int64:
-      return std::to_string(payload_->get_i64(0, key));
-    case lite3cpp::Type::Float64:
-      return std::to_string(payload_->get_f64(0, key));
-    case lite3cpp::Type::Bool:
-      return payload_->get_bool(0, key) ? "true" : "false";
-    default:
-      return "";
+  auto get_val = [&](const lite3cpp::Buffer& b, std::string_view k) -> std::string {
+      auto type = b.get_type(0, k);
+      std::string res;
+      switch (type) {
+        case lite3cpp::Type::String:
+          res = std::string(b.get_str(0, k)); break;
+        case lite3cpp::Type::Int64:
+          res = std::to_string(b.get_i64(0, k)); break;
+        case lite3cpp::Type::Float64:
+          res = std::to_string(b.get_f64(0, k)); break;
+        case lite3cpp::Type::Bool:
+          res = b.get_bool(0, k) ? "true" : "false"; break;
+        default:
+          res = ""; break;
+      }
+      return res;
+  };
+
+  std::string val = get_val(*payload_, key);
+  if (val.empty() && payload_->get_type(0, "_binary") == lite3cpp::Type::Bytes) {
+      auto bin = payload_->get_bytes(0, "_binary");
+      std::vector<uint8_t> vec; vec.reserve(bin.size());
+      for (auto b : bin) vec.push_back(static_cast<uint8_t>(b));
+      lite3cpp::Buffer nested(std::move(vec));
+      val = get_val(nested, key);
   }
+  return val;
 }
 
 } // namespace l3kvg

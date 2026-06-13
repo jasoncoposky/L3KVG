@@ -31,7 +31,18 @@ Engine::Engine(const std::string &db_path, uint32_t node_id, std::shared_ptr<lit
   }
 }
 
-Engine::~Engine() = default;
+Engine::~Engine() {
+  // 1. Stop the EdgeCoordinator (which may use the pool)
+  edge_coordinator_.reset();
+  
+  // 2. Stop the ThreadPool and wait for all background tasks to finish.
+  // This must happen while the RemoteL3KVClient (and its ZMQ context) is still alive.
+  pool_.reset();
+
+  // 3. Finally, clean up the remote client and local store.
+  remote_client_.reset();
+  store_.reset();
+}
 
 size_t Engine::get_cache_shard(uint64_t id) {
     return std::hash<uint64_t>{}(id) % settings_.node_cache_shards;
@@ -105,6 +116,7 @@ std::shared_ptr<Node> Engine::get_swizzled(uint64_t id) {
 }
 
 std::vector<std::shared_ptr<Node>> Engine::fetch_nodes(const std::vector<uint64_t>& ids, uint32_t principal_id) {
+  std::fprintf(stderr, "  [Engine] fetch_nodes: requested %zu nodes\n", ids.size()); std::fflush(stderr);
   std::unordered_map<lite3::NodeID, std::vector<uint64_t>> remote_requests;
   std::vector<std::shared_ptr<Node>> result;
   result.reserve(ids.size());
@@ -115,22 +127,21 @@ std::vector<std::shared_ptr<Node>> Engine::fetch_nodes(const std::vector<uint64_
       // Locality of Reference: Try local store even if we are not the primary owner.
       std::string key = std::string(KeyBuilder::node_key(id));
       auto buf = store_->get(key);
+      std::fprintf(stderr, "  [Engine] Checking local store for node %016llx. Size=%zu, Header=[%02x %02x %02x %02x]\n", 
+              (unsigned long long)id, buf.size(), 
+              buf.size() > 0 ? (uint8_t)buf.data()[0] : 0,
+              buf.size() > 1 ? (uint8_t)buf.data()[1] : 0,
+              buf.size() > 2 ? (uint8_t)buf.data()[2] : 0,
+              buf.size() > 3 ? (uint8_t)buf.data()[3] : 0); 
+      std::fflush(stderr);
       if (buf.size() > 0) {
-          std::string json_str;
-          const uint8_t* ptr = reinterpret_cast<const uint8_t*>(buf.data());
-          // Lite3 Objects (0x06) or Arrays (0x07)
-          if (buf.size() > 8 && (ptr[0] == 0x06 || ptr[0] == 0x07 || ptr[0] == 0x00)) {
-              try {
-                  json_str = lite3cpp::lite3_json::to_json_string(buf, 0);
-              } catch (...) {
-                  json_str = std::string(reinterpret_cast<const char*>(ptr), buf.size());
-              }
-          } else {
-              json_str = std::string(reinterpret_cast<const char*>(ptr), buf.size());
-          }
-          node->hydrate(std::move(json_str));
-      } else {
+      node->hydrate(std::string(reinterpret_cast<const char*>(buf.data()), buf.size()));
+      std::fprintf(stderr, "  [Engine] Node %016llx HYDRATED. type=[%s]\n", (unsigned long long)id, node->get_attribute_as_string("t").c_str()); std::fflush(stderr);
+      }
+
+ else {
           lite3::NodeID owner = resolver_.get_node_owner(id);
+          std::fprintf(stderr, "  [Engine] Node %016llx not local. Owner=%u, LocalNodeID=%u\n", (unsigned long long)id, owner, resolver_.get_local_node_id()); std::fflush(stderr);
           if (owner != resolver_.get_local_node_id()) {
             remote_requests[owner].push_back(id);
           }
@@ -184,23 +195,30 @@ void Engine::put_node(uint64_t id, std::string payload) {
         remote_client_->put_node_async(owner, id, payload);
         return;
     } catch (const std::exception& e) {
-        std::cerr << "[Engine::put_node] Remote RPC Failed: " << e.what() << "\n";
+        std::fprintf(stderr, "[Engine::put_node] Remote RPC Failed: %s\n", e.what()); std::fflush(stderr);
     }
   }
 
-  auto ts = hlc_.now();
-  json j_meta;
-  try {
-      j_meta = json::parse(payload);
-  } catch (...) {
-      j_meta["raw"] = payload;
-  }
-  j_meta["_hlc"] = json::parse(ts.to_json_string());
-  std::string final_json = j_meta.dump();
+  const uint8_t* ptr = reinterpret_cast<const uint8_t*>(payload.data());
+  std::string binary_payload;
 
-  // Convert to Lite3 binary for consistent storage
-  lite3cpp::Buffer buf = lite3cpp::lite3_json::from_json_string(final_json);
-  std::string binary_payload(reinterpret_cast<const char*>(buf.data()), buf.size());
+  if (payload.size() > 4 && (ptr[0] == 0x06 || ptr[0] == 0x07)) {
+      binary_payload = std::move(payload);
+  } else {
+      auto ts = hlc_.now();
+      json j_meta;
+      try {
+          j_meta = json::parse(payload);
+      } catch (...) {
+          j_meta["_raw"] = payload;
+      }
+      j_meta["_hlc"] = json::parse(ts.to_json_string());
+      std::string final_json = j_meta.dump();
+
+      // Convert to Lite3 binary for consistent storage
+      lite3cpp::Buffer buf = lite3cpp::lite3_json::from_json_string(final_json);
+      binary_payload = std::string(reinterpret_cast<const char*>(buf.data()), buf.size());
+  }
 
   std::string key = std::string(KeyBuilder::node_key(id));
   broadcast_replication(key, binary_payload, resolver_.get_local_cluster_id());
@@ -370,6 +388,20 @@ void Engine::add_edge(uint64_t src_id, std::string label,
                       double weight, uint64_t dst_id,
                       std::string payload) {
   edge_coordinator_->atomic_put_edge(src_id, std::move(label), weight, dst_id, std::move(payload)).get();
+  
+  // Cache Invalidation
+  {
+      size_t h_src = get_cache_shard(src_id);
+      std::lock_guard<std::mutex> lock(cache_shards_[h_src]->mutex);
+      cache_shards_[h_src]->map.erase(src_id);
+  }
+  {
+      size_t h_dst = get_cache_shard(dst_id);
+      std::lock_guard<std::mutex> lock(cache_shards_[h_dst]->mutex);
+      cache_shards_[h_dst]->map.erase(dst_id);
+  }
+
+  store_->wait_all_shards();
 }
 
 void Engine::add_edge(std::string_view src_uuid, std::string label,
@@ -381,6 +413,20 @@ void Engine::add_edge(std::string_view src_uuid, std::string label,
 void Engine::del_edge(uint64_t src_id, std::string label,
                       double weight, uint64_t dst_id) {
   edge_coordinator_->atomic_del_edge(src_id, std::move(label), weight, dst_id).get();
+
+  // Cache Invalidation
+  {
+      size_t h_src = get_cache_shard(src_id);
+      std::lock_guard<std::mutex> lock(cache_shards_[h_src]->mutex);
+      cache_shards_[h_src]->map.erase(src_id);
+  }
+  {
+      size_t h_dst = get_cache_shard(dst_id);
+      std::lock_guard<std::mutex> lock(cache_shards_[h_dst]->mutex);
+      cache_shards_[h_dst]->map.erase(dst_id);
+  }
+
+  store_->wait_all_shards();
 }
 
 } // namespace l3kvg

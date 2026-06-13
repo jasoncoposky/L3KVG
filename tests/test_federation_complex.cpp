@@ -70,16 +70,16 @@ void run_mock_cluster_flexible(uint16_t port, uint16_t cluster_id, const std::st
                 continue;
             }
 
-            if (recv_msgs.size() < 3) continue;
+            if (recv_msgs.size() < 4) continue;
 
             auto& identity = recv_msgs[0];
-            auto opcode = recv_msgs[2].to_string();
+            auto opcode = recv_msgs[3].to_string();
 
             if (opcode == "R") {
-                if (recv_msgs.size() < 5) continue;
+                if (recv_msgs.size() < 6) continue;
                 stats.r_requests++;
-                std::vector<uint64_t> nodes = json::parse(recv_msgs[3].to_string());
-                std::string query_json = recv_msgs[4].to_string();
+                std::vector<uint64_t> nodes = json::parse(recv_msgs[4].to_string());
+                std::string query_json = recv_msgs[5].to_string();
 
                 auto results = engine->query().resume(nodes, query_json).execute();
 
@@ -94,21 +94,29 @@ void run_mock_cluster_flexible(uint16_t port, uint16_t cluster_id, const std::st
                 sock.send(identity, zmq::send_flags::sndmore);
                 sock.send(zmq::message_t(), zmq::send_flags::sndmore);
                 sock.send(zmq::message_t(resp_json.data(), resp_json.size()), zmq::send_flags::none);
+            } else if (opcode == "S") {
+                if (recv_msgs.size() < 7) continue;
+                std::string key = recv_msgs[4].to_string();
+                std::string payload = recv_msgs[5].to_string();
+                engine->get_store()->put(key, payload);
+                sock.send(identity, zmq::send_flags::sndmore);
+                sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                sock.send(zmq::message_t("OK", 2), zmq::send_flags::none);
             } else if (opcode == "P") {
-                if (recv_msgs.size() < 5) continue;
-                std::string key = recv_msgs[3].to_string();
-                std::string payload = recv_msgs[4].to_string();
+                if (recv_msgs.size() < 6) continue;
+                std::string key = recv_msgs[4].to_string();
+                std::string payload = recv_msgs[5].to_string();
                 engine->get_store()->put(key, payload);
                 sock.send(identity, zmq::send_flags::sndmore);
                 sock.send(zmq::message_t(), zmq::send_flags::sndmore);
                 sock.send(zmq::message_t("OK", 2), zmq::send_flags::none);
             } else if (opcode == "E") {
-                if (recv_msgs.size() < 7) continue;
+                if (recv_msgs.size() < 8) continue;
                 try {
-                    uint64_t src = std::stoull(recv_msgs[3].to_string(), nullptr, 16);
-                    std::string label = recv_msgs[4].to_string();
-                    double weight = std::stod(recv_msgs[5].to_string());
-                    uint64_t dst = std::stoull(recv_msgs[6].to_string(), nullptr, 16);
+                    uint64_t src = std::stoull(recv_msgs[4].to_string(), nullptr, 16);
+                    std::string label = recv_msgs[5].to_string();
+                    double weight = std::stod(recv_msgs[6].to_string());
+                    uint64_t dst = std::stoull(recv_msgs[7].to_string(), nullptr, 16);
                     engine->add_edge(src, label, weight, dst);
                 } catch (...) {}
                 sock.send(identity, zmq::send_flags::sndmore);
@@ -270,6 +278,8 @@ TEST(FederationComplexTest, RecursiveMultiHop) {
         zmq::socket_t client(ctx, ZMQ_DEALER);
         client.connect("tcp://127.0.0.1:" + std::to_string(port));
         client.send(zmq::message_t(), zmq::send_flags::sndmore);
+        uint32_t dummy_uid = 0;
+        client.send(zmq::message_t(&dummy_uid, 4), zmq::send_flags::sndmore);
         client.send(zmq::message_t(opcode.data(), opcode.size()), zmq::send_flags::sndmore);
         for (size_t i = 0; i < args.size(); ++i) {
             client.send(zmq::message_t(args[i].data(), args[i].size()), (i == args.size() - 1) ? zmq::send_flags::none : zmq::send_flags::sndmore);

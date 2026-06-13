@@ -1,0 +1,21 @@
+# ninja log v5
+1	25	1779921495277321943	gtest-populate-prefix/src/gtest-populate-stamp/gtest-populate-mkdir	28368ad532c22a75
+1	25	1779921495277321943	/home/darkfell/dev/l3kvg/build_ninja/_deps/gtest-subbuild/gtest-populate-prefix/src/gtest-populate-stamp/gtest-populate-mkdir	28368ad532c22a75
+26	1885	1779921497136337050	gtest-populate-prefix/src/gtest-populate-stamp/gtest-populate-download	38a4b646cc760e2f
+26	1885	1779921497136337050	/home/darkfell/dev/l3kvg/build_ninja/_deps/gtest-subbuild/gtest-populate-prefix/src/gtest-populate-stamp/gtest-populate-download	38a4b646cc760e2f
+1885	1911	0	gtest-populate-prefix/src/gtest-populate-stamp/gtest-populate-update	46cc00b64c1233c4
+1885	1911	0	/home/darkfell/dev/l3kvg/build_ninja/_deps/gtest-subbuild/gtest-populate-prefix/src/gtest-populate-stamp/gtest-populate-update	46cc00b64c1233c4
+1911	1935	1779921497186337457	gtest-populate-prefix/src/gtest-populate-stamp/gtest-populate-patch	4a088657bc443189
+1911	1935	1779921497186337457	/home/darkfell/dev/l3kvg/build_ninja/_deps/gtest-subbuild/gtest-populate-prefix/src/gtest-populate-stamp/gtest-populate-patch	4a088657bc443189
+1935	1957	1779921497209337644	gtest-populate-prefix/src/gtest-populate-stamp/gtest-populate-configure	3050ffa87e35cc03
+1935	1957	1779921497209337644	/home/darkfell/dev/l3kvg/build_ninja/_deps/gtest-subbuild/gtest-populate-prefix/src/gtest-populate-stamp/gtest-populate-configure	3050ffa87e35cc03
+1957	1980	1779921497232337831	gtest-populate-prefix/src/gtest-populate-stamp/gtest-populate-build	ad63fda9b5f14b93
+1957	1980	1779921497232337831	/home/darkfell/dev/l3kvg/build_ninja/_deps/gtest-subbuild/gtest-populate-prefix/src/gtest-populate-stamp/gtest-populate-build	ad63fda9b5f14b93
+1981	2003	1779921497254338009	gtest-populate-prefix/src/gtest-populate-stamp/gtest-populate-install	1647ad26376f4aa
+1981	2003	1779921497254338009	/home/darkfell/dev/l3kvg/build_ninja/_deps/gtest-subbuild/gtest-populate-prefix/src/gtest-populate-stamp/gtest-populate-install	1647ad26376f4aa
+2003	2026	1779921497277338196	gtest-populate-prefix/src/gtest-populate-stamp/gtest-populate-test	a387a229576db826
+2003	2026	1779921497277338196	/home/darkfell/dev/l3kvg/build_ninja/_deps/gtest-subbuild/gtest-populate-prefix/src/gtest-populate-stamp/gtest-populate-test	a387a229576db826
+2026	2060	1779921497311338472	CMakeFiles/gtest-populate-complete	2d0cc36392dde0c9
+2026	2060	1779921497311338472	gtest-populate-prefix/src/gtest-populate-stamp/gtest-populate-done	2d0cc36392dde0c9
+2026	2060	1779921497311338472	/home/darkfell/dev/l3kvg/build_ninja/_deps/gtest-subbuild/CMakeFiles/gtest-populate-complete	2d0cc36392dde0c9
+2026	2060	1779921497311338472	/home/darkfell/dev/l3kvg/build_ninja/_deps/gtest-subbuild/gtest-populate-prefix/src/gtest-populate-stamp/gtest-populate-done	2d0cc36392dde0c9

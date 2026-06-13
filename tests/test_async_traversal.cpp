@@ -26,10 +26,10 @@ void run_zmq_mock_node_server(uint16_t port, std::atomic<bool>& stop_signal) {
             continue;
         }
 
-        if (recv_msgs.size() < 3) continue;
+        if (recv_msgs.size() < 4) continue;
 
         auto& identity = recv_msgs[0];
-        auto opcode = recv_msgs[2].to_string();
+        auto opcode = recv_msgs[3].to_string();
 
         if (opcode == "G") {
             // Respond with Remote Bob

@@ -46,13 +46,13 @@ protected:
             while (node2_running) {
                 std::vector<zmq::message_t> msgs;
                 if (zmq::recv_multipart(sock, std::back_inserter(msgs), zmq::recv_flags::dontwait)) {
-                    if (msgs.size() >= 4) {
+                    if (msgs.size() >= 6) {
                         messages_received++;
                         auto identity = std::move(msgs[0]);
-                        auto opcode = msgs[2].to_string();
+                        auto opcode = msgs[3].to_string();
                         if (opcode == "P") { 
-                            std::string key = msgs[3].to_string();
-                            std::string val = msgs[4].to_string();
+                            std::string key = msgs[4].to_string();
+                            std::string val = msgs[5].to_string();
                             engine2->get_store()->put(key, val);
                             sock.send(identity, zmq::send_flags::sndmore);
                             sock.send(zmq::message_t(), zmq::send_flags::sndmore);

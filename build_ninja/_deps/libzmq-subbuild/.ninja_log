@@ -1,0 +1,21 @@
+# ninja log v5
+1	24	1779921501110369342	libzmq-populate-prefix/src/libzmq-populate-stamp/libzmq-populate-mkdir	4fb20d088f740de
+1	24	1779921501110369342	/home/darkfell/dev/l3kvg/build_ninja/_deps/libzmq-subbuild/libzmq-populate-prefix/src/libzmq-populate-stamp/libzmq-populate-mkdir	4fb20d088f740de
+24	2410	1779921503494388711	libzmq-populate-prefix/src/libzmq-populate-stamp/libzmq-populate-download	dc72e090d598fffe
+24	2410	1779921503494388711	/home/darkfell/dev/l3kvg/build_ninja/_deps/libzmq-subbuild/libzmq-populate-prefix/src/libzmq-populate-stamp/libzmq-populate-download	dc72e090d598fffe
+2410	2461	0	libzmq-populate-prefix/src/libzmq-populate-stamp/libzmq-populate-update	839b637dcffb9338
+2410	2461	0	/home/darkfell/dev/l3kvg/build_ninja/_deps/libzmq-subbuild/libzmq-populate-prefix/src/libzmq-populate-stamp/libzmq-populate-update	839b637dcffb9338
+2461	2507	1779921503591389499	libzmq-populate-prefix/src/libzmq-populate-stamp/libzmq-populate-patch	fc59e44606266a9a
+2461	2507	1779921503591389499	/home/darkfell/dev/l3kvg/build_ninja/_deps/libzmq-subbuild/libzmq-populate-prefix/src/libzmq-populate-stamp/libzmq-populate-patch	fc59e44606266a9a
+2508	2557	1779921503640389897	libzmq-populate-prefix/src/libzmq-populate-stamp/libzmq-populate-configure	72b675383022b71d
+2508	2557	1779921503640389897	/home/darkfell/dev/l3kvg/build_ninja/_deps/libzmq-subbuild/libzmq-populate-prefix/src/libzmq-populate-stamp/libzmq-populate-configure	72b675383022b71d
+2557	2627	1779921503710390466	libzmq-populate-prefix/src/libzmq-populate-stamp/libzmq-populate-build	18228a36ccb8e20c
+2557	2627	1779921503710390466	/home/darkfell/dev/l3kvg/build_ninja/_deps/libzmq-subbuild/libzmq-populate-prefix/src/libzmq-populate-stamp/libzmq-populate-build	18228a36ccb8e20c
+2627	2681	1779921503765390913	libzmq-populate-prefix/src/libzmq-populate-stamp/libzmq-populate-install	38907ffd490663d1
+2627	2681	1779921503765390913	/home/darkfell/dev/l3kvg/build_ninja/_deps/libzmq-subbuild/libzmq-populate-prefix/src/libzmq-populate-stamp/libzmq-populate-install	38907ffd490663d1
+2681	2731	1779921503816391327	libzmq-populate-prefix/src/libzmq-populate-stamp/libzmq-populate-test	14c16313b2f11968
+2681	2731	1779921503816391327	/home/darkfell/dev/l3kvg/build_ninja/_deps/libzmq-subbuild/libzmq-populate-prefix/src/libzmq-populate-stamp/libzmq-populate-test	14c16313b2f11968
+2731	2766	1779921503851391612	CMakeFiles/libzmq-populate-complete	76440075c6a9a50c
+2731	2766	1779921503851391612	libzmq-populate-prefix/src/libzmq-populate-stamp/libzmq-populate-done	76440075c6a9a50c
+2731	2766	1779921503851391612	/home/darkfell/dev/l3kvg/build_ninja/_deps/libzmq-subbuild/CMakeFiles/libzmq-populate-complete	76440075c6a9a50c
+2731	2766	1779921503851391612	/home/darkfell/dev/l3kvg/build_ninja/_deps/libzmq-subbuild/libzmq-populate-prefix/src/libzmq-populate-stamp/libzmq-populate-done	76440075c6a9a50c
