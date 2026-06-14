@@ -61,10 +61,10 @@ Config load_config(const std::string &path) {
 }
 
 int main(int argc, char *argv[]) {
-  std::fprintf(stderr, "DEBUG_SERVER_v3: STARTING\n"); std::fflush(stderr);
+  if(0) std::fprintf(stderr, "DEBUG_SERVER_v3: STARTING\n"); //std::fflush(stderr);
 
   if (argc < 2) {
-      std::fprintf(stderr, "Usage: %s <config.json>\n", argv[0]);
+      if(0) std::fprintf(stderr, "Usage: %s <config.json>\n", argv[0]);
       return 1;
   }
 
@@ -72,7 +72,7 @@ int main(int argc, char *argv[]) {
   try {
       cfg = load_config(argv[1]);
   } catch (const std::exception &e) {
-      std::fprintf(stderr, "DEBUG_SERVER_v3: Failed to load config: %s\n", e.what()); std::fflush(stderr);
+      if(0) std::fprintf(stderr, "DEBUG_SERVER_v3: Failed to load config: %s\n", e.what()); //std::fflush(stderr);
       return 1;
   }
 
@@ -80,11 +80,11 @@ int main(int argc, char *argv[]) {
   settings.node_id = cfg.node_id;
 
   auto engine = std::make_unique<l3kvg::Engine>(cfg.db_path, cfg.node_id, nullptr, 4, settings);
-  std::fprintf(stderr, "DEBUG_SERVER_v3: Engine Ready\n"); std::fflush(stderr);
+  if(0) std::fprintf(stderr, "DEBUG_SERVER_v3: Engine Ready\n"); //std::fflush(stderr);
 
   if (cfg.local_cluster_name.size() > 0) {
       engine->get_resolver().register_local_cluster(cfg.local_cluster_name, cfg.local_cluster_id);
-      std::fprintf(stderr, "DEBUG_SERVER_v3: Registered Local Cluster: %s (%u)\n", cfg.local_cluster_name.c_str(), cfg.local_cluster_id); std::fflush(stderr);
+      if(0) std::fprintf(stderr, "DEBUG_SERVER_v3: Registered Local Cluster: %s (%u)\n", cfg.local_cluster_name.c_str(), cfg.local_cluster_id); //std::fflush(stderr);
   }
 
   for (const auto &f : cfg.federations) {
@@ -101,7 +101,7 @@ int main(int argc, char *argv[]) {
           zmq::socket_t sock(ctx, ZMQ_ROUTER);
           std::string zmq_endpoint = "tcp://0.0.0.0:" + std::to_string(cfg.zmq_port);
           sock.bind(zmq_endpoint);
-          std::fprintf(stderr, "DEBUG_SERVER_v3: ZMQ Ready on %s\n", zmq_endpoint.c_str()); std::fflush(stderr);
+          if(0) std::fprintf(stderr, "DEBUG_SERVER_v3: ZMQ Ready on %s\n", zmq_endpoint.c_str()); //std::fflush(stderr);
 
           while (true) {
               zmq::pollitem_t items[] = { { (void*)sock, 0, ZMQ_POLLIN, 0 } };
@@ -149,12 +149,12 @@ int main(int argc, char *argv[]) {
                       sock.send(zmq::message_t(), zmq::send_flags::sndmore);
                       sock.send(zmq::message_t(resp_json.data(), resp_json.size()), zmq::send_flags::none);
                   } catch (const std::exception& e) {
-                      std::fprintf(stderr, "L3_SERVER: Error R (std::exception): %s\n", e.what()); std::fflush(stderr);
+                      if(0) std::fprintf(stderr, "L3_SERVER: Error R (std::exception): %s\n", e.what()); //std::fflush(stderr);
                       sock.send(identity, zmq::send_flags::sndmore);
                       sock.send(zmq::message_t(), zmq::send_flags::sndmore);
                       sock.send(zmq::message_t("[]", 2), zmq::send_flags::none);
                   } catch (...) {
-                      std::fprintf(stderr, "L3_SERVER: Error R (unknown exception)\n"); std::fflush(stderr);
+                      if(0) std::fprintf(stderr, "L3_SERVER: Error R (unknown exception)\n"); //std::fflush(stderr);
                       sock.send(identity, zmq::send_flags::sndmore);
                       sock.send(zmq::message_t(), zmq::send_flags::sndmore);
                       sock.send(zmq::message_t("[]", 2), zmq::send_flags::none);
@@ -189,7 +189,7 @@ int main(int argc, char *argv[]) {
                       sock.send(zmq::message_t(), zmq::send_flags::sndmore);
                       sock.send(zmq::message_t("OK", 2), zmq::send_flags::none);
                   } catch (const std::exception& e) {
-                      std::fprintf(stderr, "L3_SERVER: Error P: %s\n", e.what()); std::fflush(stderr);
+                      if(0) std::fprintf(stderr, "L3_SERVER: Error P: %s\n", e.what()); //std::fflush(stderr);
                       sock.send(identity, zmq::send_flags::sndmore);
                       sock.send(zmq::message_t(), zmq::send_flags::sndmore);
                       sock.send(zmq::message_t("ERR", 3), zmq::send_flags::none);
@@ -209,7 +209,7 @@ int main(int argc, char *argv[]) {
                       sock.send(zmq::message_t(), zmq::send_flags::sndmore);
                       sock.send(zmq::message_t(resp_bin.data(), resp_bin.size()), zmq::send_flags::none);
                   } catch (const std::exception& e) {
-                      std::fprintf(stderr, "L3_SERVER: Error M: %s\n", e.what()); std::fflush(stderr);
+                      if(0) std::fprintf(stderr, "L3_SERVER: Error M: %s\n", e.what()); //std::fflush(stderr);
                       sock.send(identity, zmq::send_flags::sndmore);
                       sock.send(zmq::message_t(), zmq::send_flags::sndmore);
                       sock.send(zmq::message_t("", 0), zmq::send_flags::none);
@@ -222,7 +222,7 @@ int main(int argc, char *argv[]) {
                       sock.send(zmq::message_t(), zmq::send_flags::sndmore);
                       sock.send(zmq::message_t(buf.data(), buf.size()), zmq::send_flags::none);
                   } catch (const std::exception& e) {
-                      std::fprintf(stderr, "L3_SERVER: Error G: %s\n", e.what()); std::fflush(stderr);
+                      if(0) std::fprintf(stderr, "L3_SERVER: Error G: %s\n", e.what()); //std::fflush(stderr);
                       sock.send(identity, zmq::send_flags::sndmore);
                       sock.send(zmq::message_t(), zmq::send_flags::sndmore);
                       sock.send(zmq::message_t("", 0), zmq::send_flags::none);
@@ -235,7 +235,7 @@ int main(int argc, char *argv[]) {
                       sock.send(zmq::message_t(), zmq::send_flags::sndmore);
                       sock.send(zmq::message_t("OK", 2), zmq::send_flags::none);
                   } catch (const std::exception& e) {
-                      std::fprintf(stderr, "L3_SERVER: Error D: %s\n", e.what()); std::fflush(stderr);
+                      if(0) std::fprintf(stderr, "L3_SERVER: Error D: %s\n", e.what()); //std::fflush(stderr);
                       sock.send(identity, zmq::send_flags::sndmore);
                       sock.send(zmq::message_t(), zmq::send_flags::sndmore);
                       sock.send(zmq::message_t("ERR", 3), zmq::send_flags::none);
@@ -243,7 +243,7 @@ int main(int argc, char *argv[]) {
               }
           }
       } catch (const std::exception& e) {
-          std::fprintf(stderr, "ZMQ Thread Fatal Error: %s\n", e.what()); std::fflush(stderr);
+          if(0) std::fprintf(stderr, "ZMQ Thread Fatal Error: %s\n", e.what()); //std::fflush(stderr);
       }
   });
 
@@ -251,7 +251,7 @@ int main(int argc, char *argv[]) {
   svr.Get("/api/health", [](const httplib::Request&, httplib::Response& res) {
       res.set_content("OK", "text/plain");
   });
-  std::fprintf(stderr, "DEBUG_SERVER_v3: HTTP Ready\n"); std::fflush(stderr);
+  if(0) std::fprintf(stderr, "DEBUG_SERVER_v3: HTTP Ready\n"); //std::fflush(stderr);
   svr.listen("0.0.0.0", cfg.http_port);
 
   if (zmq_thread.joinable()) zmq_thread.join();

@@ -59,8 +59,8 @@ std::future<void> EdgeCoordinator::atomic_put_edge(uint64_t src_id, const std::s
             // Engine::put takes a string, we'll cast the data
             std::string binary_str(reinterpret_cast<const char*>(final_payload_data.data()), final_payload_data.size());
             
-            std::fprintf(stderr, "[EdgeCoordinator] Local Write: key=%s shard=%zu\n", key.c_str(), shard_idx);
-            std::fflush(stderr);
+            if(0) std::fprintf(stderr, "[EdgeCoordinator] Local Write: key=%s shard=%zu\n", key.c_str(), shard_idx);
+            //std::fflush(stderr);
 
             if (replication_cb_) {
                 replication_cb_(key, binary_str);
@@ -70,8 +70,8 @@ std::future<void> EdgeCoordinator::atomic_put_edge(uint64_t src_id, const std::s
                 store_->apply_put(key, binary_str);
             }));
         } else {
-            std::fprintf(stderr, "[EdgeCoordinator] Remote Write: key=%s owner=%u (local=%u)\n", key.c_str(), (uint32_t)owner, (uint32_t)local_id);
-            std::fflush(stderr);
+            if(0) std::fprintf(stderr, "[EdgeCoordinator] Remote Write: key=%s owner=%u (local=%u)\n", key.c_str(), (uint32_t)owner, (uint32_t)local_id);
+            //std::fflush(stderr);
             auto prom = std::make_shared<std::promise<void>>();
             futures.push_back(prom->get_future());
             

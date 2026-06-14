@@ -488,7 +488,7 @@ std::future<bool> RemoteL3KVClient::put_edge_async(lite3::NodeID owner_id, const
     return task_pool_->enqueue([this, owner_id, session, edge_key, json_payload, principal_id]() -> bool {
         std::lock_guard<std::recursive_mutex> lock(session->mu);
         try {
-            std::fprintf(stderr, "[RemoteClient] Sending P to owner %u: key=[%s]\n", owner_id, edge_key.c_str()); std::fflush(stderr);
+            if(0) std::fprintf(stderr, "[RemoteClient] Sending P to owner %u: key=[%s]\n", owner_id, edge_key.c_str()); //std::fflush(stderr);
             session->socket->send(zmq::message_t(), zmq::send_flags::sndmore);
             session->socket->send(zmq::message_t(&principal_id, 4), zmq::send_flags::sndmore);
             session->socket->send(zmq::message_t("P", 1), zmq::send_flags::sndmore);
@@ -567,7 +567,7 @@ std::future<std::string> RemoteL3KVClient::get_node_payload_async(lite3::NodeID 
             auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_ts - start_ts).count();
             
             if (res && recv_msgs.size() >= 2) {
-                std::fprintf(stderr, "  [ZMQ] G SUCCESS. took %lld ms. size=%zu\n", (long long)duration, recv_msgs[1].size()); std::fflush(stderr);
+                if(0) std::fprintf(stderr, "  [ZMQ] G SUCCESS. took %lld ms. size=%zu\n", (long long)duration, recv_msgs[1].size()); //std::fflush(stderr);
                 std::string resp = recv_msgs[1].to_string();
                 if (resp.starts_with("ERR_")) {
                     return ""; // Security rejection
@@ -620,7 +620,7 @@ std::future<std::unordered_map<uint64_t, std::string>> RemoteL3KVClient::get_nod
             
             std::unordered_map<uint64_t, std::string> results;
             if (res && recv_msgs.size() >= 2) {
-                std::fprintf(stderr, "  [ZMQ] M SUCCESS. took %lld ms. size=%zu\n", (long long)duration, recv_msgs[1].size()); std::fflush(stderr);
+                if(0) std::fprintf(stderr, "  [ZMQ] M SUCCESS. took %lld ms. size=%zu\n", (long long)duration, recv_msgs[1].size()); //std::fflush(stderr);
                 report_success(owner_id);
                 auto& body = recv_msgs[1];
                 lite3cpp::Buffer buf(std::vector<uint8_t>((uint8_t*)body.data(), (uint8_t*)body.data() + body.size()));

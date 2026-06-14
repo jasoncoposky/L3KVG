@@ -116,7 +116,7 @@ std::shared_ptr<Node> Engine::get_swizzled(uint64_t id) {
 }
 
 std::vector<std::shared_ptr<Node>> Engine::fetch_nodes(const std::vector<uint64_t>& ids, uint32_t principal_id) {
-  std::fprintf(stderr, "  [Engine] fetch_nodes: requested %zu nodes\n", ids.size()); std::fflush(stderr);
+  if(0) std::fprintf(stderr, "  [Engine] fetch_nodes: requested %zu nodes\n", ids.size()); //std::fflush(stderr);
   std::unordered_map<lite3::NodeID, std::vector<uint64_t>> remote_requests;
   std::vector<std::shared_ptr<Node>> result;
   result.reserve(ids.size());
@@ -127,21 +127,21 @@ std::vector<std::shared_ptr<Node>> Engine::fetch_nodes(const std::vector<uint64_
       // Locality of Reference: Try local store even if we are not the primary owner.
       std::string key = std::string(KeyBuilder::node_key(id));
       auto buf = store_->get(key);
-      std::fprintf(stderr, "  [Engine] Checking local store for node %016llx. Size=%zu, Header=[%02x %02x %02x %02x]\n", 
+      if(0) std::fprintf(stderr, "  [Engine] Checking local store for node %016llx. Size=%zu, Header=[%02x %02x %02x %02x]\n", 
               (unsigned long long)id, buf.size(), 
               buf.size() > 0 ? (uint8_t)buf.data()[0] : 0,
               buf.size() > 1 ? (uint8_t)buf.data()[1] : 0,
               buf.size() > 2 ? (uint8_t)buf.data()[2] : 0,
               buf.size() > 3 ? (uint8_t)buf.data()[3] : 0); 
-      std::fflush(stderr);
+      //std::fflush(stderr);
       if (buf.size() > 0) {
       node->hydrate(std::string(reinterpret_cast<const char*>(buf.data()), buf.size()));
-      std::fprintf(stderr, "  [Engine] Node %016llx HYDRATED. type=[%s]\n", (unsigned long long)id, node->get_attribute_as_string("t").c_str()); std::fflush(stderr);
+      if(0) std::fprintf(stderr, "  [Engine] Node %016llx HYDRATED. type=[%s]\n", (unsigned long long)id, node->get_attribute_as_string("t").c_str()); //std::fflush(stderr);
       }
 
  else {
           lite3::NodeID owner = resolver_.get_node_owner(id);
-          std::fprintf(stderr, "  [Engine] Node %016llx not local. Owner=%u, LocalNodeID=%u\n", (unsigned long long)id, owner, resolver_.get_local_node_id()); std::fflush(stderr);
+          if(0) std::fprintf(stderr, "  [Engine] Node %016llx not local. Owner=%u, LocalNodeID=%u\n", (unsigned long long)id, owner, resolver_.get_local_node_id()); //std::fflush(stderr);
           if (owner != resolver_.get_local_node_id()) {
             remote_requests[owner].push_back(id);
           }
@@ -195,7 +195,7 @@ void Engine::put_node(uint64_t id, std::string payload) {
         remote_client_->put_node_async(owner, id, payload);
         return;
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "[Engine::put_node] Remote RPC Failed: %s\n", e.what()); std::fflush(stderr);
+        if(0) std::fprintf(stderr, "[Engine::put_node] Remote RPC Failed: %s\n", e.what()); //std::fflush(stderr);
     }
   }
 

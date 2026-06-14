@@ -147,5 +147,11 @@ target_link_libraries(dbg_server PRIVATE l3kvg_engine Threads::Threads $<$<BOOL:
 add_executable(bench_l3kvg tests/bench_l3kvg.cpp)
 target_link_libraries(bench_l3kvg PRIVATE l3kvg_engine Threads::Threads)
 
+add_executable(bench_irods_patterns tests/bench_irods_patterns.cpp)
+target_link_libraries(bench_irods_patterns PRIVATE l3kvg_engine Threads::Threads)
+
+add_executable(bench_engine_core tests/bench_engine_core.cpp)
+target_link_libraries(bench_engine_core PRIVATE l3kvg_engine Threads::Threads)
+
 add_executable(bench_unified tests/bench_unified.cpp)
 target_link_libraries(bench_unified PRIVATE l3kvg_engine Threads::Threads $<$<BOOL:${WIN32}>:ws2_32> $<$<BOOL:${WIN32}>:wsock32> $<$<BOOL:${WIN32}>:crypt32>)

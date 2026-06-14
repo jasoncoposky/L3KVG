@@ -18,7 +18,7 @@
 #define L3_LOG(level, ...) if (level >= 0) rodsLog(level, __VA_ARGS__)
 #else
 #include <cstdio>
-#define L3_LOG(level, ...) std::fprintf(stderr, "[L3KVG] " __VA_ARGS__); std::fprintf(stderr, "\n")
+#define L3_LOG(level, ...) if(0) std::fprintf(stderr, "[L3KVG] " __VA_ARGS__); if(0) std::fprintf(stderr, "\n")
 #endif
 
 namespace l3kvg {
@@ -129,8 +129,16 @@ Query &Query::or_where_group(std::function<void(FilterGroup&)> cb) { root_filter
 
 Query::OutEdgeBuilder Query::out(std::string_view edge_label, double min_weight) { return OutEdgeBuilder(*this, edge_label, min_weight); }
 Query::InEdgeBuilder Query::in(std::string_view edge_label) { return InEdgeBuilder(*this, edge_label); }
-Query& Query::OutEdgeBuilder::as(std::string_view dest_alias) { q_.steps_.push_back(OutStep{label_, weight_, std::string(dest_alias)}); return q_; }
-Query& Query::InEdgeBuilder::as(std::string_view dest_alias) { q_.steps_.push_back(InStep{label_, std::string(dest_alias)}); return q_; }
+Query& Query::OutEdgeBuilder::as(std::string_view dest_alias) { 
+    q_.steps_.push_back(OutStep{label_, weight_, std::string(dest_alias), q_.current_source_alias_}); 
+    q_.current_source_alias_.clear();
+    return q_; 
+}
+Query& Query::InEdgeBuilder::as(std::string_view dest_alias) { 
+    q_.steps_.push_back(InStep{label_, std::string(dest_alias), q_.current_source_alias_}); 
+    q_.current_source_alias_.clear();
+    return q_; 
+}
 Query& Query::return_(std::string_view alias, std::string_view property, AggOp agg) { projections_.push_back(ReturnStep{std::string(alias), std::string(property), agg}); return *this; }
 
 static const Query::Filter* find_first_eq_filter(const Query::FilterGroup& g, std::string_view alias, std::string_view key = "") {
@@ -146,8 +154,16 @@ std::string Query::serialize_steps(const std::vector<Step>& steps) {
     for (size_t i = 0; i < steps.size(); ++i) {
         if (i > 0) ss << ",";
         std::visit(overloaded{
-            [&](const Query::OutStep& s) { ss << "{\"type\":\"out\",\"label\":\"" << s.label << "\",\"min_weight\":" << s.min_weight << ",\"target_alias\":\"" << s.target_alias << "\"}"; },
-            [&](const Query::InStep& s) { ss << "{\"type\":\"in\",\"label\":\"" << s.label << "\",\"target_alias\":\"" << s.target_alias << "\"}"; }
+            [&](const Query::OutStep& s) { 
+                ss << "{\"type\":\"out\",\"label\":\"" << s.label << "\",\"min_weight\":" << s.min_weight << ",\"target_alias\":\"" << s.target_alias << "\"";
+                if (!s.source_alias.empty()) ss << ",\"source_alias\":\"" << s.source_alias << "\"";
+                ss << "}";
+            },
+            [&](const Query::InStep& s) { 
+                ss << "{\"type\":\"in\",\"label\":\"" << s.label << "\",\"target_alias\":\"" << s.target_alias << "\"";
+                if (!s.source_alias.empty()) ss << ",\"source_alias\":\"" << s.source_alias << "\"";
+                ss << "}";
+            }
         }, steps[i]);
     }
     ss << "]"; return ss.str();
@@ -250,7 +266,8 @@ std::vector<ResultRow> Query::execute() {
             const auto &path = paths[p_idx];
             std::visit(overloaded{
                 [&](const OutStep& s) {
-                    auto node = path.alias_to_node.at(path.last_alias);
+                    std::string src = s.source_alias.empty() ? path.last_alias : s.source_alias;
+                    auto node = path.alias_to_node.at(src);
                     auto neighbors = node->get_neighbors(s.label, s.min_weight, principal_id_);
                     std::unordered_set<uint64_t> unique_neighbors(neighbors.begin(), neighbors.end());
                     for (const auto& neighbor_id : unique_neighbors) {
@@ -269,7 +286,8 @@ std::vector<ResultRow> Query::execute() {
                     }
                 },
                 [&](const InStep& s) {
-                    auto node = path.alias_to_node.at(path.last_alias);
+                    std::string src = s.source_alias.empty() ? path.last_alias : s.source_alias;
+                    auto node = path.alias_to_node.at(src);
                     auto neighbors = node->get_in_neighbors(s.label, principal_id_);
                     std::unordered_set<uint64_t> unique_neighbors(neighbors.begin(), neighbors.end());
                     for (const auto& neighbor_id : unique_neighbors) {
@@ -432,8 +450,9 @@ Query &Query::resume(const std::vector<uint64_t>& starting_nodes, std::string_vi
         if (j.contains("steps")) {
             for (const auto& sj : j["steps"]) {
                 std::string type = sj["type"];
-                if (type == "out") steps_.push_back(OutStep{sj["label"], sj["min_weight"], sj["target_alias"]});
-                else if (type == "in") steps_.push_back(InStep{sj["label"], sj["target_alias"]});
+                std::string src = sj.value("source_alias", "");
+                if (type == "out") steps_.push_back(OutStep{sj["label"], sj["min_weight"], sj["target_alias"], src});
+                else if (type == "in") steps_.push_back(InStep{sj["label"], sj["target_alias"], src});
             }
         }
         if (j.contains("projections")) {

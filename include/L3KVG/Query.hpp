@@ -92,6 +92,8 @@ public:
   OutEdgeBuilder out(std::string_view edge_label, double min_weight = 0.0);
   InEdgeBuilder in(std::string_view edge_label);
 
+  Query &from(std::string_view alias) { current_source_alias_ = alias; return *this; }
+
   // Projection
   enum class AggOp { None, Count, Sum, Avg, Min, Max };
   Query &return_(std::string_view alias, std::string_view property, AggOp agg = AggOp::None);
@@ -129,10 +131,12 @@ private:
     std::string label;
     double min_weight;
     std::string target_alias;
+    std::string source_alias; // If empty, use last_alias
   };
   struct InStep {
     std::string label;
     std::string target_alias;
+    std::string source_alias; // If empty, use last_alias
   };
   using Step = std::variant<OutStep, InStep>;
 
@@ -166,6 +170,7 @@ private:
   bool distinct_ = false;
   std::optional<size_t> limit_;
   std::optional<size_t> offset_;
+  std::string current_source_alias_;
 
   static std::string serialize_steps(const std::vector<Step>& steps);
 };
