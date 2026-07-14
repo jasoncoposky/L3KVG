@@ -101,23 +101,23 @@ std::shared_ptr<const std::vector<std::string>> FederationResolver::get_federati
 
 uint64_t FederationResolver::parse_uuid(std::string_view uuid_str) const {
     std::string_view cluster_name;
-    std::string_view local_uuid;
+    std::string_view local_uuid = uuid_str;
+    uint16_t cluster_id = 0;
+    bool found_cluster = false;
 
     auto colon_pos = uuid_str.find(':');
-    uint16_t cluster_id;
-
     if (colon_pos != std::string_view::npos) {
         cluster_name = uuid_str.substr(0, colon_pos);
-        local_uuid = uuid_str.substr(colon_pos + 1);
-
         std::shared_lock lock(mutex_);
         auto it = cluster_name_to_id_.find(std::string(cluster_name));
-        if (it == cluster_name_to_id_.end()) {
-            throw std::runtime_error("Unknown cluster name: " + std::string(cluster_name));
+        if (it != cluster_name_to_id_.end()) {
+            local_uuid = uuid_str.substr(colon_pos + 1);
+            cluster_id = it->second;
+            found_cluster = true;
         }
-        cluster_id = it->second;
-    } else {
-        local_uuid = uuid_str;
+    }
+
+    if (!found_cluster) {
         std::shared_lock lock(mutex_);
         cluster_id = local_cluster_id_;
     }

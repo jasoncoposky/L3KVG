@@ -52,7 +52,14 @@ static bool evaluate_filter(Node* node, const Query::Filter& f, Engine* engine) 
     bool res = false;
     auto type = node->get_attribute_type(f.key);
     switch (f.op) {
-        case Query::Op::Eq: res = (s_val == f.value); break;
+        case Query::Op::Eq: 
+            res = (s_val == f.value); 
+            #ifdef IRODS_SERVER
+            rodsLog(LOG_NOTICE, "[Filter] %s.%s: '%s' == '%s' ? %s", f.alias.c_str(), f.key.c_str(), s_val.c_str(), f.value.c_str(), res ? "YES" : "NO");
+#else
+            if(1) std::fprintf(stderr, "    [Filter] %s.%s: '%s' == '%s' ? %s\n", f.alias.c_str(), f.key.c_str(), s_val.c_str(), f.value.c_str(), res ? "YES" : "NO");
+#endif
+            break;
         case Query::Op::Ne: res = (s_val != f.value); break;
         case Query::Op::Gt: {
             if (type == lite3cpp::Type::Int64) { try { res = (std::stoll(s_val) > std::stoll(f.value)); } catch(...) { res = false; } }
@@ -267,8 +274,18 @@ std::vector<ResultRow> Query::execute() {
             std::visit(overloaded{
                 [&](const OutStep& s) {
                     std::string src = s.source_alias.empty() ? path.last_alias : s.source_alias;
-                    auto node = path.alias_to_node.at(src);
+                    auto it_src = path.alias_to_node.find(src);
+                    if (it_src == path.alias_to_node.end()) {
+                        if(1) std::fprintf(stderr, "[Query] Step %zu: Source alias [%s] not found in path!\n", i, src.c_str());
+                        return;
+                    }
+                    auto node = it_src->second;
                     auto neighbors = node->get_neighbors(s.label, s.min_weight, principal_id_);
+                    #ifdef IRODS_SERVER
+                    rodsLog(LOG_NOTICE, "[Query] Step %zu (OUT %s -> %s): Found %zu neighbors for node %016llx", i, src.c_str(), s.target_alias.c_str(), neighbors.size(), (unsigned long long)node->get_id());
+#else
+                    if(1) std::fprintf(stderr, "[Query] Step %zu (OUT %s -> %s): Found %zu neighbors for node %016llx\n", i, src.c_str(), s.target_alias.c_str(), neighbors.size(), (unsigned long long)node->get_id());
+#endif
                     std::unordered_set<uint64_t> unique_neighbors(neighbors.begin(), neighbors.end());
                     for (const auto& neighbor_id : unique_neighbors) {
                         try {
@@ -281,14 +298,28 @@ std::vector<ResultRow> Query::execute() {
                             auto neighbor_node = engine_->get_node(neighbor_id);
                             if (!neighbor_node) continue;
                             Path new_path = path; new_path.alias_to_node[s.target_alias] = neighbor_node; new_path.last_alias = s.target_alias;
-                            if (evaluate_group(root_filters_, new_path.alias_to_node, s.target_alias, engine_)) local_next_paths.push_back(std::move(new_path));
+                            if (evaluate_group(root_filters_, new_path.alias_to_node, s.target_alias, engine_)) {
+                                local_next_paths.push_back(std::move(new_path));
+                            } else {
+                                if(1) std::fprintf(stderr, "  [Query] Neighbor %016llx filtered out\n", (unsigned long long)neighbor_id);
+                            }
                         } catch (...) {}
                     }
                 },
                 [&](const InStep& s) {
                     std::string src = s.source_alias.empty() ? path.last_alias : s.source_alias;
-                    auto node = path.alias_to_node.at(src);
+                    auto it_src = path.alias_to_node.find(src);
+                    if (it_src == path.alias_to_node.end()) {
+                        if(1) std::fprintf(stderr, "[Query] Step %zu: Source alias [%s] not found in path!\n", i, src.c_str());
+                        return;
+                    }
+                    auto node = it_src->second;
                     auto neighbors = node->get_in_neighbors(s.label, principal_id_);
+                    #ifdef IRODS_SERVER
+                    rodsLog(LOG_NOTICE, "[Query] Step %zu (IN %s -> %s): Found %zu neighbors for node %016llx", i, src.c_str(), s.target_alias.c_str(), neighbors.size(), (unsigned long long)node->get_id());
+#else
+                    if(1) std::fprintf(stderr, "[Query] Step %zu (IN %s -> %s): Found %zu neighbors for node %016llx\n", i, src.c_str(), s.target_alias.c_str(), neighbors.size(), (unsigned long long)node->get_id());
+#endif
                     std::unordered_set<uint64_t> unique_neighbors(neighbors.begin(), neighbors.end());
                     for (const auto& neighbor_id : unique_neighbors) {
                         try {
@@ -301,7 +332,11 @@ std::vector<ResultRow> Query::execute() {
                             auto neighbor_node = engine_->get_node(neighbor_id);
                             if (!neighbor_node) continue;
                             Path new_path = path; new_path.alias_to_node[s.target_alias] = neighbor_node; new_path.last_alias = s.target_alias;
-                            if (evaluate_group(root_filters_, new_path.alias_to_node, s.target_alias, engine_)) local_next_paths.push_back(std::move(new_path));
+                            if (evaluate_group(root_filters_, new_path.alias_to_node, s.target_alias, engine_)) {
+                                local_next_paths.push_back(std::move(new_path));
+                            } else {
+                                if(1) std::fprintf(stderr, "  [Query] Neighbor %016llx filtered out\n", (unsigned long long)neighbor_id);
+                            }
                         } catch (...) {}
                     }
                 }

@@ -1,4 +1,3 @@
-#include "L3KVG/Node.hpp"
 #include "L3KVG/Cypher.hpp"
 #include "L3KVG/Engine.hpp"
 #include "L3KVG/KeyBuilder.hpp"
@@ -24,7 +23,6 @@ struct Config {
     uint16_t node_id;
     uint32_t zmq_port;
     uint32_t http_port;
-    std::string auth_secret;
     std::string local_cluster_name;
     uint16_t local_cluster_id;
     struct Federation {
@@ -44,11 +42,10 @@ Config load_config(const std::string &path) {
     Config cfg;
     cfg.db_path = j.at("db_path").get<std::string>();
     cfg.node_id = j.at("node_id").get<uint16_t>();
-    cfg.zmq_port = j.value("zmq_port", 5556);
+    cfg.zmq_port = j.value("zmq_port", 5555);
     cfg.http_port = j.value("http_port", 8080);
-    cfg.auth_secret = j.value("auth_secret", "");
     cfg.local_cluster_name = j.value("local_cluster_name", "");
-    cfg.local_cluster_id = j.value("local_cluster_id", 0);
+    cfg.local_cluster_id = j.value("local_cluster_id", (uint16_t)0);
     if (j.contains("federations")) {
         for (const auto &fj : j["federations"]) {
             Config::Federation fed;
@@ -106,15 +103,9 @@ int main(int argc, char *argv[]) {
           sock.bind(zmq_endpoint);
           if(1) std::fprintf(stderr, "DEBUG_SERVER_v3: ZMQ Ready on %s\n", zmq_endpoint.c_str()); //std::fflush(stderr);
 
-          auto last_flush = std::chrono::steady_clock::now();
           while (true) {
               zmq::pollitem_t items[] = { { (void*)sock, 0, ZMQ_POLLIN, 0 } };
               zmq::poll(&items[0], 1, std::chrono::milliseconds(100));
-
-              if (std::chrono::steady_clock::now() - last_flush > std::chrono::seconds(1)) {
-                  engine->get_store()->flush();
-                  last_flush = std::chrono::steady_clock::now();
-              }
 
               if (!(items[0].revents & ZMQ_POLLIN)) continue;
 
@@ -122,12 +113,6 @@ int main(int argc, char *argv[]) {
               auto res = zmq::recv_multipart(sock, std::back_inserter(recv_msgs));
               if (!res || recv_msgs.empty()) continue;
 
-              if(1) {
-                  std::fprintf(stderr, "L3_SERVER: Received %zu frames\n", recv_msgs.size());
-                  for (size_t i = 0; i < recv_msgs.size(); ++i) {
-                      std::fprintf(stderr, "  Frame %zu: size=%zu, content=[%s]\n", i, recv_msgs[i].size(), (recv_msgs[i].size() < 64 ? recv_msgs[i].to_string().c_str() : "LONG"));
-                  }
-              }
 
               if (recv_msgs.size() < 4) {
                   continue;
@@ -135,62 +120,17 @@ int main(int argc, char *argv[]) {
 
               auto identity = std::move(recv_msgs[0]);
               size_t data_idx = 1;
-              if (recv_msgs[data_idx].size() == 0) data_idx++; // Skip delimiter
+              if (recv_msgs[data_idx].empty()) data_idx++;
 
               uint32_t principal_id = 0;
-              if (data_idx < recv_msgs.size() && recv_msgs[data_idx].size() == 4) {
+              if (recv_msgs[data_idx].size() == 4) {
                   std::memcpy(&principal_id, recv_msgs[data_idx].data(), 4);
-                  data_idx++;
               }
+              data_idx++;
 
-              if (data_idx >= recv_msgs.size()) continue;
-
-              std::string opcode = recv_msgs[data_idx].to_string(); data_idx++;
-              if(1) std::fprintf(stderr, "L3_SERVER: Handling opcode [%s] from pid [%u]\n", opcode.c_str(), principal_id);
-
-              if (opcode == "A") { // Auth
-                  std::string node_id_str = recv_msgs[data_idx].to_string(); data_idx++;
-                  std::string secret = recv_msgs[data_idx].to_string(); data_idx++;
-                  
-                  sock.send(identity, zmq::send_flags::sndmore);
-                  sock.send(zmq::message_t(), zmq::send_flags::sndmore);
-                  if (cfg.auth_secret.empty() || secret == cfg.auth_secret) {
-                      sock.send(zmq::message_t("OK", 2), zmq::send_flags::none);
-                  } else {
-                      sock.send(zmq::message_t("ERR_AUTH", 8), zmq::send_flags::none);
-                  }
-              }
-
-              if (opcode == "+") { // Atomic Increment
-                  if (data_idx >= recv_msgs.size()) continue;
-                  std::string key = recv_msgs[data_idx].to_string(); data_idx++;
-                  int64_t delta = 1;
-                  if (data_idx < recv_msgs.size()) {
-                      delta = std::stoll(recv_msgs[data_idx].to_string());
-                      data_idx++;
-                  }
-
-                  try {
-                      auto buf = engine->get_store()->get(key);
-                      int64_t val = 0;
-                      if (buf.size() > 0) {
-                          lite3cpp::Buffer lbuf(std::vector<uint8_t>(buf.data(), buf.data() + buf.size()));
-                          val = lbuf.get_i64(0, "v");
-                      }
-                      val += delta;
-                      
-                      lite3cpp::Buffer nbuf; nbuf.init_object(); nbuf.set_i64(0, "v", val);
-                      engine->get_store()->put(key, nbuf.move_to_string());
-                      
-                      sock.send(identity, zmq::send_flags::sndmore);
-                      sock.send(zmq::message_t(), zmq::send_flags::sndmore);
-                      sock.send(zmq::message_t(std::to_string(val)), zmq::send_flags::none);
-                  } catch (const std::exception& e) {
-                      sock.send(identity, zmq::send_flags::sndmore);
-                      sock.send(zmq::message_t(), zmq::send_flags::sndmore);
-                      sock.send(zmq::message_t("ERR", 3), zmq::send_flags::none);
-                  }
-              }
+              std::string opcode = recv_msgs[data_idx].to_string();
+              data_idx++;
+              
 
               if (opcode == "R") {
                   try {
@@ -198,14 +138,12 @@ int main(int argc, char *argv[]) {
                       data_idx++;
                       std::string query_json = recv_msgs[data_idx].to_string();
                       auto results = engine->query().resume(nodes, query_json).execute();
-                      
                       json j_res = json::array();
                       for (const auto& row : results) {
-                          json j_row;
-                          j_row["fields"] = row.fields;
-                          j_res.push_back(j_row);
+                          json jr = json::object();
+                          for (const auto& [k, v] : row.fields) jr[k] = v;
+                          j_res.push_back(jr);
                       }
-                      
                       std::string resp_json = j_res.dump();
                       sock.send(identity, zmq::send_flags::sndmore);
                       sock.send(zmq::message_t(), zmq::send_flags::sndmore);
@@ -302,56 +240,10 @@ int main(int argc, char *argv[]) {
                       sock.send(zmq::message_t(), zmq::send_flags::sndmore);
                       sock.send(zmq::message_t("ERR", 3), zmq::send_flags::none);
                   }
-              } else if (opcode == "N") {
-                  try {
-                      std::string id_str = recv_msgs[data_idx].to_string(); data_idx++;
-                      std::string label = recv_msgs[data_idx].to_string(); data_idx++;
-                      std::string w_str = recv_msgs[data_idx].to_string();
-                      
-                      uint64_t target_node_id = std::stoull(id_str, nullptr, 16);
-                      double min_weight = std::stod(w_str);
-                      
-                      auto node = engine->get_node(target_node_id);
-                      std::vector<uint64_t> neighs;
-                      if (node) neighs = node->get_neighbors(label, min_weight, principal_id);
-                      
-                      json j_res = neighs;
-                      std::string resp_json = j_res.dump();
-                      sock.send(identity, zmq::send_flags::sndmore);
-                      sock.send(zmq::message_t(), zmq::send_flags::sndmore);
-                      sock.send(zmq::message_t(resp_json.data(), resp_json.size()), zmq::send_flags::none);
-                  } catch (const std::exception& e) {
-                      if(1) std::fprintf(stderr, "L3_SERVER: Error N: %s\n", e.what()); //std::fflush(stderr);
-                      sock.send(identity, zmq::send_flags::sndmore);
-                      sock.send(zmq::message_t(), zmq::send_flags::sndmore);
-                      sock.send(zmq::message_t("[]", 2), zmq::send_flags::none);
-                  }
-              } else if (opcode == "I") {
-                  try {
-                      std::string id_str = recv_msgs[data_idx].to_string(); data_idx++;
-                      std::string label = recv_msgs[data_idx].to_string();
-                      
-                      uint64_t target_node_id = std::stoull(id_str, nullptr, 16);
-                      
-                      auto node = engine->get_node(target_node_id);
-                      std::vector<uint64_t> neighs;
-                      if (node) neighs = node->get_in_neighbors(label, principal_id);
-                      
-                      json j_res = neighs;
-                      std::string resp_json = j_res.dump();
-                      sock.send(identity, zmq::send_flags::sndmore);
-                      sock.send(zmq::message_t(), zmq::send_flags::sndmore);
-                      sock.send(zmq::message_t(resp_json.data(), resp_json.size()), zmq::send_flags::none);
-                  } catch (const std::exception& e) {
-                      if(1) std::fprintf(stderr, "L3_SERVER: Error I: %s\n", e.what()); //std::fflush(stderr);
-                      sock.send(identity, zmq::send_flags::sndmore);
-                      sock.send(zmq::message_t(), zmq::send_flags::sndmore);
-                      sock.send(zmq::message_t("[]", 2), zmq::send_flags::none);
-                  }
               }
           }
       } catch (const std::exception& e) {
-          if(1) std::fprintf(stderr, "DEBUG_SERVER_v3: ZMQ Error: %s\n", e.what()); //std::fflush(stderr);
+          if(1) std::fprintf(stderr, "ZMQ Thread Fatal Error: %s\n", e.what()); //std::fflush(stderr);
       }
   });
 

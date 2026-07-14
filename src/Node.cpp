@@ -122,7 +122,7 @@ std::vector<uint64_t> Node::get_neighbors(std::string_view label,
           if (start_brace != std::string::npos && end_brace != std::string::npos && end_brace > start_brace) {
               std::string id_str = key.substr(start_brace + 1, end_brace - start_brace - 1);
               uint64_t nid = std::stoull(id_str, nullptr, 16);
-              // std::cout << "  [Node " << id_ << "] Found neighbor " << nid << " via key " << key << std::endl;
+              if(0) std::fprintf(stderr, "  Found OUT neighbor %016llx\n", (unsigned long long)nid);
               neighbors.push_back(nid);
           }
       }
@@ -147,10 +147,13 @@ std::vector<uint64_t> Node::get_in_neighbors(std::string_view label, uint32_t pr
   std::vector<uint64_t> neighbors;
   std::string_view prefix = KeyBuilder::edge_in_prefix(id_, label);
   
+  if(0) std::fprintf(stderr, "[Node %016llx] Scanning IN edges for label [%s]\n", (unsigned long long)id_, std::string(label).c_str());
+
   auto *store = engine_->get_store();
   size_t target_shard = store->get_routing_shard(std::string(prefix));
 
   auto chunk = store->get_prefix_keys(std::string(prefix), target_shard, std::string(prefix), engine_->get_settings().prefix_scan_limit);
+  if(1) std::fprintf(stderr, "[Node %016llx] Scanned label [%s], found %zu keys\n", (unsigned long long)id_, std::string(label).c_str(), chunk.size());
   for (const auto &key : chunk) {
       if (key.ends_with(":meta"))
           continue;
@@ -158,7 +161,9 @@ std::vector<uint64_t> Node::get_in_neighbors(std::string_view label, uint32_t pr
       size_t end_brace = key.find_last_of('}');
       if (start_brace != std::string::npos && end_brace != std::string::npos && end_brace > start_brace) {
           std::string id_str = key.substr(start_brace + 1, end_brace - start_brace - 1);
-          neighbors.push_back(std::stoull(id_str, nullptr, 16));
+          uint64_t nid = std::stoull(id_str, nullptr, 16);
+          if(0) std::fprintf(stderr, "  Found IN neighbor %016llx\n", (unsigned long long)nid);
+          neighbors.push_back(nid);
       }
   }
   
@@ -194,7 +199,8 @@ std::vector<std::shared_ptr<Edge>> Node::get_edges(std::string_view label,
 
   // We need a method in l3kv::Engine that returns pairs of {key, value}
   // Let's assume get_prefix_entries exists or iterate through keys and get values.
-  auto chunk = store->get_prefix_keys(std::string(prefix), target_shard, start_key, engine_->get_settings().prefix_scan_limit);
+  auto chunk = store->get_prefix_keys(std::string(prefix), target_shard, std::string(prefix), engine_->get_settings().prefix_scan_limit);
+  if(1) std::fprintf(stderr, "[Node %016llx] Scanned label [%s], found %zu keys\n", (unsigned long long)id_, std::string(label).c_str(), chunk.size());
   for (const auto &key : chunk) {
     if (key.ends_with(":meta"))
       continue;

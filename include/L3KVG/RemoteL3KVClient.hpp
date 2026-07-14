@@ -83,6 +83,13 @@ public:
         uint32_t principal_id = l3kv::INTERNAL_UID
     );
 
+    std::future<uint64_t> atomic_incr_async(
+        lite3::NodeID owner_id,
+        const std::string& key,
+        int64_t delta,
+        uint32_t principal_id = l3kv::INTERNAL_UID
+    );
+
     // Batch Fetch: Reduces network roundtrips by coalescing requests to the same peer.
     std::future<std::unordered_map<uint64_t, std::string>> get_nodes_batch_async(
         lite3::NodeID owner_id,

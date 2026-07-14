@@ -51,6 +51,8 @@ std::future<void> EdgeCoordinator::atomic_put_edge(uint64_t src_id, const std::s
     std::string out_key = std::string(KeyBuilder::edge_out_key(src_id, label, weight, dst_id));
     std::string in_key = std::string(KeyBuilder::edge_in_key(dst_id, label, src_id));
 
+    if(1) std::fprintf(stderr, "[EdgeCoordinator] atomic_del_edge: out_key=[%s] in_key=[%s]\n", out_key.c_str(), in_key.c_str());
+
     std::vector<std::future<void>> futures;
 
     auto handle_write = [&](lite3::NodeID owner, const std::string& key) {
@@ -109,6 +111,8 @@ std::future<void> EdgeCoordinator::atomic_del_edge(uint64_t src_id, const std::s
 
     std::string out_key = std::string(KeyBuilder::edge_out_key(src_id, label, weight, dst_id));
     std::string in_key = std::string(KeyBuilder::edge_in_key(dst_id, label, src_id));
+
+    if(1) std::fprintf(stderr, "[EdgeCoordinator] atomic_del_edge: out_key=[%s] in_key=[%s]\n", out_key.c_str(), in_key.c_str());
 
     std::vector<std::future<void>> futures;
 

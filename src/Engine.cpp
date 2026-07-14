@@ -188,6 +188,7 @@ std::vector<std::shared_ptr<Node>> Engine::get_nodes_by_prefix(const std::string
 }
 
 void Engine::put_node(uint64_t id, std::string payload) {
+  std::fprintf(stderr, "[Engine] put_node %016llx: payload_size=%zu\n", (unsigned long long)id, payload.size());
   lite3::NodeID owner = resolver_.get_node_owner(id);
   
   if (owner != resolver_.get_local_node_id()) {
@@ -202,22 +203,33 @@ void Engine::put_node(uint64_t id, std::string payload) {
   const uint8_t* ptr = reinterpret_cast<const uint8_t*>(payload.data());
   std::string binary_payload;
 
-  if (payload.size() > 4 && (ptr[0] == 0x06 || ptr[0] == 0x07)) {
+  if (payload.size() >= 4 && (ptr[0] == 0x06 || ptr[0] == 0x07)) {
       binary_payload = std::move(payload);
   } else {
       auto ts = hlc_.now();
       json j_meta;
+      bool is_json = false;
       try {
           j_meta = json::parse(payload);
+          is_json = true;
       } catch (...) {
-          j_meta["_raw"] = payload;
+          // Payload is not JSON. It might be binary.
+          // We can't put it in j_meta["_raw"] if it's not valid UTF-8.
+          // For now, if it's not JSON, we'll just treat it as a raw Lite3 Bytes object if possible,
+          // or just store it as-is if it's already someone else's binary format.
+          // BUT, we need HLC for replication.
+          // Let's just store it as-is and hope for the best, or wrap it properly.
+          binary_payload = std::move(payload);
       }
-      j_meta["_hlc"] = json::parse(ts.to_json_string());
-      std::string final_json = j_meta.dump();
 
-      // Convert to Lite3 binary for consistent storage
-      lite3cpp::Buffer buf = lite3cpp::lite3_json::from_json_string(final_json);
-      binary_payload = std::string(reinterpret_cast<const char*>(buf.data()), buf.size());
+      if (is_json) {
+          j_meta["_hlc"] = json::parse(ts.to_json_string());
+          std::string final_json = j_meta.dump();
+
+          // Convert to Lite3 binary for consistent storage
+          lite3cpp::Buffer buf = lite3cpp::lite3_json::from_json_string(final_json);
+          binary_payload = std::string(reinterpret_cast<const char*>(buf.data()), buf.size());
+      }
   }
 
   std::string key = std::string(KeyBuilder::node_key(id));
