@@ -390,7 +390,10 @@ std::vector<ResultRow> Query::execute() {
         for (const auto& s : sorts_) if (s.alias == alias) { std::string k = s.alias + "." + s.property; if (row.fields.find(k) == row.fields.end()) { if (node->has_attribute(s.property)) row.fields[k] = node->get_attribute_as_string(s.property); } }
         for (const auto& g : groups_) if (g.alias == alias) { std::string k = g.alias + "." + g.property; if (row.fields.find(k) == row.fields.end()) { if (node->has_attribute(g.property)) row.fields[k] = node->get_attribute_as_string(g.property); } }
     }
-    for (size_t i = 0; i < projections_.size(); ++i) { if (!row.fields.contains("idx_" + std::to_string(i))) row.fields["idx_" + std::to_string(i)] = ""; }
+    for (size_t i = 0; i < projections_.size(); ++i) {
+        if (!row.fields.contains("idx_" + std::to_string(i))) row.fields["idx_" + std::to_string(i)] = "";
+        row.fields["_col_" + std::to_string(i)] = projections_[i].alias + "." + projections_[i].property;
+    }
     results.push_back(std::move(row));
   }
   for (auto& f : remote_futures) {
