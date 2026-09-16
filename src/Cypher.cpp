@@ -74,15 +74,23 @@ CypherParser::execute(std::string_view query_text) {
   parse_props(tgt_props, tgt_alias);
 
   // Search for RETURN clause
-  std::regex return_rx(R"(RETURN\s+([^\.]+)\.([^ \n\r]+))");
+  std::regex return_rx(R"(RETURN\s+([^\n\r;]+))");
   std::smatch return_ast;
   if (!std::regex_search(query, return_ast, return_rx)) {
     throw std::runtime_error("Cypher Syntax Error: Missing RETURN clause.");
   }
 
-  std::string ret_alias = return_ast[1];
-  std::string ret_prop = return_ast[2];
-  q.return_(ret_alias, ret_prop);
+  std::string ret_clause = return_ast[1];
+  std::regex item_rx(R"(([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+))");
+  auto items_begin = std::sregex_iterator(ret_clause.begin(), ret_clause.end(), item_rx);
+  auto items_end = std::sregex_iterator();
+  if (items_begin == items_end) {
+    throw std::runtime_error("Cypher Syntax Error: Invalid RETURN clause.");
+  }
+  for (auto i = items_begin; i != items_end; ++i) {
+    std::smatch match = *i;
+    q.return_(match[1].str(), match[2].str());
+  }
 
   return q.execute();
 }
