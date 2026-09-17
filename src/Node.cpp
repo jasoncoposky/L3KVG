@@ -316,6 +316,17 @@ std::string Node::get_attribute_as_string(std::string_view key) {
           res = std::to_string(b.get_f64(0, k)); break;
         case lite3cpp::Type::Bool:
           res = b.get_bool(0, k) ? "true" : "false"; break;
+        case lite3cpp::Type::Bytes: {
+          auto span = b.get_bytes(0, k);
+          static const char hex_chars[] = "0123456789abcdef";
+          res.reserve(span.size() * 2);
+          for (auto byte : span) {
+            uint8_t byte_val = static_cast<uint8_t>(byte);
+            res.push_back(hex_chars[(byte_val >> 4) & 0x0F]);
+            res.push_back(hex_chars[byte_val & 0x0F]);
+          }
+          break;
+        }
         default:
           res = ""; break;
       }
