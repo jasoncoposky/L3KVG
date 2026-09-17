@@ -75,7 +75,29 @@ template <typename T> T Node::get_attribute(std::string_view key) {
   std::string k(key);
   if constexpr (std::is_same_v<T, std::string>) {
     return std::string(payload_->get_str(0, k));
+  } else if constexpr (std::is_same_v<T, bool>) {
+    auto t = payload_->get_type(0, k);
+    if (t == lite3cpp::Type::Bool) {
+      return payload_->get_bool(0, k);
+    } else if (t == lite3cpp::Type::Int64) {
+      return payload_->get_i64(0, k) != 0;
+    } else if (t == lite3cpp::Type::String) {
+      auto s = payload_->get_str(0, k);
+      return s == "true" || s == "1" || s == "True";
+    }
+    return false;
   } else if constexpr (std::is_integral_v<T>) {
+    auto t = payload_->get_type(0, k);
+    if (t == lite3cpp::Type::Bool) {
+      return static_cast<T>(payload_->get_bool(0, k) ? 1 : 0);
+    } else if (t == lite3cpp::Type::String) {
+      try {
+        auto s = payload_->get_str(0, k);
+        return static_cast<T>(std::stoll(std::string(s)));
+      } catch (...) {
+        return T{};
+      }
+    }
     return static_cast<T>(payload_->get_i64(0, k));
   } else if constexpr (std::is_floating_point_v<T>) {
     return static_cast<T>(payload_->get_f64(0, k));

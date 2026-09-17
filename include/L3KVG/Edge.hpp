@@ -50,7 +50,29 @@ public:
     try {
         if constexpr (std::is_same_v<T, std::string>) {
           return std::string(payload_->get_str(props_ofs, k));
+        } else if constexpr (std::is_same_v<T, bool>) {
+          auto t = payload_->get_type(props_ofs, k);
+          if (t == lite3cpp::Type::Bool) {
+            return payload_->get_bool(props_ofs, k);
+          } else if (t == lite3cpp::Type::Int64) {
+            return payload_->get_i64(props_ofs, k) != 0;
+          } else if (t == lite3cpp::Type::String) {
+            auto s = payload_->get_str(props_ofs, k);
+            return s == "true" || s == "1" || s == "True";
+          }
+          return false;
         } else if constexpr (std::is_integral_v<T>) {
+          auto t = payload_->get_type(props_ofs, k);
+          if (t == lite3cpp::Type::Bool) {
+            return static_cast<T>(payload_->get_bool(props_ofs, k) ? 1 : 0);
+          } else if (t == lite3cpp::Type::String) {
+            try {
+              auto s = payload_->get_str(props_ofs, k);
+              return static_cast<T>(std::stoll(std::string(s)));
+            } catch (...) {
+              return T{};
+            }
+          }
           return static_cast<T>(payload_->get_i64(props_ofs, k));
         } else if constexpr (std::is_floating_point_v<T>) {
           return static_cast<T>(payload_->get_f64(props_ofs, k));
