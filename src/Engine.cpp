@@ -188,7 +188,7 @@ std::vector<std::shared_ptr<Node>> Engine::get_nodes_by_prefix(const std::string
 }
 
 void Engine::put_node(uint64_t id, std::string payload) {
-  std::fprintf(stderr, "[Engine] put_node %016llx: payload_size=%zu\n", (unsigned long long)id, payload.size());
+  // if(0) std::fprintf(stderr, "[Engine] put_node %016llx: payload_size=%zu\n", (unsigned long long)id, payload.size());
   lite3::NodeID owner = resolver_.get_node_owner(id);
   
   if (owner != resolver_.get_local_node_id()) {

@@ -153,7 +153,7 @@ std::vector<uint64_t> Node::get_in_neighbors(std::string_view label, uint32_t pr
   size_t target_shard = store->get_routing_shard(std::string(prefix));
 
   auto chunk = store->get_prefix_keys(std::string(prefix), target_shard, std::string(prefix), engine_->get_settings().prefix_scan_limit);
-  if(1) std::fprintf(stderr, "[Node %016llx] Scanned label [%s], found %zu keys\n", (unsigned long long)id_, std::string(label).c_str(), chunk.size());
+  if(0) std::fprintf(stderr, "[Node %016llx] Scanned label [%s], found %zu keys\n", (unsigned long long)id_, std::string(label).c_str(), chunk.size());
   for (const auto &key : chunk) {
       if (key.ends_with(":meta"))
           continue;
@@ -200,7 +200,7 @@ std::vector<std::shared_ptr<Edge>> Node::get_edges(std::string_view label,
   // We need a method in l3kv::Engine that returns pairs of {key, value}
   // Let's assume get_prefix_entries exists or iterate through keys and get values.
   auto chunk = store->get_prefix_keys(std::string(prefix), target_shard, std::string(prefix), engine_->get_settings().prefix_scan_limit);
-  if(1) std::fprintf(stderr, "[Node %016llx] Scanned label [%s], found %zu keys\n", (unsigned long long)id_, std::string(label).c_str(), chunk.size());
+  if(0) std::fprintf(stderr, "[Node %016llx] Scanned label [%s], found %zu keys\n", (unsigned long long)id_, std::string(label).c_str(), chunk.size());
   for (const auto &key : chunk) {
     if (key.ends_with(":meta"))
       continue;
