@@ -30,6 +30,14 @@ template<class... Ts> overloaded(Ts...) -> overloaded<Ts...>;
 
 static bool evaluate_filter(Node* node, const Query::Filter& f, Engine* engine) {
     if (f.key == "id") {
+        if (node->has_attribute("id")) {
+            std::string s_val;
+            try { s_val = node->get_attribute_as_string("id"); } catch (...) {}
+            if (!s_val.empty()) {
+                if (f.op == Query::Op::Eq) return (s_val == f.value);
+                if (f.op == Query::Op::Ne) return (s_val != f.value);
+            }
+        }
         uint64_t target_id = engine->get_resolver().parse_uuid(f.value);
         uint64_t node_id = node->get_id();
         bool res = false;
@@ -183,7 +191,11 @@ std::vector<ResultRow> Query::execute() {
   } else {
       if (!initial_match_) return results;
       root_alias_ = initial_match_->alias;
-      if (auto* f = find_first_eq_filter(root_filters_, root_alias_, "id")) frontier_set.insert(engine_->get_resolver().parse_uuid(f->value));
+      if (auto* f = find_first_eq_filter(root_filters_, root_alias_, "id")) {
+          if (f->value.size() == 16 && std::all_of(f->value.begin(), f->value.end(), ::isxdigit)) {
+              frontier_set.insert(engine_->get_resolver().parse_uuid(f->value));
+          }
+      }
       if (frontier_set.empty()) {
         for (const auto &n : root_filters_.nodes) {
             if (auto* f = std::get_if<Filter>(&n.node)) {
