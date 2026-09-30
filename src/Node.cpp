@@ -117,6 +117,8 @@ std::vector<uint64_t> Node::get_neighbors(std::string_view label,
       for (const auto &key : chunk) {
           if (key.ends_with(":meta"))
               continue;
+          if (store->get(key).size() == 0)
+              continue;
           size_t start_brace = key.find_last_of('{');
           size_t end_brace = key.find_last_of('}');
           if (start_brace != std::string::npos && end_brace != std::string::npos && end_brace > start_brace) {
@@ -156,6 +158,8 @@ std::vector<uint64_t> Node::get_in_neighbors(std::string_view label, uint32_t pr
   if(0) std::fprintf(stderr, "[Node %016llx] Scanned label [%s], found %zu keys\n", (unsigned long long)id_, std::string(label).c_str(), chunk.size());
   for (const auto &key : chunk) {
       if (key.ends_with(":meta"))
+          continue;
+      if (store->get(key).size() == 0)
           continue;
       size_t start_brace = key.find_last_of('{');
       size_t end_brace = key.find_last_of('}');

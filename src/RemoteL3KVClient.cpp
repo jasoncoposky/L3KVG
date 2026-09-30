@@ -5,6 +5,8 @@
 #include <zmq_addon.hpp>
 #include <nlohmann/json.hpp>
 
+#include <unistd.h>
+
 #ifdef IRODS_SERVER
 #include "irods/rodsLog.h"
 #endif
@@ -12,23 +14,42 @@
 namespace l3kvg {
 
 RemoteL3KVClient::RemoteL3KVClient(const Settings& settings) 
-    : settings_(settings), zmq_sndhwm_(settings.zmq_sndhwm), zmq_ctx_(1) {
+    : settings_(settings), zmq_sndhwm_(settings.zmq_sndhwm), zmq_ctx_(1), creator_pid_(getpid()) {
     health_check_thread_ = std::thread(&RemoteL3KVClient::run_health_check_loop, this);
 }
 
 RemoteL3KVClient::~RemoteL3KVClient() {
+    if (getpid() != creator_pid_) {
+        if (health_check_thread_.joinable()) {
+            health_check_thread_.detach();
+        }
+        return;
+    }
     stop_health_check_ = true;
+    health_check_cv_.notify_all();
     if (health_check_thread_.joinable()) {
         health_check_thread_.join();
     }
 
+    // 1. Reset and join task_pool_ BEFORE closing sockets or destroying zmq_ctx_
+    task_pool_.reset();
+
+    // 2. Close all sockets with linger=0
     std::lock_guard<std::mutex> lock(endpoints_mutex_);
     for (auto& [id, session] : peer_sessions_) {
         std::lock_guard<std::recursive_mutex> s_lock(session->mu);
         if (session->socket) {
+            session->socket->set(zmq::sockopt::linger, 0);
             session->socket->close();
+            session->socket.reset();
         }
     }
+
+    // 3. Shutdown zmq_ctx_ explicitly
+    try {
+        zmq_ctx_.shutdown();
+        zmq_ctx_.close();
+    } catch (...) {}
 }
 
 void RemoteL3KVClient::add_peer(lite3::NodeID node_id, const std::string& endpoint_url) {
@@ -125,7 +146,12 @@ void RemoteL3KVClient::check_circuit(std::shared_ptr<Session> session) {
 
 void RemoteL3KVClient::run_health_check_loop() {
     while (!stop_health_check_) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(settings_.health_check_interval_ms));
+        {
+            std::unique_lock<std::mutex> lk(health_check_cv_mu_);
+            health_check_cv_.wait_for(lk, std::chrono::milliseconds(settings_.health_check_interval_ms), [this] {
+                return stop_health_check_.load();
+            });
+        }
         if (stop_health_check_) break;
 
         std::vector<lite3::NodeID> to_check;

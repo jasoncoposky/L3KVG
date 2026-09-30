@@ -238,6 +238,14 @@ void Engine::put_node(uint64_t id, std::string payload) {
   store_->del(key);
   store_->put(std::move(key), std::move(binary_payload));
   store_->wait_all_shards();
+
+  size_t h = get_cache_shard(id);
+  auto& shard = *cache_shards_[h];
+  {
+      std::lock_guard<std::mutex> lock(shard.mutex);
+      shard.map.erase(id);
+      shard.lru.remove(id);
+  }
 }
 
 void Engine::put_node(std::string_view uuid, std::string payload) {
@@ -339,6 +347,14 @@ void Engine::replicate_key(const std::string& key, std::string payload, uint16_t
         store_->del(key);
         store_->put(key, std::move(binary_payload));
         store_->wait_all_shards();
+
+        if (key.starts_with("n:{")) {
+            size_t h = get_cache_shard(id);
+            auto& shard = *cache_shards_[h];
+            std::lock_guard<std::mutex> lock(shard.mutex);
+            shard.map.erase(id);
+            shard.lru.remove(id);
+        }
     } catch (...) {
         store_->put(key, payload);
     }
@@ -381,6 +397,14 @@ void Engine::del_node(uint64_t id) {
   if (owner != resolver_.get_local_node_id()) {
     // Phase 5 Pending: Remote del_node RPC
     return;
+  }
+
+  size_t h = get_cache_shard(id);
+  auto& shard = *cache_shards_[h];
+  {
+      std::lock_guard<std::mutex> lock(shard.mutex);
+      shard.map.erase(id);
+      shard.lru.remove(id);
   }
 
   std::string key = std::string(KeyBuilder::node_key(id));

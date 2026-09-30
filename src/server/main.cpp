@@ -122,7 +122,7 @@ int main(int argc, char *argv[]) {
               auto res = zmq::recv_multipart(sock, std::back_inserter(recv_msgs));
               if (!res || recv_msgs.empty()) continue;
 
-              if(1) {
+              if(0) {
                   std::fprintf(stderr, "L3_SERVER: Received %zu frames\n", recv_msgs.size());
                   for (size_t i = 0; i < recv_msgs.size(); ++i) {
                       std::fprintf(stderr, "  Frame %zu: size=%zu, content=[%s]\n", i, recv_msgs[i].size(), (recv_msgs[i].size() < 64 ? recv_msgs[i].to_string().c_str() : "LONG"));
@@ -146,7 +146,8 @@ int main(int argc, char *argv[]) {
               if (data_idx >= recv_msgs.size()) continue;
 
               std::string opcode = recv_msgs[data_idx].to_string(); data_idx++;
-              if(1) std::fprintf(stderr, "L3_SERVER: Handling opcode [%s] from pid [%u]\n", opcode.c_str(), principal_id);
+              std::fprintf(stderr, "L3_SERVER: Handling opcode [%s] from pid [%u]\n", opcode.c_str(), principal_id);
+              std::fflush(stderr);
 
               if (opcode == "A") { // Auth
                   std::string node_id_str = recv_msgs[data_idx].to_string(); data_idx++;
@@ -197,6 +198,8 @@ int main(int argc, char *argv[]) {
                       std::vector<uint64_t> nodes = json::parse(recv_msgs[data_idx].to_string());
                       data_idx++;
                       std::string query_json = recv_msgs[data_idx].to_string();
+                      std::fprintf(stderr, "L3_SERVER: Handling opcode R: nodes=%zu, query=%s\n", nodes.size(), query_json.c_str());
+                      std::fflush(stderr);
                       auto results = engine->query().resume(nodes, query_json).execute();
                       
                       json j_res = json::array();
@@ -292,7 +295,25 @@ int main(int argc, char *argv[]) {
               } else if (opcode == "D") {
                   try {
                       std::string key = recv_msgs[data_idx].to_string();
-                      engine->get_store()->del(key);
+                      if (key.starts_with("n:{")) {
+                          size_t end_pos = key.find('}', 3);
+                          if (end_pos != std::string::npos) {
+                              uint64_t nid = std::stoull(key.substr(3, end_pos - 3), nullptr, 16);
+                              engine->del_node(nid);
+                          } else {
+                              engine->get_store()->del(key);
+                          }
+                      } else if (key.starts_with("e:out:{")) {
+                          uint64_t src = 0, dst = 0; double weight = 0; char label_buf[256] = {0};
+                          int parsed = std::sscanf(key.c_str(), "e:out:{%llx\x7d:%255[^:]:%lf:{%llx\x7d", (unsigned long long*)&src, label_buf, &weight, (unsigned long long*)&dst);
+                          if (parsed == 4) {
+                              engine->del_edge(src, label_buf, weight, dst);
+                          } else {
+                              engine->get_store()->del(key);
+                          }
+                      } else {
+                          engine->get_store()->del(key);
+                      }
                       sock.send(identity, zmq::send_flags::sndmore);
                       sock.send(zmq::message_t(), zmq::send_flags::sndmore);
                       sock.send(zmq::message_t("OK", 2), zmq::send_flags::none);

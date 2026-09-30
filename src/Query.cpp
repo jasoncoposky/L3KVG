@@ -13,13 +13,15 @@
 #include <regex>
 #include "engine/store.hpp"
 
-#ifdef IRODS_SERVER
-#include "irods/rodsLog.h"
-#define L3_LOG(level, ...) if (level >= 0) rodsLog(level, __VA_ARGS__)
-#else
 #include <cstdio>
-#define L3_LOG(level, ...) if(0) std::fprintf(stderr, "[L3KVG] " __VA_ARGS__); if(0) std::fprintf(stderr, "\n")
-#endif
+#define L3_LOG(level, ...) do { \
+    static const bool s_l3_debug = (std::getenv("L3_DEBUG") != nullptr); \
+    if (s_l3_debug) { \
+        std::fprintf(stderr, "[L3KVG] " __VA_ARGS__); \
+        std::fprintf(stderr, "\n"); \
+        std::fflush(stderr); \
+    } \
+} while(0)
 
 namespace l3kvg {
 
@@ -70,27 +72,83 @@ static bool evaluate_filter(Node* node, const Query::Filter& f, Engine* engine) 
             break;
         case Query::Op::Ne: res = (s_val != f.value); break;
         case Query::Op::Gt: {
-            if (type == lite3cpp::Type::Int64) { try { res = (std::stoll(s_val) > std::stoll(f.value)); } catch(...) { res = false; } }
-            else if (type == lite3cpp::Type::Float64) { try { res = (std::stod(s_val) > std::stod(f.value)); } catch(...) { res = false; } }
-            else res = (s_val > f.value);
+            bool compared = false;
+            try {
+                size_t p1 = 0, p2 = 0;
+                long long v1 = std::stoll(s_val, &p1);
+                long long v2 = std::stoll(f.value, &p2);
+                if (p1 == s_val.size() && p2 == f.value.size()) {
+                    res = (v1 > v2);
+                    compared = true;
+                }
+            } catch (...) {}
+            if (!compared) {
+                if (type == lite3cpp::Type::Float64) { try { res = (std::stod(s_val) > std::stod(f.value)); } catch(...) { res = false; } }
+                else res = (s_val > f.value);
+            }
+            #ifdef IRODS_SERVER
+            rodsLog(LOG_NOTICE, "[Filter] %s.%s: '%s' > '%s' ? %s", f.alias.c_str(), f.key.c_str(), s_val.c_str(), f.value.c_str(), res ? "YES" : "NO");
+            #endif
             break;
         }
         case Query::Op::Ge: {
-            if (type == lite3cpp::Type::Int64) { try { res = (std::stoll(s_val) >= std::stoll(f.value)); } catch(...) { res = false; } }
-            else if (type == lite3cpp::Type::Float64) { try { res = (std::stod(s_val) >= std::stod(f.value)); } catch(...) { res = false; } }
-            else res = (s_val >= f.value);
+            bool compared = false;
+            try {
+                size_t p1 = 0, p2 = 0;
+                long long v1 = std::stoll(s_val, &p1);
+                long long v2 = std::stoll(f.value, &p2);
+                if (p1 == s_val.size() && p2 == f.value.size()) {
+                    res = (v1 >= v2);
+                    compared = true;
+                }
+            } catch (...) {}
+            if (!compared) {
+                if (type == lite3cpp::Type::Float64) { try { res = (std::stod(s_val) >= std::stod(f.value)); } catch(...) { res = false; } }
+                else res = (s_val >= f.value);
+            }
+            #ifdef IRODS_SERVER
+            rodsLog(LOG_NOTICE, "[Filter] %s.%s: '%s' >= '%s' ? %s", f.alias.c_str(), f.key.c_str(), s_val.c_str(), f.value.c_str(), res ? "YES" : "NO");
+            #endif
             break;
         }
         case Query::Op::Lt: {
-            if (type == lite3cpp::Type::Int64) { try { res = (std::stoll(s_val) < std::stoll(f.value)); } catch(...) { res = false; } }
-            else if (type == lite3cpp::Type::Float64) { try { res = (std::stod(s_val) < std::stod(f.value)); } catch(...) { res = false; } }
-            else res = (s_val < f.value);
+            bool compared = false;
+            try {
+                size_t p1 = 0, p2 = 0;
+                long long v1 = std::stoll(s_val, &p1);
+                long long v2 = std::stoll(f.value, &p2);
+                if (p1 == s_val.size() && p2 == f.value.size()) {
+                    res = (v1 < v2);
+                    compared = true;
+                }
+            } catch (...) {}
+            if (!compared) {
+                if (type == lite3cpp::Type::Float64) { try { res = (std::stod(s_val) < std::stod(f.value)); } catch(...) { res = false; } }
+                else res = (s_val < f.value);
+            }
+            #ifdef IRODS_SERVER
+            rodsLog(LOG_NOTICE, "[Filter] %s.%s: '%s' < '%s' ? %s", f.alias.c_str(), f.key.c_str(), s_val.c_str(), f.value.c_str(), res ? "YES" : "NO");
+            #endif
             break;
         }
         case Query::Op::Le: {
-            if (type == lite3cpp::Type::Int64) { try { res = (std::stoll(s_val) <= std::stoll(f.value)); } catch(...) { res = false; } }
-            else if (type == lite3cpp::Type::Float64) { try { res = (std::stod(s_val) <= std::stod(f.value)); } catch(...) { res = false; } }
-            else res = (s_val <= f.value);
+            bool compared = false;
+            try {
+                size_t p1 = 0, p2 = 0;
+                long long v1 = std::stoll(s_val, &p1);
+                long long v2 = std::stoll(f.value, &p2);
+                if (p1 == s_val.size() && p2 == f.value.size()) {
+                    res = (v1 <= v2);
+                    compared = true;
+                }
+            } catch (...) {}
+            if (!compared) {
+                if (type == lite3cpp::Type::Float64) { try { res = (std::stod(s_val) <= std::stod(f.value)); } catch(...) { res = false; } }
+                else res = (s_val <= f.value);
+            }
+            #ifdef IRODS_SERVER
+            rodsLog(LOG_NOTICE, "[Filter] %s.%s: '%s' <= '%s' ? %s", f.alias.c_str(), f.key.c_str(), s_val.c_str(), f.value.c_str(), res ? "YES" : "NO");
+            #endif
             break;
         }
         case Query::Op::Like: {
@@ -186,12 +244,15 @@ std::string Query::serialize_steps(const std::vector<Step>& steps) {
 
 std::vector<ResultRow> Query::execute() {
   std::vector<ResultRow> results; std::set<uint64_t> frontier_set;
+  L3_LOG(0, "Query::execute() ENTER: starting_nodes=%zu, root_filters=%zu, steps=%zu", starting_nodes_.size(), root_filters_.nodes.size(), steps_.size());
   if (!starting_nodes_.empty()) {
       for(auto id : starting_nodes_) frontier_set.insert(id);
   } else {
       if (!initial_match_) return results;
       root_alias_ = initial_match_->alias;
+      bool had_eq_filter = false;
       if (auto* f = find_first_eq_filter(root_filters_, root_alias_, "id")) {
+          had_eq_filter = true;
           if (f->value.size() == 16 && std::all_of(f->value.begin(), f->value.end(), ::isxdigit)) {
               frontier_set.insert(engine_->get_resolver().parse_uuid(f->value));
           }
@@ -200,6 +261,9 @@ std::vector<ResultRow> Query::execute() {
         for (const auto &n : root_filters_.nodes) {
             if (auto* f = std::get_if<Filter>(&n.node)) {
                 if (f->alias == root_alias_ && f->op == Op::Eq) {
+                    if (f->key == "n" || f->key == "path" || f->key == "id") {
+                        had_eq_filter = true;
+                    }
                     std::string idx_prefix = "idx:" + f->alias + ":" + f->key + ":" + f->value;
                     auto idx_keys = engine_->get_store()->get_prefix_keys_all_shards(idx_prefix, "", 100);
                     if (!idx_keys.empty()) {
@@ -216,19 +280,37 @@ std::vector<ResultRow> Query::execute() {
         }
       }
       if (frontier_set.empty()) {
-        std::string store_prefix = "n:{"; 
-        auto keys = engine_->get_store()->get_prefix_keys_all_shards(store_prefix, "", engine_->get_settings().prefix_scan_limit);
-        for (const auto& k : keys) {
-            if (k.starts_with("n:{") && !k.ends_with(":meta")) {
-                size_t end_pos = k.find('}', 3);
-                if (end_pos != std::string::npos) {
-                    try { frontier_set.insert(std::stoull(k.substr(3, end_pos - 3), nullptr, 16)); } catch(...) {}
+        if (had_eq_filter) {
+            return results;
+        }
+        if (!root_alias_.empty()) {
+            std::string idx_n_prefix = "idx:" + root_alias_ + ":n:";
+            auto idx_keys = engine_->get_store()->get_prefix_keys_all_shards(idx_n_prefix, "", 10000);
+            for (const auto& k : idx_keys) {
+                auto idx_buf = engine_->get_store()->get(k);
+                if (idx_buf.size() > 0) {
+                    std::string id_str(reinterpret_cast<const char*>(idx_buf.data()), idx_buf.size());
+                    try { frontier_set.insert(std::stoull(id_str, nullptr, 16)); } catch(...) {}
+                }
+            }
+        }
+        if (frontier_set.empty()) {
+            std::string store_prefix = "n:{"; 
+            auto keys = engine_->get_store()->get_prefix_keys_all_shards(store_prefix, "", engine_->get_settings().prefix_scan_limit);
+            L3_LOG(0, "Query::execute() store_prefix scan returned keys=%zu", keys.size());
+            for (const auto& k : keys) {
+                if (k.starts_with("n:{") && !k.ends_with(":meta")) {
+                    size_t end_pos = k.find('}', 3);
+                    if (end_pos != std::string::npos) {
+                        try { frontier_set.insert(std::stoull(k.substr(3, end_pos - 3), nullptr, 16)); } catch(...) {}
+                    }
                 }
             }
         }
       }
   }
 
+  L3_LOG(0, "Query::execute() root_alias=%s, frontier_set.size=%zu", root_alias_.c_str(), frontier_set.size());
   if (frontier_set.empty()) return results;
 
   std::vector<uint64_t> frontier(frontier_set.begin(), frontier_set.end());
@@ -236,16 +318,22 @@ std::vector<ResultRow> Query::execute() {
       std::vector<uint64_t> filtered;
       auto nodes = engine_->fetch_nodes(frontier, principal_id_);
       for (auto& node : nodes) {
+          L3_LOG(0, "Query::execute() checking node %016llx: ptr=%d, loaded=%d", 
+                 (unsigned long long)(node ? node->get_id() : 0), (node != nullptr), (node && node->is_loaded()));
           if (!node || !node->is_loaded()) continue;
           std::string key = std::string(KeyBuilder::node_key(node->get_id()));
           auto perm = engine_->get_store()->credentials().check_permission(principal_id_, key);
+          L3_LOG(0, "Query::execute() node %016llx: perm=0x%x, principal=%u", (unsigned long long)node->get_id(), (unsigned int)perm, principal_id_);
           if (!(perm & l3kv::Permission::READ) && !(perm & l3kv::Permission::ADMIN)) continue;
           std::unordered_map<std::string, std::shared_ptr<Node>> available; available[root_alias_] = node;
-          if (evaluate_group(root_filters_, available, root_alias_, engine_)) filtered.push_back(node->get_id());
+          bool eval_res = evaluate_group(root_filters_, available, root_alias_, engine_);
+          L3_LOG(0, "Query::execute() evaluate_group result=%d", eval_res);
+          if (eval_res) filtered.push_back(node->get_id());
       }
       frontier = std::move(filtered);
   }
 
+  L3_LOG(0, "Query::execute() filtered frontier count=%zu", frontier.size());
   if (frontier.empty()) return results;
   
   struct Path { std::unordered_map<std::string, std::shared_ptr<Node>> alias_to_node; std::string last_alias; };
@@ -255,15 +343,19 @@ std::vector<ResultRow> Query::execute() {
       if (!node) continue;
       std::string actual_type;
       try { actual_type = node->get_attribute_as_string("t"); } catch (...) { actual_type = ""; }
+      if (root_alias_ == "Resource" && (actual_type == "unixfilesystem" || actual_type == "resource" || actual_type.empty())) {
+          L3_LOG(0, "Query::execute() checking candidate %016llx: loaded=%d, type='%s'", (unsigned long long)id, node->is_loaded(), actual_type.c_str());
+      }
       bool type_match = false;
       if (root_alias_ == "Zone") type_match = (actual_type == "zone" || actual_type == "local" || actual_type == "remote");
       else if (root_alias_ == "User") type_match = (actual_type == "user" || actual_type == "rodsuser" || actual_type == "rodsadmin" || actual_type == "groupadmin" || actual_type == "rodsgroup");
-      else if (root_alias_ == "Collection") type_match = (actual_type == "collection" || actual_type == "local" || actual_type == "federated" || actual_type == "");
+      else if (root_alias_ == "Collection") type_match = (actual_type != "data_object" && actual_type != "generic" && actual_type != "replica" && actual_type != "resource" && actual_type != "unixfilesystem" && actual_type != "s3" && actual_type != "user" && actual_type != "rodsuser" && actual_type != "rodsadmin" && actual_type != "groupadmin" && actual_type != "rodsgroup" && actual_type != "zone" && actual_type != "remote" && actual_type != "metadata" && actual_type != "access" && actual_type != "rule");
       else if (root_alias_ == "DataObject") type_match = (actual_type == "data_object" || actual_type == "generic");
       else if (root_alias_ == "Replica") type_match = (actual_type == "replica");
       else if (root_alias_ == "Resource") type_match = (actual_type == "resource" || actual_type == "unixfilesystem" || actual_type == "s3");
       else if (root_alias_ == "Metadata") type_match = (actual_type == "metadata");
       else if (root_alias_ == "Access") type_match = (actual_type == "access");
+      else if (root_alias_ == "Rule") type_match = (actual_type == "rule");
       else type_match = true; // Generic alias, allow any type
       
 
@@ -271,6 +363,8 @@ std::vector<ResultRow> Query::execute() {
       if (!type_match) continue;
       Path p; p.alias_to_node[root_alias_] = node; p.last_alias = root_alias_; paths.push_back(std::move(p));
   }
+
+  L3_LOG(0, "Query::execute() initial paths count=%zu", paths.size());
 
   std::unordered_map<uint16_t, std::vector<std::pair<uint64_t, std::pair<std::string, std::vector<Step>>>>> suspended_branches;
 
@@ -488,7 +582,37 @@ std::vector<ResultRow> Query::execute() {
   }
   if (offset_) { if (*offset_ >= results.size()) results.clear(); else results.erase(results.begin(), results.begin() + *offset_); }
   if (limit_ && results.size() > *limit_) results.resize(*limit_);
+  L3_LOG(0, "Query::execute() returning results.size=%zu", results.size());
   return results;
+}
+
+static void parse_filter_nodes(const json& filters_json, Query::FilterGroup& group) {
+    for (const auto& fj : filters_json) {
+        if (fj.contains("group")) {
+            auto cb = [&](Query::FilterGroup& sub) {
+                if (fj.contains("filters")) {
+                    parse_filter_nodes(fj["filters"], sub);
+                }
+            };
+            std::string grp_prep = fj.value("prepended_op", "and");
+            if (grp_prep == "or") {
+                group.or_where_group(cb);
+            } else {
+                group.where_group(cb);
+            }
+        } else if (fj.contains("alias") && fj.contains("key") && fj.contains("op") && fj.contains("value")) {
+            std::string alias = fj["alias"].get<std::string>();
+            std::string key = fj["key"].get<std::string>();
+            auto op = static_cast<Query::Op>(fj["op"].get<int>());
+            std::string val = fj["value"].get<std::string>();
+            std::string prep = fj.value("prepended_op", "and");
+            if (prep == "or") {
+                group.or_where(alias, key, op, val);
+            } else {
+                group.where(alias, key, op, val);
+            }
+        }
+    }
 }
 
 Query &Query::resume(const std::vector<uint64_t>& starting_nodes, std::string_view query_json) {
@@ -508,8 +632,17 @@ Query &Query::resume(const std::vector<uint64_t>& starting_nodes, std::string_vi
         if (j.contains("projections")) {
             for (const auto& pj : j["projections"]) projections_.push_back(ReturnStep{pj["alias"], pj["property"], static_cast<AggOp>(pj["agg"])});
         }
+        if (j.contains("limit")) {
+            limit_ = j["limit"].get<size_t>();
+        }
+        if (j.contains("offset")) {
+            offset_ = j["offset"].get<size_t>();
+        }
+        if (j.contains("distinct")) {
+            distinct_ = j["distinct"].get<bool>();
+        }
         if (j.contains("filters")) {
-            for (const auto& fj : j["filters"]) root_filters_.where(fj["alias"].get<std::string>(), fj["key"].get<std::string>(), static_cast<Op>(fj["op"].get<int>()), fj["value"].get<std::string>());
+            parse_filter_nodes(j["filters"], root_filters_);
         }
     } catch (...) {}
     return *this;

@@ -5,6 +5,7 @@
 #include <future>
 #include <unordered_map>
 #include <mutex>
+#include <condition_variable>
 #include <memory>
 #include <zmq.hpp>
 #include <lite3/ring.hpp>
@@ -167,13 +168,15 @@ private:
     std::unordered_map<lite3::NodeID, std::string> peer_endpoints_;
     std::unordered_map<lite3::NodeID, std::shared_ptr<Session>> peer_sessions_;
     std::mutex endpoints_mutex_;
-    std::shared_ptr<ThreadPool> task_pool_;
-    
     int zmq_sndhwm_;
     zmq::context_t zmq_ctx_;
+    std::shared_ptr<ThreadPool> task_pool_;
 
     std::atomic<bool> stop_health_check_{false};
+    std::mutex health_check_cv_mu_;
+    std::condition_variable health_check_cv_;
     std::thread health_check_thread_;
+    pid_t creator_pid_{0};
 };
 
 
