@@ -146,8 +146,11 @@ int main(int argc, char *argv[]) {
               if (data_idx >= recv_msgs.size()) continue;
 
               std::string opcode = recv_msgs[data_idx].to_string(); data_idx++;
-              std::fprintf(stderr, "L3_SERVER: Handling opcode [%s] from pid [%u]\n", opcode.c_str(), principal_id);
-              std::fflush(stderr);
+              static const bool s_server_debug = (std::getenv("L3_SERVER_DEBUG") != nullptr);
+              if (s_server_debug) {
+                  std::fprintf(stderr, "L3_SERVER: Handling opcode [%s] from pid [%u]\n", opcode.c_str(), principal_id);
+                  std::fflush(stderr);
+              }
 
               if (opcode == "A") { // Auth
                   std::string node_id_str = recv_msgs[data_idx].to_string(); data_idx++;
@@ -198,9 +201,12 @@ int main(int argc, char *argv[]) {
                       std::vector<uint64_t> nodes = json::parse(recv_msgs[data_idx].to_string());
                       data_idx++;
                       std::string query_json = recv_msgs[data_idx].to_string();
-                      std::fprintf(stderr, "L3_SERVER: Handling opcode R: nodes=%zu, query=%s\n", nodes.size(), query_json.c_str());
-                      std::fflush(stderr);
-                      auto results = engine->query().resume(nodes, query_json).execute();
+                      if (s_server_debug) {
+                          std::fprintf(stderr, "L3_SERVER: Handling opcode R: nodes=%zu, query=%s\n", nodes.size(), query_json.c_str());
+                          std::fflush(stderr);
+                      }
+                      uint32_t eff_principal = (principal_id != 0) ? principal_id : l3kvg::INTERNAL_UID;
+                      auto results = engine->query().set_principal_id(eff_principal).resume(nodes, query_json).execute();
                       
                       json j_res = json::array();
                       for (const auto& row : results) {
@@ -229,6 +235,10 @@ int main(int argc, char *argv[]) {
                       std::string key = recv_msgs[data_idx].to_string(); data_idx++;
                       std::string payload = recv_msgs[data_idx].to_string();
                       
+                      static const bool s_l3_debug = (std::getenv("L3_DEBUG") != nullptr);
+                      if (s_l3_debug) {
+                          std::fprintf(stderr, "[L3_SERVER] Opcode P: key=%s val_len=%zu\n", key.c_str(), payload.size());
+                      }
 
                       if (key.starts_with("e:out:{")) {
                           uint64_t src = 0, dst = 0; double weight = 0; char label_buf[256] = {0};
@@ -336,6 +346,12 @@ int main(int argc, char *argv[]) {
                       std::vector<uint64_t> neighs;
                       if (node) neighs = node->get_neighbors(label, min_weight, principal_id);
                       
+                      static const bool s_l3_debug = (std::getenv("L3_DEBUG") != nullptr);
+                      if (s_l3_debug) {
+                          std::fprintf(stderr, "[L3_SERVER] Opcode N: id=%016llx label=%s min_w=%f -> count=%zu\n",
+                                       (unsigned long long)target_node_id, label.c_str(), min_weight, neighs.size());
+                      }
+
                       json j_res = neighs;
                       std::string resp_json = j_res.dump();
                       sock.send(identity, zmq::send_flags::sndmore);
@@ -358,6 +374,12 @@ int main(int argc, char *argv[]) {
                       std::vector<uint64_t> neighs;
                       if (node) neighs = node->get_in_neighbors(label, principal_id);
                       
+                      static const bool s_l3_debug = (std::getenv("L3_DEBUG") != nullptr);
+                      if (s_l3_debug) {
+                          std::fprintf(stderr, "[L3_SERVER] Opcode I: id=%016llx label=%s -> count=%zu\n",
+                                       (unsigned long long)target_node_id, label.c_str(), neighs.size());
+                      }
+
                       json j_res = neighs;
                       std::string resp_json = j_res.dump();
                       sock.send(identity, zmq::send_flags::sndmore);

@@ -51,24 +51,113 @@ static bool evaluate_filter(Node* node, const Query::Filter& f, Engine* engine) 
         return res;
     }
 
-    if (f.key == "pn") {
+    if (f.key == "_access_user") {
+        std::string user_name = f.value;
+        if (user_name.empty()) return true;
+
+        // 1. Check if node is owned by the user
+        std::string owner;
+        try { owner = node->get_attribute_as_string("o"); } catch (...) {}
+        if (!owner.empty() && owner == user_name) return true;
+
+        // 2. Check system root collections accessible to all users
+        std::string p;
+        try { p = node->get_attribute_as_string("p"); } catch (...) {}
+        if (p.empty()) try { p = node->get_attribute_as_string("n"); } catch (...) {}
+        bool is_system_root = (p == "/");
+        if (!is_system_root && !p.empty() && p[0] == '/') {
+            size_t second_slash = p.find('/', 1);
+            if (second_slash == std::string::npos) {
+                is_system_root = true;
+            } else {
+                std::string_view sub(p.data() + second_slash, p.size() - second_slash);
+                if (sub == "/home" || sub == "/trash" || sub == "/trash/home" ||
+                    sub == "/home/public" || sub == "/trash/home/public") {
+                    is_system_root = true;
+                }
+            }
+        }
+        if (is_system_root) {
+            return true;
+        }
+
+        static auto perm_rank = [](std::string_view lvl) -> int {
+            if (lvl.starts_with("admin:")) lvl = lvl.substr(6);
+            if (lvl == "null") return 1000;
+            if (lvl == "execute") return 1010;
+            if (lvl == "read_annotation") return 1020;
+            if (lvl == "read_system_metadata") return 1030;
+            if (lvl == "read_metadata") return 1040;
+            if (lvl == "read_object" || lvl == "read") return 1050;
+            if (lvl == "write_annotation") return 1060;
+            if (lvl == "create_metadata") return 1070;
+            if (lvl == "modify_metadata") return 1080;
+            if (lvl == "delete_metadata") return 1090;
+            if (lvl == "administer_object") return 1100;
+            if (lvl == "create_object") return 1110;
+            if (lvl == "modify_object" || lvl == "write") return 1120;
+            if (lvl == "delete_object" || lvl == "delete") return 1130;
+            if (lvl == "create_token") return 1140;
+            if (lvl == "delete_token") return 1150;
+            if (lvl == "curate") return 1160;
+            if (lvl == "own") return 1200;
+            return 0;
+        };
+
+        auto access_nodes = node->get_in_neighbors("FOR_OBJECT", INTERNAL_UID);
+        for (auto aid : access_nodes) {
+            auto a_node = engine->get_node(aid);
+            if (!a_node) continue;
+            a_node->ensure_loaded();
+            if (!a_node->is_loaded()) continue;
+            std::string level;
+            try { level = a_node->get_attribute_as_string("l"); } catch (...) {}
+            if (perm_rank(level) < 1050) continue;
+            
+            auto user_nodes = a_node->get_in_neighbors("HAS_ACCESS", INTERNAL_UID);
+            for (auto uid : user_nodes) {
+                auto u_node = engine->get_node(uid);
+                if (!u_node) continue;
+                u_node->ensure_loaded();
+                if (!u_node->is_loaded()) continue;
+                std::string un;
+                try { un = u_node->get_attribute_as_string("n"); } catch (...) {}
+                if (un == user_name || un == "public") return true;
+                auto mem_nodes = u_node->get_in_neighbors("MEMBER_OF", INTERNAL_UID);
+                for (auto m_uid : mem_nodes) {
+                    auto m_node = engine->get_node(m_uid);
+                    if (m_node) {
+                        m_node->ensure_loaded();
+                        if (m_node->is_loaded()) {
+                            std::string mn;
+                            try { mn = m_node->get_attribute_as_string("n"); } catch (...) {}
+                            if (mn == user_name) return true;
+                        }
+                    }
+                }
+            }
+        }
+        return false;
     }
 
-    if (!node->has_attribute(f.key)) return false;
+    L3_LOG(0, "evaluate_filter() key=%s, val=%s, op=%d", f.key.c_str(), f.value.c_str(), (int)f.op);
+    if (!node->has_attribute(f.key)) {
+        L3_LOG(0, "evaluate_filter() node %016llx does NOT have attribute '%s'", (unsigned long long)node->get_id(), f.key.c_str());
+        return false;
+    }
 
     std::string s_val;
-    try { s_val = node->get_attribute_as_string(f.key); } catch (...) { return false; }
+    try { s_val = node->get_attribute_as_string(f.key); } catch (...) { 
+        L3_LOG(0, "evaluate_filter() node %016llx failed to get attribute '%s' as string", (unsigned long long)node->get_id(), f.key.c_str());
+        return false; 
+    }
 
     bool res = false;
     auto type = node->get_attribute_type(f.key);
     switch (f.op) {
         case Query::Op::Eq: 
             res = (s_val == f.value); 
-            #ifdef IRODS_SERVER
-            rodsLog(LOG_NOTICE, "[Filter] %s.%s: '%s' == '%s' ? %s", f.alias.c_str(), f.key.c_str(), s_val.c_str(), f.value.c_str(), res ? "YES" : "NO");
-#else
-            if(0) std::fprintf(stderr, "    [Filter] %s.%s: '%s' == '%s' ? %s\n", f.alias.c_str(), f.key.c_str(), s_val.c_str(), f.value.c_str(), res ? "YES" : "NO");
-#endif
+            L3_LOG(0, "evaluate_filter() [Filter] %s.%s: '%s' == '%s' ? %s", f.alias.c_str(), f.key.c_str(), s_val.c_str(), f.value.c_str(), res ? "YES" : "NO");
             break;
         case Query::Op::Ne: res = (s_val != f.value); break;
         case Query::Op::Gt: {
@@ -163,27 +252,77 @@ static bool evaluate_filter(Node* node, const Query::Filter& f, Engine* engine) 
             try { std::regex re(regex_str, std::regex_constants::icase); res = std::regex_match(s_val, re); } catch (...) { res = false; }
             break;
         }
+        case Query::Op::NotLike: {
+            std::string regex_str = "^";
+            for (char c : f.value) {
+                if (c == '%') regex_str += ".*";
+                else if (c == '_') regex_str += ".";
+                else if (c == '.' || c == '*' || c == '+' || c == '?' || c == '(' || c == ')' || c == '[' || c == ']' || c == '{' || c == '}' || c == '|') { regex_str += "\\"; regex_str += c; }
+                else regex_str += c;
+            }
+            regex_str += "$";
+            try { std::regex re(regex_str, std::regex_constants::icase); res = !std::regex_match(s_val, re); } catch (...) { res = true; }
+            break;
+        }
         default: res = false;
     }
     return res;
 }
 
-static bool evaluate_group(const Query::FilterGroup& g, const std::unordered_map<std::string, std::shared_ptr<Node>>& available_nodes, std::string_view current_alias, Engine* engine) {
-    if (g.nodes.empty()) return true;
-    bool result = true;
+enum class TriBool {
+    False = 0,
+    True = 1,
+    Unknown = 2
+};
+
+inline TriBool tb_and(TriBool a, TriBool b) {
+    if (a == TriBool::False || b == TriBool::False) return TriBool::False;
+    if (a == TriBool::True && b == TriBool::True) return TriBool::True;
+    return TriBool::Unknown;
+}
+
+inline TriBool tb_or(TriBool a, TriBool b) {
+    if (a == TriBool::True || b == TriBool::True) return TriBool::True;
+    if (a == TriBool::False && b == TriBool::False) return TriBool::False;
+    return TriBool::Unknown;
+}
+
+inline TriBool tb_not(TriBool a) {
+    if (a == TriBool::True) return TriBool::False;
+    if (a == TriBool::False) return TriBool::True;
+    return TriBool::Unknown;
+}
+
+static TriBool evaluate_group_tribool(const Query::FilterGroup& g, const std::unordered_map<std::string, std::shared_ptr<Node>>& available_nodes, std::string_view current_alias, Engine* engine) {
+    if (g.nodes.empty()) return TriBool::True;
+    TriBool result = TriBool::True;
+    bool is_first = true;
     for (const auto& n : g.nodes) {
-        bool val = std::visit(overloaded{
-            [&](const Query::Filter& f) {
+        TriBool val = std::visit(overloaded{
+            [&](const Query::Filter& f) -> TriBool {
                 auto it = available_nodes.find(f.alias);
-                if (it != available_nodes.end()) return evaluate_filter(it->second.get(), f, engine);
-                return true; 
+                if (it != available_nodes.end()) return evaluate_filter(it->second.get(), f, engine) ? TriBool::True : TriBool::False;
+                return TriBool::Unknown; 
             },
-            [&](const std::shared_ptr<Query::FilterGroup>& sub) { return evaluate_group(*sub, available_nodes, current_alias, engine); }
+            [&](const std::shared_ptr<Query::FilterGroup>& sub) -> TriBool { return evaluate_group_tribool(*sub, available_nodes, current_alias, engine); }
         }, n.node);
-        if (n.prepended_op == Query::LogicalOp::And) { if (&n == &g.nodes.front()) result = val; else result = result && val; }
-        else result = result || val;
+        if (is_first) {
+            result = val;
+            is_first = false;
+        } else {
+            if (n.prepended_op == Query::LogicalOp::Or) {
+                result = tb_or(result, val);
+            } else {
+                result = tb_and(result, val);
+            }
+        }
     }
     return result;
+}
+
+static bool evaluate_group(const Query::FilterGroup& g, const std::unordered_map<std::string, std::shared_ptr<Node>>& available_nodes, std::string_view current_alias, Engine* engine) {
+    TriBool res = evaluate_group_tribool(g, available_nodes, current_alias, engine);
+    return res != TriBool::False;
 }
 
 Query::FilterGroup& Query::FilterGroup::where(std::string_view alias, std::string_view key, Op op, std::string_view value) { nodes.push_back({Filter{std::string(alias), std::string(key), op, std::string(value)}, LogicalOp::And}); return *this; }
@@ -212,7 +351,30 @@ Query& Query::InEdgeBuilder::as(std::string_view dest_alias) {
     q_.current_source_alias_.clear();
     return q_; 
 }
-Query& Query::return_(std::string_view alias, std::string_view property, AggOp agg) { projections_.push_back(ReturnStep{std::string(alias), std::string(property), agg}); return *this; }
+Query& Query::return_(std::string_view alias, std::string_view property, AggOp agg, bool distinct) { 
+    projections_.push_back(ReturnStep{std::string(alias), std::string(property), agg, distinct}); 
+    return *this; 
+}
+Query& Query::group_by(std::string_view alias, std::string_view property, std::string_view func_name, const std::vector<std::string>& func_args) {
+    groups_.push_back(GroupStep{std::string(alias), std::string(property), std::string(func_name), func_args});
+    return *this;
+}
+Query& Query::distinct(bool enable) {
+    distinct_ = enable;
+    return *this;
+}
+
+static bool has_or_or_like_filter(const Query::FilterGroup& g) {
+    for (const auto& n : g.nodes) {
+        if (n.prepended_op == Query::LogicalOp::Or) return true;
+        if (auto* f = std::get_if<Query::Filter>(&n.node)) {
+            if (f->op == Query::Op::Like || f->op == Query::Op::NotLike || f->op == Query::Op::Ne) return true;
+        } else if (auto* sub = std::get_if<std::shared_ptr<Query::FilterGroup>>(&n.node)) {
+            if (has_or_or_like_filter(**sub)) return true;
+        }
+    }
+    return false;
+}
 
 static const Query::Filter* find_first_eq_filter(const Query::FilterGroup& g, std::string_view alias, std::string_view key = "") {
     for (const auto& n : g.nodes) {
@@ -242,6 +404,37 @@ std::string Query::serialize_steps(const std::vector<Step>& steps) {
     ss << "]"; return ss.str();
 }
 
+static bool is_entity_type_match(std::string_view alias, std::string_view et, std::string_view actual_type, bool has_v) {
+    if (!et.empty()) {
+        if (alias == "DataObject") return (et == "data_object" || et == "generic");
+        if (alias == "Collection" || alias == "ParentCollection") return (et == "collection");
+        if (alias == "Resource" || alias == "ChildResource" || alias == "ParentResource") return (et == "resource" || et == "unixfilesystem" || et == "passthru" || et == "replication" || et == "compound" || et == "load_balanced" || et == "random" || et == "deferred" || et == "structfile" || et == "s3" || et == "mockarchive");
+        if (alias == "User") return (et == "user" || et == "group" || et == "rodsuser" || et == "rodsadmin" || et == "groupadmin" || et == "rodsgroup");
+        if (alias == "Group") return (et == "group" || et == "rodsgroup" || et == "user");
+        if (alias == "Zone") return (et == "zone" || et == "local" || et == "remote");
+        if (alias == "Replica") return (et == "replica");
+        if (alias == "Metadata") return (et == "metadata");
+        if (alias == "Access" || alias == "CollAccess") return (et == "access" || et == "access_type");
+        if (alias == "Rule") return (et == "rule");
+        if (alias == "Ticket") return (et == "ticket");
+        if (strcasecmp(std::string(alias).c_str(), std::string(et).c_str()) == 0) return true;
+        return false;
+    }
+    // Fallback when entity_type is empty
+    if (alias == "Zone") return (actual_type == "zone" || actual_type == "local" || actual_type == "remote");
+    if (alias == "User") return (actual_type == "user" || actual_type == "rodsuser" || actual_type == "rodsadmin" || actual_type == "groupadmin" || actual_type == "rodsgroup");
+    if (alias == "Group") return (actual_type == "rodsgroup" || actual_type == "group" || actual_type == "rodsuser" || actual_type == "rodsadmin" || actual_type == "groupadmin" || actual_type == "user");
+    if (alias == "Collection" || alias == "ParentCollection") return (!has_v && actual_type != "data_object" && actual_type != "generic" && actual_type != "replica" && actual_type != "resource" && actual_type != "unixfilesystem" && actual_type != "passthru" && actual_type != "replication" && actual_type != "compound" && actual_type != "load_balanced" && actual_type != "random" && actual_type != "deferred" && actual_type != "structfile" && actual_type != "s3" && actual_type != "mockarchive" && actual_type != "user" && actual_type != "rodsuser" && actual_type != "rodsadmin" && actual_type != "groupadmin" && actual_type != "rodsgroup" && actual_type != "zone" && actual_type != "local" && actual_type != "remote" && actual_type != "metadata" && actual_type != "access" && actual_type != "access_type" && actual_type != "rule" && actual_type != "ticket");
+    if (alias == "DataObject") return (actual_type == "data_object" || actual_type == "generic");
+    if (alias == "Replica") return (actual_type == "replica");
+    if (alias == "Resource" || alias == "ChildResource" || alias == "ParentResource") return (actual_type == "resource" || actual_type == "unixfilesystem" || actual_type == "passthru" || actual_type == "replication" || actual_type == "compound" || actual_type == "load_balanced" || actual_type == "random" || actual_type == "deferred" || actual_type == "structfile" || actual_type == "s3" || actual_type == "mockarchive");
+    if (alias == "Metadata") return (actual_type == "metadata");
+    if (alias == "Access" || alias == "CollAccess") return (actual_type == "access" || actual_type == "access_type");
+    if (alias == "Rule") return (actual_type == "rule");
+    if (alias == "Ticket") return (actual_type == "ticket");
+    return true;
+}
+
 std::vector<ResultRow> Query::execute() {
   std::vector<ResultRow> results; std::set<uint64_t> frontier_set;
   L3_LOG(0, "Query::execute() ENTER: starting_nodes=%zu, root_filters=%zu, steps=%zu", starting_nodes_.size(), root_filters_.nodes.size(), steps_.size());
@@ -250,42 +443,53 @@ std::vector<ResultRow> Query::execute() {
   } else {
       if (!initial_match_) return results;
       root_alias_ = initial_match_->alias;
+      bool has_complex = has_or_or_like_filter(root_filters_);
       bool had_eq_filter = false;
-      if (auto* f = find_first_eq_filter(root_filters_, root_alias_, "id")) {
-          had_eq_filter = true;
-          if (f->value.size() == 16 && std::all_of(f->value.begin(), f->value.end(), ::isxdigit)) {
-              frontier_set.insert(engine_->get_resolver().parse_uuid(f->value));
+      if (!has_complex) {
+          if (auto* f = find_first_eq_filter(root_filters_, root_alias_, "id")) {
+              had_eq_filter = true;
+              if (f->value.size() == 16 && std::all_of(f->value.begin(), f->value.end(), ::isxdigit)) {
+                  frontier_set.insert(engine_->get_resolver().parse_uuid(f->value));
+              }
           }
-      }
-      if (frontier_set.empty()) {
-        for (const auto &n : root_filters_.nodes) {
-            if (auto* f = std::get_if<Filter>(&n.node)) {
-                if (f->alias == root_alias_ && f->op == Op::Eq) {
-                    if (f->key == "n" || f->key == "path" || f->key == "id") {
-                        had_eq_filter = true;
-                    }
-                    std::string idx_prefix = "idx:" + f->alias + ":" + f->key + ":" + f->value;
-                    auto idx_keys = engine_->get_store()->get_prefix_keys_all_shards(idx_prefix, "", 100);
-                    if (!idx_keys.empty()) {
-                        for (const auto& k : idx_keys) {
-                            auto idx_buf = engine_->get_store()->get(k);
-                            if (idx_buf.size() > 0) {
-                                std::string id_str(reinterpret_cast<const char*>(idx_buf.data()), idx_buf.size());
-                                try { frontier_set.insert(std::stoull(id_str, nullptr, 16)); } catch(...) {}
+          if (frontier_set.empty()) {
+            std::function<void(const FilterGroup&)> find_index_filters = [&](const FilterGroup& fg) {
+                for (const auto &n : fg.nodes) {
+                    if (auto* f = std::get_if<Filter>(&n.node)) {
+                        if (f->alias == root_alias_ && f->op == Op::Eq) {
+                            if (f->key == "n" || f->key == "path" || f->key == "id") {
+                                had_eq_filter = true;
                             }
+                            std::string idx_prefix = "idx:" + f->alias + ":" + f->key + ":" + f->value;
+                            auto idx_keys = engine_->get_store()->get_prefix_keys_all_shards(idx_prefix, "", 100);
+                            if (!idx_keys.empty()) {
+                                for (const auto& k : idx_keys) {
+                                    auto idx_buf = engine_->get_store()->get(k);
+                                    if (idx_buf.size() > 0) {
+                                        std::string id_str(reinterpret_cast<const char*>(idx_buf.data()), idx_buf.size());
+                                        try { frontier_set.insert(std::stoull(id_str, nullptr, 16)); } catch(...) {}
+                                    }
+                                }
+                            }
+                        }
+                    } else if (auto* sub = std::get_if<std::shared_ptr<FilterGroup>>(&n.node)) {
+                        if (*sub && n.prepended_op == LogicalOp::And) {
+                            find_index_filters(**sub);
                         }
                     }
                 }
-            }
-        }
+            };
+            find_index_filters(root_filters_);
+          }
       }
       if (frontier_set.empty()) {
-        if (had_eq_filter) {
+        if (had_eq_filter && !has_complex) {
             return results;
         }
         if (!root_alias_.empty()) {
-            std::string idx_n_prefix = "idx:" + root_alias_ + ":n:";
-            auto idx_keys = engine_->get_store()->get_prefix_keys_all_shards(idx_n_prefix, "", 10000);
+            std::string entity_name = (root_alias_ == "Group" ? "User" : root_alias_);
+            std::string idx_id_prefix = "idx:" + entity_name + ":id:";
+            auto idx_keys = engine_->get_store()->get_prefix_keys_all_shards(idx_id_prefix, "", 10000);
             for (const auto& k : idx_keys) {
                 auto idx_buf = engine_->get_store()->get(k);
                 if (idx_buf.size() > 0) {
@@ -293,8 +497,19 @@ std::vector<ResultRow> Query::execute() {
                     try { frontier_set.insert(std::stoull(id_str, nullptr, 16)); } catch(...) {}
                 }
             }
+            if (frontier_set.empty()) {
+                std::string idx_n_prefix = "idx:" + entity_name + ":n:";
+                auto idx_keys_n = engine_->get_store()->get_prefix_keys_all_shards(idx_n_prefix, "", 10000);
+                for (const auto& k : idx_keys_n) {
+                    auto idx_buf = engine_->get_store()->get(k);
+                    if (idx_buf.size() > 0) {
+                        std::string id_str(reinterpret_cast<const char*>(idx_buf.data()), idx_buf.size());
+                        try { frontier_set.insert(std::stoull(id_str, nullptr, 16)); } catch(...) {}
+                    }
+                }
+            }
         }
-        if (frontier_set.empty()) {
+        if (frontier_set.empty() && root_alias_.empty()) {
             std::string store_prefix = "n:{"; 
             auto keys = engine_->get_store()->get_prefix_keys_all_shards(store_prefix, "", engine_->get_settings().prefix_scan_limit);
             L3_LOG(0, "Query::execute() store_prefix scan returned keys=%zu", keys.size());
@@ -321,8 +536,20 @@ std::vector<ResultRow> Query::execute() {
           L3_LOG(0, "Query::execute() checking node %016llx: ptr=%d, loaded=%d", 
                  (unsigned long long)(node ? node->get_id() : 0), (node != nullptr), (node && node->is_loaded()));
           if (!node || !node->is_loaded()) continue;
+          if (!root_alias_.empty()) {
+              std::string et;
+              try { et = node->get_attribute_as_string("entity_type"); } catch (...) {}
+              std::string actual_type;
+              try { actual_type = node->get_attribute_as_string("t"); } catch (...) {}
+              bool has_v = node->has_attribute("v");
+              if (!is_entity_type_match(root_alias_, et, actual_type, has_v)) {
+                  L3_LOG(0, "Query::execute() node %016llx skipped: root_alias '%s' mismatch with et '%s', actual_type '%s'",
+                         (unsigned long long)node->get_id(), root_alias_.c_str(), et.c_str(), actual_type.c_str());
+                  continue;
+              }
+          }
           std::string key = std::string(KeyBuilder::node_key(node->get_id()));
-          auto perm = engine_->get_store()->credentials().check_permission(principal_id_, key);
+          auto perm = (principal_id_ == INTERNAL_UID || principal_id_ == 0) ? l3kv::Permission::ADMIN : engine_->get_store()->credentials().check_permission(principal_id_, key);
           L3_LOG(0, "Query::execute() node %016llx: perm=0x%x, principal=%u", (unsigned long long)node->get_id(), (unsigned int)perm, principal_id_);
           if (!(perm & l3kv::Permission::READ) && !(perm & l3kv::Permission::ADMIN)) continue;
           std::unordered_map<std::string, std::shared_ptr<Node>> available; available[root_alias_] = node;
@@ -343,23 +570,12 @@ std::vector<ResultRow> Query::execute() {
       if (!node) continue;
       std::string actual_type;
       try { actual_type = node->get_attribute_as_string("t"); } catch (...) { actual_type = ""; }
-      if (root_alias_ == "Resource" && (actual_type == "unixfilesystem" || actual_type == "resource" || actual_type.empty())) {
-          L3_LOG(0, "Query::execute() checking candidate %016llx: loaded=%d, type='%s'", (unsigned long long)id, node->is_loaded(), actual_type.c_str());
-      }
-      bool type_match = false;
-      if (root_alias_ == "Zone") type_match = (actual_type == "zone" || actual_type == "local" || actual_type == "remote");
-      else if (root_alias_ == "User") type_match = (actual_type == "user" || actual_type == "rodsuser" || actual_type == "rodsadmin" || actual_type == "groupadmin" || actual_type == "rodsgroup");
-      else if (root_alias_ == "Collection") type_match = (actual_type != "data_object" && actual_type != "generic" && actual_type != "replica" && actual_type != "resource" && actual_type != "unixfilesystem" && actual_type != "s3" && actual_type != "user" && actual_type != "rodsuser" && actual_type != "rodsadmin" && actual_type != "groupadmin" && actual_type != "rodsgroup" && actual_type != "zone" && actual_type != "remote" && actual_type != "metadata" && actual_type != "access" && actual_type != "rule");
-      else if (root_alias_ == "DataObject") type_match = (actual_type == "data_object" || actual_type == "generic");
-      else if (root_alias_ == "Replica") type_match = (actual_type == "replica");
-      else if (root_alias_ == "Resource") type_match = (actual_type == "resource" || actual_type == "unixfilesystem" || actual_type == "s3");
-      else if (root_alias_ == "Metadata") type_match = (actual_type == "metadata");
-      else if (root_alias_ == "Access") type_match = (actual_type == "access");
-      else if (root_alias_ == "Rule") type_match = (actual_type == "rule");
-      else type_match = true; // Generic alias, allow any type
-      
+      std::string entity_type;
+      try { entity_type = node->get_attribute_as_string("entity_type"); } catch (...) { entity_type = ""; }
+      L3_LOG(0, "Query::execute() checking candidate %016llx: alias='%s', loaded=%d, type='%s', entity_type='%s', has_v=%d", (unsigned long long)id, root_alias_.c_str(), node->is_loaded(), actual_type.c_str(), entity_type.c_str(), node->has_attribute("v"));
+      bool type_match = is_entity_type_match(root_alias_, entity_type, actual_type, node->has_attribute("v"));
 
-
+      L3_LOG(0, "Query::execute() candidate %016llx: type_match=%d", (unsigned long long)id, type_match);
       if (!type_match) continue;
       Path p; p.alias_to_node[root_alias_] = node; p.last_alias = root_alias_; paths.push_back(std::move(p));
   }
@@ -403,6 +619,12 @@ std::vector<ResultRow> Query::execute() {
                             }
                             auto neighbor_node = engine_->get_node(neighbor_id);
                             if (!neighbor_node) continue;
+                            std::string et;
+                            try { et = neighbor_node->get_attribute_as_string("entity_type"); } catch (...) {}
+                            std::string actual_type;
+                            try { actual_type = neighbor_node->get_attribute_as_string("t"); } catch (...) {}
+                            bool has_v = neighbor_node->has_attribute("v");
+                            if (!is_entity_type_match(s.target_alias, et, actual_type, has_v)) continue;
                             Path new_path = path; new_path.alias_to_node[s.target_alias] = neighbor_node; new_path.last_alias = s.target_alias;
                             if (evaluate_group(root_filters_, new_path.alias_to_node, s.target_alias, engine_)) {
                                 local_next_paths.push_back(std::move(new_path));
@@ -437,6 +659,12 @@ std::vector<ResultRow> Query::execute() {
                             }
                             auto neighbor_node = engine_->get_node(neighbor_id);
                             if (!neighbor_node) continue;
+                            std::string et;
+                            try { et = neighbor_node->get_attribute_as_string("entity_type"); } catch (...) {}
+                            std::string actual_type;
+                            try { actual_type = neighbor_node->get_attribute_as_string("t"); } catch (...) {}
+                            bool has_v = neighbor_node->has_attribute("v");
+                            if (!is_entity_type_match(s.target_alias, et, actual_type, has_v)) continue;
                             Path new_path = path; new_path.alias_to_node[s.target_alias] = neighbor_node; new_path.last_alias = s.target_alias;
                             if (evaluate_group(root_filters_, new_path.alias_to_node, s.target_alias, engine_)) {
                                 local_next_paths.push_back(std::move(new_path));
@@ -479,6 +707,9 @@ std::vector<ResultRow> Query::execute() {
   }
 
   for (const auto &path : paths) {
+    if (evaluate_group_tribool(root_filters_, path.alias_to_node, "", engine_) != TriBool::True) {
+        continue;
+    }
     ResultRow row;
     for (const auto& [alias, node] : path.alias_to_node) {
         row.nodes.push_back(node);
@@ -508,40 +739,144 @@ std::vector<ResultRow> Query::execute() {
   }
 
   bool has_agg = false; for (const auto& p : projections_) if (p.agg != AggOp::None) { has_agg = true; break; }
-  if (has_agg) {
+  if (has_agg || !groups_.empty()) {
+      std::vector<std::string> partition_order;
       std::unordered_map<std::string, std::vector<ResultRow>> partitions;
-      if (groups_.empty()) partitions["ALL"] = std::move(results);
-      else {
+      std::vector<GroupStep> effective_groups = groups_;
+      if (effective_groups.empty() && has_agg) {
+          for (const auto& p : projections_) {
+              if (p.agg == AggOp::None) {
+                  bool exists = false;
+                  for (const auto& eg : effective_groups) {
+                      if (eg.alias == p.alias && eg.property == p.property) {
+                          exists = true;
+                          break;
+                      }
+                  }
+                  if (!exists) {
+                      effective_groups.push_back(GroupStep{p.alias, p.property, "", {}});
+                  }
+              }
+          }
+      }
+      if (effective_groups.empty()) {
+          partition_order.push_back("ALL");
+          partitions["ALL"] = std::move(results);
+      } else {
           for (auto& row : results) {
               std::string g_key;
-              for (const auto& g : groups_) {
+              for (const auto& g : effective_groups) {
                   auto it = row.fields.find(g.alias + "." + g.property);
-                  if (it != row.fields.end()) g_key += it->second + "|"; else g_key += "|";
+                  std::string val = (it != row.fields.end() ? it->second : "");
+                  if (!g.func_name.empty()) {
+                      std::string fn = g.func_name;
+                      std::transform(fn.begin(), fn.end(), fn.begin(), ::toupper);
+                      if (fn == "LENGTH") {
+                          val = std::to_string(val.size());
+                      } else if (fn == "SUBSTRING" || fn == "SUBSTR") {
+                          if (!g.func_args.empty()) {
+                              try {
+                                  int pos = std::stoi(g.func_args[0]);
+                                  int start = std::max(0, pos);
+                                  if (start < static_cast<int>(val.size())) {
+                                      if (g.func_args.size() > 1) {
+                                          int len = std::stoi(g.func_args[1]);
+                                          val = (len > 0) ? val.substr(start, len) : "";
+                                      } else {
+                                          val = val.substr(start);
+                                      }
+                                  } else {
+                                      val = "";
+                                  }
+                              } catch (...) {}
+                          }
+                      }
+                  }
+                  g_key += val + "|";
+              }
+              if (partitions.find(g_key) == partitions.end()) {
+                  partition_order.push_back(g_key);
               }
               partitions[g_key].push_back(std::move(row));
           }
       }
       std::vector<ResultRow> final_res;
-      for (auto& pair : partitions) {
-          auto& part = pair.second; ResultRow agg_row;
+      for (const auto& pk : partition_order) {
+          auto& part = partitions[pk]; ResultRow agg_row;
+          for (const auto& g : effective_groups) {
+              std::string gk = g.alias + "." + g.property;
+              if (!part.empty() && part[0].fields.contains(gk)) {
+                  agg_row.fields[gk] = part[0].fields.at(gk);
+              }
+          }
           for (size_t i = 0; i < projections_.size(); ++i) {
               const auto& p = projections_[i]; std::string k = "idx_" + std::to_string(i);
-              if (p.agg == AggOp::None) { if (!part.empty()) agg_row.fields[k] = part[0].fields.at(k); }
-              else if (p.agg == AggOp::Count) agg_row.fields[k] = std::to_string(part.size());
+              agg_row.fields["_col_" + std::to_string(i)] = p.alias + "." + p.property;
+              if (p.agg == AggOp::None) { 
+                  if (!part.empty()) {
+                      auto it = part[0].fields.find(p.alias + "." + p.property);
+                      if (it == part[0].fields.end()) it = part[0].fields.find(k);
+                      if (it != part[0].fields.end()) {
+                          agg_row.fields[k] = it->second;
+                          agg_row.fields[p.alias + "." + p.property] = it->second;
+                      } else {
+                          agg_row.fields[k] = "";
+                      }
+                  } else {
+                      agg_row.fields[k] = "";
+                  }
+              }
+              else if (p.agg == AggOp::Count) {
+                  if (p.distinct) {
+                      std::unordered_set<std::string> dist_vals;
+                      for (auto& r : part) {
+                          auto it = r.fields.find(p.alias + "." + p.property);
+                          if (it == r.fields.end()) it = r.fields.find(k);
+                          if (it != r.fields.end() && !it->second.empty()) dist_vals.insert(it->second);
+                      }
+                      agg_row.fields[k] = std::to_string(dist_vals.size());
+                  } else {
+                      agg_row.fields[k] = std::to_string(part.size());
+                  }
+                  agg_row.fields[p.alias + "." + p.property] = agg_row.fields[k];
+              }
               else {
-                  double acc = 0; bool first = true;
-                  for (auto& r : part) {
-                      double v = 0; try { v = std::stod(std::string(r.fields.at(k))); } catch(...) {}
-                      if (first) { acc = v; first = false; }
-                      else {
-                          if (p.agg == AggOp::Sum || p.agg == AggOp::Avg) acc += v;
-                          else if (p.agg == AggOp::Min) acc = std::min(acc, v);
-                          else if (p.agg == AggOp::Max) acc = std::max(acc, v);
+                  std::vector<double> vals;
+                  if (p.distinct) {
+                      std::set<double> dist_set;
+                      for (auto& r : part) {
+                          auto it = r.fields.find(p.alias + "." + p.property);
+                          if (it == r.fields.end()) it = r.fields.find(k);
+                          if (it != r.fields.end() && !it->second.empty()) {
+                              try { dist_set.insert(std::stod(it->second)); } catch(...) {}
+                          }
+                      }
+                      vals.assign(dist_set.begin(), dist_set.end());
+                  } else {
+                      for (auto& r : part) {
+                          auto it = r.fields.find(p.alias + "." + p.property);
+                          if (it == r.fields.end()) it = r.fields.find(k);
+                          if (it != r.fields.end() && !it->second.empty()) {
+                              try { vals.push_back(std::stod(it->second)); } catch(...) {}
+                          }
                       }
                   }
-                  if (p.agg == AggOp::Avg && !part.empty()) acc /= part.size();
-                  if (acc == static_cast<int64_t>(acc)) agg_row.fields[k] = std::to_string(static_cast<int64_t>(acc));
-                  else agg_row.fields[k] = std::to_string(acc);
+                  if (vals.empty()) {
+                      agg_row.fields[k] = "0";
+                  } else {
+                      double acc = 0;
+                      if (p.agg == AggOp::Min) {
+                          acc = *std::min_element(vals.begin(), vals.end());
+                      } else if (p.agg == AggOp::Max) {
+                          acc = *std::max_element(vals.begin(), vals.end());
+                      } else {
+                          for (double v : vals) acc += v;
+                          if (p.agg == AggOp::Avg) acc /= vals.size();
+                      }
+                      if (acc == static_cast<int64_t>(acc)) agg_row.fields[k] = std::to_string(static_cast<int64_t>(acc));
+                      else agg_row.fields[k] = std::to_string(acc);
+                  }
+                  agg_row.fields[p.alias + "." + p.property] = agg_row.fields[k];
               }
           }
           final_res.push_back(std::move(agg_row));
@@ -549,7 +884,7 @@ std::vector<ResultRow> Query::execute() {
       results = std::move(final_res);
   }
 
-  if (distinct_ || (!projections_.empty() && projections_[0].agg == AggOp::None)) {
+  if (distinct_) {
       std::set<std::string> seen; std::vector<ResultRow> unique_res;
       for (auto& row : results) {
           std::string key; 
@@ -564,8 +899,8 @@ std::vector<ResultRow> Query::execute() {
       results = std::move(unique_res);
   }
 
-  if (!sorts_.empty()) {
-      std::sort(results.begin(), results.end(), [&](const ResultRow& a, const ResultRow& b) {
+  std::sort(results.begin(), results.end(), [&](const ResultRow& a, const ResultRow& b) {
+      if (!sorts_.empty()) {
           for (const auto& s : sorts_) {
               std::string k = s.alias + "." + s.property;
               auto it_a = a.fields.find(k);
@@ -577,9 +912,25 @@ std::vector<ResultRow> Query::execute() {
                   }
               }
           }
-          return false;
-      });
-  }
+      }
+      for (size_t i = 0; i < projections_.size(); ++i) {
+          std::string k = "idx_" + std::to_string(i);
+          auto it_a = a.fields.find(k);
+          auto it_b = b.fields.find(k);
+          const std::string& v_a = (it_a != a.fields.end()) ? it_a->second : "";
+          const std::string& v_b = (it_b != b.fields.end()) ? it_b->second : "";
+          if (v_a != v_b) return v_a < v_b;
+      }
+      size_t min_nodes = std::min(a.nodes.size(), b.nodes.size());
+      for (size_t n = 0; n < min_nodes; ++n) {
+          if (a.nodes[n] && b.nodes[n]) {
+              uint64_t id_a = a.nodes[n]->get_id();
+              uint64_t id_b = b.nodes[n]->get_id();
+              if (id_a != id_b) return id_a < id_b;
+          }
+      }
+      return a.nodes.size() < b.nodes.size();
+  });
   if (offset_) { if (*offset_ >= results.size()) results.clear(); else results.erase(results.begin(), results.begin() + *offset_); }
   if (limit_ && results.size() > *limit_) results.resize(*limit_);
   L3_LOG(0, "Query::execute() returning results.size=%zu", results.size());
@@ -630,7 +981,34 @@ Query &Query::resume(const std::vector<uint64_t>& starting_nodes, std::string_vi
             }
         }
         if (j.contains("projections")) {
-            for (const auto& pj : j["projections"]) projections_.push_back(ReturnStep{pj["alias"], pj["property"], static_cast<AggOp>(pj["agg"])});
+            for (const auto& pj : j["projections"]) {
+                projections_.push_back(ReturnStep{
+                    pj["alias"],
+                    pj["property"],
+                    static_cast<AggOp>(pj.value("agg", 0)),
+                    pj.value("distinct", false)
+                });
+            }
+        }
+        if (j.contains("groups")) {
+            for (const auto& gj : j["groups"]) {
+                std::string alias = gj.value("alias", "");
+                std::string prop = gj.value("property", "");
+                std::string func_name = gj.value("func_name", "");
+                std::vector<std::string> func_args;
+                if (gj.contains("func_args")) {
+                    for (const auto& a : gj["func_args"]) func_args.push_back(a.get<std::string>());
+                }
+                groups_.push_back(GroupStep{alias, prop, func_name, func_args});
+            }
+        }
+        if (j.contains("sorts")) {
+            for (const auto& sj : j["sorts"]) {
+                std::string alias = sj.value("alias", "");
+                std::string prop = sj.value("property", "");
+                bool asc = sj.value("ascending", true);
+                sorts_.push_back(SortStep{alias, prop, asc});
+            }
         }
         if (j.contains("limit")) {
             limit_ = j["limit"].get<size_t>();

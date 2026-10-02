@@ -4,6 +4,15 @@
 #include "L3KVG/KeyBuilder.hpp"
 #include "engine/store.hpp"
 #include <iostream>
+#include <cstdio>
+#define L3_LOG(level, ...) do { \
+    static const bool s_l3_debug = (std::getenv("L3_DEBUG") != nullptr); \
+    if (s_l3_debug) { \
+        std::fprintf(stderr, "[L3KVG] " __VA_ARGS__); \
+        std::fprintf(stderr, "\n"); \
+        std::fflush(stderr); \
+    } \
+} while(0)
 
 namespace l3kvg {
 
@@ -24,6 +33,7 @@ void Node::ensure_loaded() {
   // Locality of Reference: Check local store first even if we are not the primary owner.
   // L3KV replication may have placed a local copy here.
   auto buf = engine_->get_store()->get(key);
+  L3_LOG(0, "Node::ensure_loaded() id=%016llx, key='%s', buf.size()=%zu", (unsigned long long)id_, key.c_str(), buf.size());
   if (buf.size() > 0) {
       payload_ = std::move(buf);
       if (payload_->get_type(0, "bloom") == lite3cpp::Type::Int64) {
@@ -32,8 +42,10 @@ void Node::ensure_loaded() {
           bloom_filter_ = 0xFFFFFFFFFFFFFFFF;
       }
       loaded_.store(true, std::memory_order_release);
+      L3_LOG(0, "Node::ensure_loaded() SUCCESS id=%016llx", (unsigned long long)id_);
       return;
   }
+  L3_LOG(0, "Node::ensure_loaded() FAILED TO LOAD FROM STORE id=%016llx, is_local=%d", (unsigned long long)id_, resolver.is_local(id_));
 
   if (!resolver.is_local(id_)) {
       lite3::NodeID owner = resolver.get_node_owner(id_);
@@ -95,7 +107,10 @@ void Node::register_edge_bloom(std::string_view label) {
 std::vector<uint64_t> Node::get_neighbors(std::string_view label,
                                              double min_weight,
                                              uint32_t principal_id) {
+  L3_LOG(0, "Node::get_neighbors() node=%016llx label=%.*s min_weight=%.2f", 
+         (unsigned long long)id_, (int)label.size(), label.data(), min_weight);
   if (!might_have_edge(label)) {
+    L3_LOG(0, "Node::get_neighbors() node=%016llx might_have_edge is false!", (unsigned long long)id_);
     return {};
   }
 
@@ -110,25 +125,46 @@ std::vector<uint64_t> Node::get_neighbors(std::string_view label,
 
   auto *store = engine_->get_store();
   size_t target_shard = store->get_routing_shard(std::string(prefix));
+  L3_LOG(0, "Node::get_neighbors() node=%016llx prefix='%s' target_shard=%zu start_key='%s'",
+         (unsigned long long)id_, std::string(prefix).c_str(), target_shard, start_key.c_str());
 
   // Locality of Reference: Check local store first.
-  auto chunk = store->get_prefix_keys(std::string(prefix), target_shard, start_key, engine_->get_settings().prefix_scan_limit);
-  if (!chunk.empty()) {
-      for (const auto &key : chunk) {
-          if (key.ends_with(":meta"))
-              continue;
-          if (store->get(key).size() == 0)
-              continue;
-          size_t start_brace = key.find_last_of('{');
-          size_t end_brace = key.find_last_of('}');
-          if (start_brace != std::string::npos && end_brace != std::string::npos && end_brace > start_brace) {
-              std::string id_str = key.substr(start_brace + 1, end_brace - start_brace - 1);
-              uint64_t nid = std::stoull(id_str, nullptr, 16);
-              if(0) std::fprintf(stderr, "  Found OUT neighbor %016llx\n", (unsigned long long)nid);
-              neighbors.push_back(nid);
-          }
+  std::string current_start = start_key;
+  size_t limit = engine_->get_settings().prefix_scan_limit;
+  while (true) {
+    auto chunk = store->get_prefix_keys(std::string(prefix), target_shard, current_start, limit);
+    L3_LOG(0, "Node::get_neighbors() node=%016llx current_start='%s' chunk_size=%zu", 
+           (unsigned long long)id_, current_start.c_str(), chunk.size());
+    if (chunk.empty()) {
+      break;
+    }
+    for (const auto &key : chunk) {
+      L3_LOG(0, "Node::get_neighbors() node=%016llx key='%s' val_len=%zu", 
+             (unsigned long long)id_, key.c_str(), store->get(key).size());
+      if (key.ends_with(":meta"))
+        continue;
+      if (store->get(key).size() == 0)
+        continue;
+      size_t start_brace = key.find_last_of('{');
+      size_t end_brace = key.find_last_of('}');
+      if (start_brace != std::string::npos && end_brace != std::string::npos && end_brace > start_brace) {
+        std::string id_str = key.substr(start_brace + 1, end_brace - start_brace - 1);
+        uint64_t nid = std::stoull(id_str, nullptr, 16);
+        L3_LOG(0, "Node::get_neighbors() node=%016llx found neighbor: %016llx", 
+               (unsigned long long)id_, (unsigned long long)nid);
+        neighbors.push_back(nid);
       }
-      return neighbors;
+    }
+    if (chunk.size() < limit) {
+      break;
+    }
+    current_start = chunk.back() + '\0';
+  }
+
+  L3_LOG(0, "Node::get_neighbors() node=%016llx total local neighbors=%zu", 
+         (unsigned long long)id_, neighbors.size());
+  if (!neighbors.empty()) {
+    return neighbors;
   }
 
   auto& resolver = engine_->get_resolver();
@@ -149,28 +185,46 @@ std::vector<uint64_t> Node::get_in_neighbors(std::string_view label, uint32_t pr
   std::vector<uint64_t> neighbors;
   std::string_view prefix = KeyBuilder::edge_in_prefix(id_, label);
   
-  if(0) std::fprintf(stderr, "[Node %016llx] Scanning IN edges for label [%s]\n", (unsigned long long)id_, std::string(label).c_str());
+  L3_LOG(0, "Node::get_in_neighbors() node=%016llx label=%.*s prefix='%s'", 
+         (unsigned long long)id_, (int)label.size(), label.data(), std::string(prefix).c_str());
 
   auto *store = engine_->get_store();
   size_t target_shard = store->get_routing_shard(std::string(prefix));
 
-  auto chunk = store->get_prefix_keys(std::string(prefix), target_shard, std::string(prefix), engine_->get_settings().prefix_scan_limit);
-  if(0) std::fprintf(stderr, "[Node %016llx] Scanned label [%s], found %zu keys\n", (unsigned long long)id_, std::string(label).c_str(), chunk.size());
-  for (const auto &key : chunk) {
+  std::string current_start = std::string(prefix);
+  size_t limit = engine_->get_settings().prefix_scan_limit;
+  while (true) {
+    auto chunk = store->get_prefix_keys(std::string(prefix), target_shard, current_start, limit);
+    L3_LOG(0, "Node::get_in_neighbors() node=%016llx chunk_size=%zu", 
+           (unsigned long long)id_, chunk.size());
+    if (chunk.empty()) {
+      break;
+    }
+    for (const auto &key : chunk) {
+      L3_LOG(0, "Node::get_in_neighbors() node=%016llx key='%s' val_len=%zu", 
+             (unsigned long long)id_, key.c_str(), store->get(key).size());
       if (key.ends_with(":meta"))
-          continue;
+        continue;
       if (store->get(key).size() == 0)
-          continue;
+        continue;
       size_t start_brace = key.find_last_of('{');
       size_t end_brace = key.find_last_of('}');
       if (start_brace != std::string::npos && end_brace != std::string::npos && end_brace > start_brace) {
-          std::string id_str = key.substr(start_brace + 1, end_brace - start_brace - 1);
-          uint64_t nid = std::stoull(id_str, nullptr, 16);
-          if(0) std::fprintf(stderr, "  Found IN neighbor %016llx\n", (unsigned long long)nid);
-          neighbors.push_back(nid);
+        std::string id_str = key.substr(start_brace + 1, end_brace - start_brace - 1);
+        uint64_t nid = std::stoull(id_str, nullptr, 16);
+        L3_LOG(0, "Node::get_in_neighbors() node=%016llx found in-neighbor: %016llx", 
+               (unsigned long long)id_, (unsigned long long)nid);
+        neighbors.push_back(nid);
       }
+    }
+    if (chunk.size() < limit) {
+      break;
+    }
+    current_start = chunk.back() + '\0';
   }
   
+  L3_LOG(0, "Node::get_in_neighbors() node=%016llx total in-neighbors=%zu", 
+         (unsigned long long)id_, neighbors.size());
   return neighbors;
 }
 
@@ -201,38 +255,46 @@ std::vector<std::shared_ptr<Edge>> Node::get_edges(std::string_view label,
   auto *store = engine_->get_store();
   size_t target_shard = store->get_routing_shard(std::string(prefix));
 
-  // We need a method in l3kv::Engine that returns pairs of {key, value}
-  // Let's assume get_prefix_entries exists or iterate through keys and get values.
-  auto chunk = store->get_prefix_keys(std::string(prefix), target_shard, std::string(prefix), engine_->get_settings().prefix_scan_limit);
-  if(0) std::fprintf(stderr, "[Node %016llx] Scanned label [%s], found %zu keys\n", (unsigned long long)id_, std::string(label).c_str(), chunk.size());
-  for (const auto &key : chunk) {
-    if (key.ends_with(":meta"))
-      continue;
-    
-    lite3cpp::Buffer buf = store->get(key); // Fetch property payload
-    
-    // Parse key: e:out:{src}:{label}:{weight}:{dst}
-    size_t start_brace_dst = key.find_last_of('{');
-    size_t end_brace_dst = key.find_last_of('}');
-
-    if (start_brace_dst != std::string::npos && end_brace_dst != std::string::npos && end_brace_dst > start_brace_dst) {
-        std::string dst_id_str = key.substr(start_brace_dst + 1, end_brace_dst - start_brace_dst - 1);
-        uint64_t dst_id = std::stoull(dst_id_str, nullptr, 16);
-
-        // Extract weight from key: it's between the second-to-last colon and the last open-brace
-        size_t weight_end = start_brace_dst - 1; // The colon before {dst}
-        size_t weight_start = key.find_last_of(':', weight_end - 1);
-
-        double weight = 0.0;
-        if (weight_start != std::string::npos) {
-            std::string w_str = key.substr(weight_start + 1, weight_end - weight_start - 1);
-            weight = std::stod(w_str);
-        }
-
-        edges.push_back(std::make_shared<Edge>(engine_, id_, std::string(label), weight, dst_id, 
-                                               buf.size() > 0 ? std::make_optional(std::move(buf)) : std::nullopt));
+  std::string current_start = start_key;
+  size_t limit = engine_->get_settings().prefix_scan_limit;
+  while (true) {
+    auto chunk = store->get_prefix_keys(std::string(prefix), target_shard, current_start, limit);
+    if (chunk.empty()) {
+      break;
     }
+    if(0) std::fprintf(stderr, "[Node %016llx] Scanned label [%s], found %zu keys\n", (unsigned long long)id_, std::string(label).c_str(), chunk.size());
+    for (const auto &key : chunk) {
+      if (key.ends_with(":meta"))
+        continue;
+      
+      lite3cpp::Buffer buf = store->get(key); // Fetch property payload
+      
+      // Parse key: e:out:{src}:{label}:{weight}:{dst}
+      size_t start_brace_dst = key.find_last_of('{');
+      size_t end_brace_dst = key.find_last_of('}');
 
+      if (start_brace_dst != std::string::npos && end_brace_dst != std::string::npos && end_brace_dst > start_brace_dst) {
+          std::string dst_id_str = key.substr(start_brace_dst + 1, end_brace_dst - start_brace_dst - 1);
+          uint64_t dst_id = std::stoull(dst_id_str, nullptr, 16);
+
+          // Extract weight from key: it's between the second-to-last colon and the last open-brace
+          size_t weight_end = start_brace_dst - 1; // The colon before {dst}
+          size_t weight_start = key.find_last_of(':', weight_end - 1);
+
+          double weight = 0.0;
+          if (weight_start != std::string::npos) {
+              std::string w_str = key.substr(weight_start + 1, weight_end - weight_start - 1);
+              weight = std::stod(w_str);
+          }
+
+          edges.push_back(std::make_shared<Edge>(engine_, id_, std::string(label), weight, dst_id, 
+                                                 buf.size() > 0 ? std::make_optional(std::move(buf)) : std::nullopt));
+      }
+    }
+    if (chunk.size() < limit) {
+      break;
+    }
+    current_start = chunk.back() + '\0';
   }
   return edges;
 }
@@ -281,10 +343,23 @@ void Node::hydrate(const std::string &data) {
 
 bool Node::has_attribute(const std::string &key) {
   ensure_loaded();
-  if (!payload_ || payload_->size() == 0)
+  if (!payload_ || payload_->size() == 0) {
+    L3_LOG(0, "Node::has_attribute(%s): payload empty or not loaded", key.c_str());
     return false;
-  return payload_->get_type(0, key) != lite3cpp::Type::Null &&
-         payload_->get_type(0, key) != lite3cpp::Type::Invalid;
+  }
+  auto t = payload_->get_type(0, key);
+  L3_LOG(0, "Node::has_attribute(%s): payload_->get_type(0, %s)=%d", key.c_str(), key.c_str(), (int)t);
+  if (t != lite3cpp::Type::Null && t != lite3cpp::Type::Invalid) return true;
+  if (payload_->get_type(0, "_binary") == lite3cpp::Type::Bytes) {
+      auto bin = payload_->get_bytes(0, "_binary");
+      std::vector<uint8_t> vec; vec.reserve(bin.size());
+      for (auto b : bin) vec.push_back(static_cast<uint8_t>(b));
+      lite3cpp::Buffer nested(std::move(vec));
+      auto t2 = nested.get_type(0, key);
+      L3_LOG(0, "Node::has_attribute(%s): nested.get_type(0, %s)=%d", key.c_str(), key.c_str(), (int)t2);
+      return t2 != lite3cpp::Type::Null && t2 != lite3cpp::Type::Invalid;
+  }
+  return false;
 }
 
 lite3cpp::Type Node::get_attribute_type(std::string_view key) {

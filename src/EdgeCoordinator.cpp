@@ -56,24 +56,30 @@ std::future<void> EdgeCoordinator::atomic_put_edge(uint64_t src_id, const std::s
     std::vector<std::future<void>> futures;
 
     auto handle_write = [&](lite3::NodeID owner, const std::string& key) {
+        static const bool s_l3_debug = (std::getenv("L3_DEBUG") != nullptr);
         if (owner == local_id) {
             size_t shard_idx = store_->get_routing_shard(key);
             // Engine::put takes a string, we'll cast the data
             std::string binary_str(reinterpret_cast<const char*>(final_payload_data.data()), final_payload_data.size());
             
-            if(0) std::fprintf(stderr, "[EdgeCoordinator] Local Write: key=%s shard=%zu\n", key.c_str(), shard_idx);
-            //std::fflush(stderr);
+            if (s_l3_debug) {
+                std::fprintf(stderr, "[EdgeCoordinator] Local Write: key=%s shard=%zu data_len=%zu\n", key.c_str(), shard_idx, binary_str.size());
+                std::fflush(stderr);
+            }
 
             if (replication_cb_) {
                 replication_cb_(key, binary_str);
             }
 
-            futures.push_back(store_->submit_to_shard_idx(shard_idx, [this, key, binary_str]() {
-                store_->apply_put(key, binary_str);
-            }));
+            store_->put(key, binary_str);
+            auto prom = std::make_shared<std::promise<void>>();
+            prom->set_value();
+            futures.push_back(prom->get_future());
         } else {
-            if(0) std::fprintf(stderr, "[EdgeCoordinator] Remote Write: key=%s owner=%u (local=%u)\n", key.c_str(), (uint32_t)owner, (uint32_t)local_id);
-            //std::fflush(stderr);
+            if (s_l3_debug) {
+                std::fprintf(stderr, "[EdgeCoordinator] Remote Write: key=%s owner=%u (local=%u)\n", key.c_str(), (uint32_t)owner, (uint32_t)local_id);
+                std::fflush(stderr);
+            }
             auto prom = std::make_shared<std::promise<void>>();
             futures.push_back(prom->get_future());
             
@@ -122,9 +128,10 @@ std::future<void> EdgeCoordinator::atomic_del_edge(uint64_t src_id, const std::s
             if (replication_cb_) {
                 replication_cb_(key, "");
             }
-            futures.push_back(store_->submit_to_shard_idx(shard_idx, [this, key]() {
-                store_->apply_del(key);
-            }));
+            store_->del(key);
+            auto prom = std::make_shared<std::promise<void>>();
+            prom->set_value();
+            futures.push_back(prom->get_future());
         } else {
             // Phase 5 Pending: Remote del_edge batching/RPC
         }

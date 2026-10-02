@@ -216,7 +216,7 @@ std::future<bool> RemoteL3KVClient::put_batch_binary_async(lite3::NodeID owner_i
         std::promise<bool> p; p.set_exception(std::current_exception()); return p.get_future();
     }
 
-    return task_pool_->enqueue([this, owner_id, session, &batch_buffer, principal_id]() -> bool {
+    return task_pool_->enqueue([this, owner_id, session, batch_buffer, principal_id]() -> bool {
         std::lock_guard<std::recursive_mutex> lock(session->mu);
         try {
             uint32_t pid = principal_id;

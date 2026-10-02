@@ -124,27 +124,12 @@ std::vector<std::shared_ptr<Node>> Engine::fetch_nodes(const std::vector<uint64_
   for (const auto& id : ids) {
     auto node = get_node(id);
     if (node && !node->is_loaded()) {
-      // Locality of Reference: Try local store even if we are not the primary owner.
-      std::string key = std::string(KeyBuilder::node_key(id));
-      auto buf = store_->get(key);
-      if(0) std::fprintf(stderr, "  [Engine] Checking local store for node %016llx. Size=%zu, Header=[%02x %02x %02x %02x]\n", 
-              (unsigned long long)id, buf.size(), 
-              buf.size() > 0 ? (uint8_t)buf.data()[0] : 0,
-              buf.size() > 1 ? (uint8_t)buf.data()[1] : 0,
-              buf.size() > 2 ? (uint8_t)buf.data()[2] : 0,
-              buf.size() > 3 ? (uint8_t)buf.data()[3] : 0); 
-      //std::fflush(stderr);
-      if (buf.size() > 0) {
-      node->hydrate(std::string(reinterpret_cast<const char*>(buf.data()), buf.size()));
-      if(0) std::fprintf(stderr, "  [Engine] Node %016llx HYDRATED. type=[%s]\n", (unsigned long long)id, node->get_attribute_as_string("t").c_str()); //std::fflush(stderr);
-      }
-
- else {
-          lite3::NodeID owner = resolver_.get_node_owner(id);
-          if(0) std::fprintf(stderr, "  [Engine] Node %016llx not local. Owner=%u, LocalNodeID=%u\n", (unsigned long long)id, owner, resolver_.get_local_node_id()); //std::fflush(stderr);
-          if (owner != resolver_.get_local_node_id()) {
-            remote_requests[owner].push_back(id);
-          }
+      node->ensure_loaded();
+      if (!node->is_loaded()) {
+        lite3::NodeID owner = resolver_.get_node_owner(id);
+        if (owner != resolver_.get_local_node_id()) {
+          remote_requests[owner].push_back(id);
+        }
       }
     }
     result.push_back(node);

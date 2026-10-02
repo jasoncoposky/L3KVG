@@ -25,7 +25,7 @@ public:
   Query &match_id(std::string_view uuid, std::string_view alias = "a");
 
   // Filters
-  enum class Op { Eq, Ne, Gt, Ge, Lt, Le, Like };
+  enum class Op { Eq, Ne, Gt, Ge, Lt, Le, Like, NotLike };
   enum class LogicalOp { And, Or };
 
   struct Filter {
@@ -96,7 +96,7 @@ public:
 
   // Projection
   enum class AggOp { None, Count, Sum, Avg, Min, Max };
-  Query &return_(std::string_view alias, std::string_view property, AggOp agg = AggOp::None);
+  Query &return_(std::string_view alias, std::string_view property, AggOp agg = AggOp::None, bool distinct = false);
 
   // Sorting & Pagination
   Query &order_by(std::string_view alias, std::string_view property, bool ascending = true);
@@ -104,7 +104,7 @@ public:
   Query &offset(size_t offset);
 
   // Grouping
-  Query &group_by(std::string_view alias, std::string_view property);
+  Query &group_by(std::string_view alias, std::string_view property, std::string_view func_name = "", const std::vector<std::string>& func_args = {});
   Query &distinct(bool enable = true);
 
   // Execution
@@ -149,6 +149,7 @@ private:
     std::string alias;
     std::string property;
     AggOp agg = AggOp::None;
+    bool distinct = false;
   };
   struct SortStep {
     std::string alias;
@@ -158,6 +159,8 @@ private:
   struct GroupStep {
     std::string alias;
     std::string property;
+    std::string func_name;
+    std::vector<std::string> func_args;
   };
 
   std::optional<MatchStep> initial_match_;
