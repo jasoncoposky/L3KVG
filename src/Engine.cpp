@@ -2,6 +2,7 @@
 #include "L3KVG/Node.hpp"
 #include "L3KVG/Query.hpp"
 #include "L3KVG/KeyBuilder.hpp"
+#include "L3KVG/MutationBatch.hpp"
 #include "engine/store.hpp"
 #include "json.hpp"
 #include <iomanip>
@@ -448,6 +449,48 @@ void Engine::del_edge(uint64_t src_id, std::string label,
   }
 
   store_->wait_all_shards();
+}
+
+bool Engine::apply_batch(const lite3cpp::Buffer& buffer, uint32_t principal_id) {
+    size_t count = MutationBatch::item_count(buffer);
+    if (count == 0) return true;
+
+    try {
+        for (size_t i = 0; i < count; ++i) {
+            MutationItem item = MutationBatch::read_item(buffer, i);
+            switch (item.op) {
+                case MutationOp::PutRaw: {
+                    store_->put(std::string(item.key), std::string(item.value));
+                    break;
+                }
+                case MutationOp::PutNode: {
+                    put_node(item.src, std::string(item.value));
+                    break;
+                }
+                case MutationOp::AddEdge: {
+                    add_edge(item.src, std::string(item.label), item.weight, item.dst, std::string(item.value));
+                    break;
+                }
+                case MutationOp::DelRaw: {
+                    store_->del(std::string(item.key));
+                    break;
+                }
+                case MutationOp::DelNode: {
+                    del_node(item.src);
+                    break;
+                }
+                case MutationOp::DelEdge: {
+                    del_edge(item.src, std::string(item.label), item.weight, item.dst);
+                    break;
+                }
+            }
+        }
+        store_->wait_all_shards();
+        return true;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "[Engine::apply_batch] Exception: %s\n", e.what());
+        return false;
+    }
 }
 
 } // namespace l3kvg

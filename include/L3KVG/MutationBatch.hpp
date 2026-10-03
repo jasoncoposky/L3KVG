@@ -17,7 +17,7 @@ enum class MutationOp : uint8_t {
 };
 
 struct MutationItem {
-    MutationOp op;
+    MutationOp op = MutationOp::PutRaw;
     std::string_view key;
     std::string_view value;
     uint64_t src = 0;
@@ -41,6 +41,7 @@ public:
 
     [[nodiscard]] MutationItem get(size_t index) const;
     static MutationItem read_item(const lite3cpp::Buffer& buf, size_t index);
+    static size_t item_count(const lite3cpp::Buffer& buf);
 
     [[nodiscard]] const lite3cpp::Buffer& get_buffer() const noexcept { return buf_; }
     [[nodiscard]] size_t size() const noexcept { return count_; }
@@ -49,6 +50,7 @@ public:
 
 private:
     lite3cpp::Buffer buf_;
+    size_t arr_ofs_ = 0;
     size_t count_ = 0;
 };
 

@@ -4,6 +4,7 @@
 #include "L3KVG/KeyBuilder.hpp"
 #include "L3KVG/RemoteL3KVClient.hpp"
 #include "L3KVG/Settings.hpp"
+#include "L3KVG/MutationBatch.hpp"
 #include "engine/store.hpp"
 #include <cstdio>
 #include <fstream>
@@ -329,6 +330,33 @@ int main(int argc, char *argv[]) {
                       sock.send(zmq::message_t("OK", 2), zmq::send_flags::none);
                   } catch (const std::exception& e) {
                       if(1) std::fprintf(stderr, "L3_SERVER: Error D: %s\n", e.what()); //std::fflush(stderr);
+                      sock.send(identity, zmq::send_flags::sndmore);
+                      sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                      sock.send(zmq::message_t("ERR", 3), zmq::send_flags::none);
+                  }
+              } else if (opcode == "B") {
+                  try {
+                      if (data_idx < recv_msgs.size()) {
+                          const auto& msg = recv_msgs[data_idx];
+                          lite3cpp::Buffer batch_buf(std::vector<uint8_t>(
+                              static_cast<const uint8_t*>(msg.data()),
+                              static_cast<const uint8_t*>(msg.data()) + msg.size()
+                          ));
+                          bool ok = engine->apply_batch(batch_buf, principal_id);
+                          sock.send(identity, zmq::send_flags::sndmore);
+                          sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                          if (ok) {
+                              sock.send(zmq::message_t("OK", 2), zmq::send_flags::none);
+                          } else {
+                              sock.send(zmq::message_t("ERR", 3), zmq::send_flags::none);
+                          }
+                      } else {
+                          sock.send(identity, zmq::send_flags::sndmore);
+                          sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                          sock.send(zmq::message_t("ERR", 3), zmq::send_flags::none);
+                      }
+                  } catch (const std::exception& e) {
+                      if (1) std::fprintf(stderr, "L3_SERVER: Error B: %s\n", e.what());
                       sock.send(identity, zmq::send_flags::sndmore);
                       sock.send(zmq::message_t(), zmq::send_flags::sndmore);
                       sock.send(zmq::message_t("ERR", 3), zmq::send_flags::none);

@@ -1,5 +1,9 @@
 #include <gtest/gtest.h>
 #include <L3KVG/MutationBatch.hpp>
+#include <L3KVG/Engine.hpp>
+#include <L3KVG/Node.hpp>
+#include "engine/store.hpp"
+#include <filesystem>
 
 TEST(MutationBatchTest, EmptyBatch) {
     l3kvg::MutationBatch batch;
@@ -38,4 +42,36 @@ TEST(MutationBatchTest, PackHeterogeneousMutations) {
     auto item3 = batch.get(3);
     EXPECT_EQ(item3.op, l3kvg::MutationOp::DelRaw);
     EXPECT_EQ(item3.key, "tmp:marker");
+}
+
+TEST(MutationBatchTest, EngineApplyBatch) {
+    std::string db_path = "test_apply_batch_db";
+    std::filesystem::remove_all(db_path);
+
+    {
+        l3kvg::Engine engine(db_path, 1);
+
+        l3kvg::MutationBatch batch;
+        batch.put_node(0x5001, "{\"n\":\"batch_file\"}");
+        batch.put_raw("idx:test:key", "val123");
+        batch.add_edge(0x6001, "CONTAINS", 1.0, 0x5001, "{}");
+
+        bool ok = engine.apply_batch(batch.get_buffer());
+        EXPECT_TRUE(ok);
+
+        auto node = engine.get_node(0x5001);
+        ASSERT_NE(node, nullptr);
+        EXPECT_EQ(node->get_attribute_as_string("n"), "batch_file");
+
+        auto raw_val = engine.get_store()->get("idx:test:key");
+        EXPECT_EQ(std::string(reinterpret_cast<const char*>(raw_val.data()), raw_val.size()), "val123");
+
+        auto node6001 = engine.get_node(0x6001);
+        ASSERT_NE(node6001, nullptr);
+        auto neighbors = node6001->get_neighbors("CONTAINS");
+        ASSERT_EQ(neighbors.size(), size_t(1));
+        EXPECT_EQ(neighbors[0], 0x5001);
+    }
+
+    std::filesystem::remove_all(db_path);
 }

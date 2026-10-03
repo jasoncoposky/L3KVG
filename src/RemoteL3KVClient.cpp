@@ -1,4 +1,5 @@
 #include "L3KVG/RemoteL3KVClient.hpp"
+#include "L3KVG/MutationBatch.hpp"
 #include "L3KVG/KeyBuilder.hpp"
 #include <iostream>
 #include <thread>
@@ -236,6 +237,10 @@ std::future<bool> RemoteL3KVClient::put_batch_binary_async(lite3::NodeID owner_i
             return false;
         }
     });
+}
+
+std::future<bool> RemoteL3KVClient::execute_batch_async(lite3::NodeID owner_id, const MutationBatch& batch, uint32_t principal_id) {
+    return put_batch_binary_async(owner_id, batch.get_buffer(), principal_id);
 }
 
 std::future<bool> RemoteL3KVClient::replicate_async(uint16_t cluster_id, const std::string& key, const std::string& payload, uint16_t origin_cluster_id, uint32_t principal_id) {

@@ -79,6 +79,8 @@ public:
   void del_edge(uint64_t src_id, std::string label,
                 double weight, uint64_t dst_id);
 
+  bool apply_batch(const lite3cpp::Buffer& buffer, uint32_t principal_id = l3kv::INTERNAL_UID);
+
   // Mechanical Sympathy & HPC APIs
   SREMetrics &get_metrics() { return metrics_; }
   const Settings& get_settings() const { return settings_; }
