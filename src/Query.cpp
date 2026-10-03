@@ -448,9 +448,7 @@ std::vector<ResultRow> Query::execute() {
       if (!has_complex) {
           if (auto* f = find_first_eq_filter(root_filters_, root_alias_, "id")) {
               had_eq_filter = true;
-              if (f->value.size() == 16 && std::all_of(f->value.begin(), f->value.end(), ::isxdigit)) {
-                  frontier_set.insert(engine_->get_resolver().parse_uuid(f->value));
-              }
+              frontier_set.insert(engine_->get_resolver().parse_uuid(f->value));
           }
           if (frontier_set.empty()) {
             std::function<void(const FilterGroup&)> find_index_filters = [&](const FilterGroup& fg) {

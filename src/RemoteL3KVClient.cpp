@@ -106,6 +106,9 @@ void RemoteL3KVClient::ensure_authenticated(std::shared_ptr<Session> session, li
     try {
         std::string uid_str = std::to_string(settings_.node_id);
 
+        // Delimiter frame
+        session->socket->send(zmq::message_t(), zmq::send_flags::sndmore);
+
         // EffectiveUID frame for Auth (dummy 0)
         uint32_t dummy_uid = 0;
         session->socket->send(zmq::message_t(&dummy_uid, 4), zmq::send_flags::sndmore);
