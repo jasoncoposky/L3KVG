@@ -26,6 +26,7 @@ add_library(l3kvg_engine STATIC
     src/RemoteL3KVClient.cpp
     src/EdgeCoordinator.cpp
     src/ThreadPool.cpp
+    src/MutationBatch.cpp
 )
 
 target_include_directories(l3kvg_engine PUBLIC
@@ -101,6 +102,10 @@ add_test(NAME test_async COMMAND test_async_traversal)
 add_test(NAME test_edge_props COMMAND test_edge_properties)
 add_test(NAME test_federation COMMAND test_federation_id)
 add_test(NAME test_federation_query COMMAND test_federation_query)
+
+add_executable(test_mutation_batch tests/test_mutation_batch.cpp)
+target_link_libraries(test_mutation_batch PRIVATE l3kvg_engine gtest_main Threads::Threads)
+add_test(NAME test_mutation_batch COMMAND test_mutation_batch)
 
 add_executable(test_federation_integration tests/test_federation_integration.cpp)
 target_link_libraries(test_federation_integration PRIVATE l3kvg_engine gtest_main Threads::Threads $<$<BOOL:${WIN32}>:ws2_32>)
