@@ -361,6 +361,7 @@ TEST(SecureMeshTest, PrincipalPropagation) {
     uint64_t target_id = FederationID::pack(3, 999);
     std::string target_key = std::string(KeyBuilder::node_key(target_id));
     node3.engine->get_store()->put(target_key, "{\"name\":\"Secret\"}");
+    node3.engine->get_store()->wait_all_shards();
     node3.engine->get_store()->credentials().set_acl(user_id, "n:{", l3kv::Permission::READ);
 
     std::cout << "[Test] Node 1 (Admin Session) fetching from Node 3 as UID 500 via Query..." << std::endl;

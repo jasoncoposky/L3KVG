@@ -1,4 +1,5 @@
 #include "L3KVG/Engine.hpp"
+#include "engine/store.hpp"
 #include "L3KVG/Query.hpp"
 #include "L3KVG/FederationID.hpp"
 #include "L3KVG/QueryResult.hpp"
@@ -121,6 +122,7 @@ TEST(FederationIntegrationTest, EndToEndZmqQuery) {
 
     uint64_t node_b_id = engine->get_resolver().parse_uuid("remote:node_b");
     engine->add_edge(node_a_id, "link", 1.0, node_b_id);
+    engine->get_store()->wait_all_shards();
 
     auto results = engine->query()
                          .match("a")

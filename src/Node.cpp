@@ -54,9 +54,18 @@ void Node::ensure_loaded() {
           // TODO: Update client to take uint64_t
           std::string raw_data = client.get_node_payload_async(owner, id_).get();
           if (!raw_data.empty()) {
-              payload_ = lite3cpp::lite3_json::from_json_string(raw_data);
+              try {
+                  if (raw_data.starts_with("{")) {
+                      payload_ = lite3cpp::lite3_json::from_json_string(raw_data);
+                  } else {
+                      std::vector<uint8_t> vec(raw_data.begin(), raw_data.end());
+                      payload_ = lite3cpp::Buffer(std::move(vec));
+                  }
+              } catch (const std::exception& e) {
+                  payload_ = lite3cpp::Buffer(std::vector<uint8_t>(raw_data.begin(), raw_data.end()));
+              }
               
-              if (payload_->get_type(0, "bloom") == lite3cpp::Type::Int64) {
+              if (payload_ && payload_->get_type(0, "bloom") == lite3cpp::Type::Int64) {
                   bloom_filter_ = payload_->get_i64(0, "bloom");
               } else {
                   bloom_filter_ = 0xFFFFFFFFFFFFFFFF;

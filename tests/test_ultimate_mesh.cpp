@@ -64,7 +64,7 @@ NodeHandle(uint32_t id, uint16_t cid, uint16_t port, std::string db, std::shared
 
                         auto identity = std::move(recv_msgs[0]);
                         auto identity_str = identity.to_string();
-                        
+
                         uint32_t effective_uid = 0;
                         if (recv_msgs[2].size() == 4) {
                             effective_uid = *static_cast<uint32_t*>(recv_msgs[2].data());

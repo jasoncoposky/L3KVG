@@ -27,6 +27,10 @@ lite3::NodeID FederationResolver::get_local_shard_owner(uint64_t vertex_id) cons
 
 bool FederationResolver::is_local(uint64_t vertex_id) const {
   std::shared_lock lock(mutex_);
+  uint16_t cluster_id = FederationID::get_cluster(vertex_id);
+  if (cluster_id != 0 && cluster_id != local_cluster_id_) {
+      return false;
+  }
   return get_node_owner_impl(vertex_id) == local_node_id_;
 }
 
@@ -114,6 +118,8 @@ uint64_t FederationResolver::parse_uuid(std::string_view uuid_str) const {
             local_uuid = uuid_str.substr(colon_pos + 1);
             cluster_id = it->second;
             found_cluster = true;
+        } else {
+            throw std::runtime_error("Unknown cluster in UUID: " + std::string(cluster_name));
         }
     }
 

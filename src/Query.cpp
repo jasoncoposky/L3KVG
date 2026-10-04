@@ -240,28 +240,60 @@ static bool evaluate_filter(Node* node, const Query::Filter& f, Engine* engine) 
             #endif
             break;
         }
-        case Query::Op::Like: {
-            std::string regex_str = "^";
-            for (char c : f.value) {
-                if (c == '%') regex_str += ".*";
-                else if (c == '_') regex_str += ".";
-                else if (c == '.' || c == '*' || c == '+' || c == '?' || c == '(' || c == ')' || c == '[' || c == ']' || c == '{' || c == '}' || c == '|') { regex_str += "\\"; regex_str += c; }
-                else regex_str += c;
-            }
-            regex_str += "$";
-            try { std::regex re(regex_str, std::regex_constants::icase); res = std::regex_match(s_val, re); } catch (...) { res = false; }
-            break;
-        }
+        case Query::Op::Like:
         case Query::Op::NotLike: {
-            std::string regex_str = "^";
-            for (char c : f.value) {
-                if (c == '%') regex_str += ".*";
-                else if (c == '_') regex_str += ".";
-                else if (c == '.' || c == '*' || c == '+' || c == '?' || c == '(' || c == ')' || c == '[' || c == ']' || c == '{' || c == '}' || c == '|') { regex_str += "\\"; regex_str += c; }
-                else regex_str += c;
+            bool matches = false;
+            bool has_underscore = (f.value.find('_') != std::string::npos);
+            size_t first_pct = f.value.find('%');
+            size_t last_pct = f.value.rfind('%');
+
+            if (!has_underscore) {
+                if (first_pct == std::string::npos) {
+                    // Exact match (case-insensitive)
+                    matches = (strcasecmp(s_val.c_str(), f.value.c_str()) == 0);
+                } else if (first_pct == f.value.size() - 1 && last_pct == first_pct) {
+                    // Prefix match: "prefix%"
+                    std::string_view pfx(f.value.data(), first_pct);
+                    matches = (s_val.size() >= pfx.size() && strncasecmp(s_val.data(), pfx.data(), pfx.size()) == 0);
+                } else if (first_pct == 0 && last_pct == 0) {
+                    // Suffix match: "%suffix"
+                    std::string_view sfx(f.value.data() + 1, f.value.size() - 1);
+                    matches = (s_val.size() >= sfx.size() && strncasecmp(s_val.data() + s_val.size() - sfx.size(), sfx.data(), sfx.size()) == 0);
+                } else if (first_pct == 0 && last_pct == f.value.size() - 1 && f.value.size() >= 2) {
+                    // Substring match: "%substr%"
+                    size_t mid_pct = f.value.find('%', 1);
+                    if (mid_pct == last_pct) {
+                        std::string sub = f.value.substr(1, last_pct - 1);
+                        auto it = std::search(s_val.begin(), s_val.end(), sub.begin(), sub.end(),
+                                              [](char a, char b) { return ::tolower(a) == ::tolower(b); });
+                        matches = (it != s_val.end());
+                    }
+                }
             }
-            regex_str += "$";
-            try { std::regex re(regex_str, std::regex_constants::icase); res = !std::regex_match(s_val, re); } catch (...) { res = true; }
+
+            if (!matches && (has_underscore || (first_pct != std::string::npos && !(first_pct == f.value.size() - 1 && last_pct == first_pct)))) {
+                thread_local static std::unordered_map<std::string, std::regex> s_regex_cache;
+                auto it = s_regex_cache.find(f.value);
+                if (it == s_regex_cache.end()) {
+                    std::string regex_str = "^";
+                    for (char c : f.value) {
+                        if (c == '%') regex_str += ".*";
+                        else if (c == '_') regex_str += ".";
+                        else if (c == '.' || c == '*' || c == '+' || c == '?' || c == '(' || c == ')' || c == '[' || c == ']' || c == '{' || c == '}' || c == '|') { regex_str += "\\"; regex_str += c; }
+                        else regex_str += c;
+                    }
+                    regex_str += "$";
+                    try {
+                        it = s_regex_cache.emplace(f.value, std::regex(regex_str, std::regex_constants::icase)).first;
+                    } catch (...) {
+                        it = s_regex_cache.end();
+                    }
+                }
+                if (it != s_regex_cache.end()) {
+                    try { matches = std::regex_match(s_val, it->second); } catch (...) { matches = false; }
+                }
+            }
+            res = (f.op == Query::Op::Like) ? matches : !matches;
             break;
         }
         default: res = false;
@@ -445,22 +477,36 @@ std::vector<ResultRow> Query::execute() {
       root_alias_ = initial_match_->alias;
       bool has_complex = has_or_or_like_filter(root_filters_);
       bool had_eq_filter = false;
-      if (!has_complex) {
-          if (auto* f = find_first_eq_filter(root_filters_, root_alias_, "id")) {
-              had_eq_filter = true;
-              frontier_set.insert(engine_->get_resolver().parse_uuid(f->value));
-          }
-          if (frontier_set.empty()) {
-            std::function<void(const FilterGroup&)> find_index_filters = [&](const FilterGroup& fg) {
-                for (const auto &n : fg.nodes) {
-                    if (auto* f = std::get_if<Filter>(&n.node)) {
-                        if (f->alias == root_alias_ && f->op == Op::Eq) {
+
+      if (auto* f = find_first_eq_filter(root_filters_, root_alias_, "id")) {
+          had_eq_filter = true;
+          frontier_set.insert(engine_->get_resolver().parse_uuid(f->value));
+      }
+
+      if (frontier_set.empty()) {
+        std::function<void(const FilterGroup&)> find_index_filters = [&](const FilterGroup& fg) {
+            for (const auto &n : fg.nodes) {
+                if (auto* f = std::get_if<Filter>(&n.node)) {
+                    if (f->alias == root_alias_) {
+                        if (f->op == Op::Eq) {
                             if (f->key == "n" || f->key == "path" || f->key == "id") {
                                 had_eq_filter = true;
                             }
                             std::string idx_prefix = "idx:" + f->alias + ":" + f->key + ":" + f->value;
-                            auto idx_keys = engine_->get_store()->get_prefix_keys_all_shards(idx_prefix, "", 100);
-                            if (!idx_keys.empty()) {
+                            auto idx_keys = engine_->get_store()->get_prefix_keys_all_shards(idx_prefix, "", 100000);
+                            for (const auto& k : idx_keys) {
+                                auto idx_buf = engine_->get_store()->get(k);
+                                if (idx_buf.size() > 0) {
+                                    std::string id_str(reinterpret_cast<const char*>(idx_buf.data()), idx_buf.size());
+                                    try { frontier_set.insert(std::stoull(id_str, nullptr, 16)); } catch(...) {}
+                                }
+                            }
+                        } else if (f->op == Op::Like) {
+                            size_t first_wc = f->value.find_first_of("%_");
+                            std::string prefix_literal = (first_wc == std::string::npos) ? f->value : f->value.substr(0, first_wc);
+                            if (!prefix_literal.empty()) {
+                                std::string idx_prefix = "idx:" + f->alias + ":" + f->key + ":" + prefix_literal;
+                                auto idx_keys = engine_->get_store()->get_prefix_keys_all_shards(idx_prefix, "", 100000);
                                 for (const auto& k : idx_keys) {
                                     auto idx_buf = engine_->get_store()->get(k);
                                     if (idx_buf.size() > 0) {
@@ -468,17 +514,65 @@ std::vector<ResultRow> Query::execute() {
                                         try { frontier_set.insert(std::stoull(id_str, nullptr, 16)); } catch(...) {}
                                     }
                                 }
+                            } else {
+                                // Substring / trigram search
+                                std::vector<std::string> trigrams;
+                                std::string segment;
+                                for (char c : f->value) {
+                                    if (c == '%' || c == '_') {
+                                        if (segment.size() >= 3) {
+                                            for (size_t ti = 0; ti + 3 <= segment.size(); ++ti) {
+                                                trigrams.push_back(segment.substr(ti, 3));
+                                            }
+                                        }
+                                        segment.clear();
+                                    } else {
+                                        segment += c;
+                                    }
+                                }
+                                if (segment.size() >= 3) {
+                                    for (size_t ti = 0; ti + 3 <= segment.size(); ++ti) {
+                                        trigrams.push_back(segment.substr(ti, 3));
+                                    }
+                                }
+                                if (!trigrams.empty()) {
+                                    std::set<uint64_t> tri_candidates;
+                                    bool first_tri = true;
+                                    for (const auto& tri : trigrams) {
+                                        std::string tri_prefix = "idx:" + f->alias + ":tri:" + tri + ":";
+                                        auto idx_keys = engine_->get_store()->get_prefix_keys_all_shards(tri_prefix, "", 100000);
+                                        std::set<uint64_t> cur_tri_set;
+                                        for (const auto& k : idx_keys) {
+                                            auto idx_buf = engine_->get_store()->get(k);
+                                            if (idx_buf.size() > 0) {
+                                                std::string id_str(reinterpret_cast<const char*>(idx_buf.data()), idx_buf.size());
+                                                try { cur_tri_set.insert(std::stoull(id_str, nullptr, 16)); } catch(...) {}
+                                            }
+                                        }
+                                        if (first_tri) {
+                                            tri_candidates = std::move(cur_tri_set);
+                                            first_tri = false;
+                                        } else {
+                                            std::set<uint64_t> inter;
+                                            std::set_intersection(tri_candidates.begin(), tri_candidates.end(),
+                                                                  cur_tri_set.begin(), cur_tri_set.end(),
+                                                                  std::inserter(inter, inter.begin()));
+                                            tri_candidates = std::move(inter);
+                                        }
+                                    }
+                                    frontier_set.insert(tri_candidates.begin(), tri_candidates.end());
+                                }
                             }
                         }
-                    } else if (auto* sub = std::get_if<std::shared_ptr<FilterGroup>>(&n.node)) {
-                        if (*sub && n.prepended_op == LogicalOp::And) {
-                            find_index_filters(**sub);
-                        }
+                    }
+                } else if (auto* sub = std::get_if<std::shared_ptr<FilterGroup>>(&n.node)) {
+                    if (*sub && n.prepended_op == LogicalOp::And) {
+                        find_index_filters(**sub);
                     }
                 }
-            };
-            find_index_filters(root_filters_);
-          }
+            }
+        };
+        find_index_filters(root_filters_);
       }
       if (frontier_set.empty()) {
         if (had_eq_filter && !has_complex) {

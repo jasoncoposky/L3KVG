@@ -50,10 +50,11 @@ protected:
                         messages_received++;
                         auto identity = std::move(msgs[0]);
                         auto opcode = msgs[3].to_string();
-                        if (opcode == "P") { 
+                        if (opcode == "P" || opcode == "S") { 
                             std::string key = msgs[4].to_string();
                             std::string val = msgs[5].to_string();
                             engine2->get_store()->put(key, val);
+                            engine2->get_store()->wait_all_shards();
                             sock.send(identity, zmq::send_flags::sndmore);
                             sock.send(zmq::message_t(), zmq::send_flags::sndmore);
                             sock.send(zmq::message_t("OK", 2), zmq::send_flags::none);
