@@ -12,6 +12,7 @@ class Node;
 struct ResultRow {
     std::unordered_map<std::string, std::string> fields;
     std::vector<std::string> projected_values;
+    std::vector<std::string> projected_names;
     std::vector<std::shared_ptr<Node>> nodes; // Keep memory alive for views
 };
 

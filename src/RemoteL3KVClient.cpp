@@ -564,28 +564,18 @@ std::future<std::vector<ResultRow>> RemoteL3KVClient::resume_query_async(
                     lite3cpp::NodeView root_nv(reinterpret_cast<const lite3cpp::PackedNodeLayout*>(resp_buf.data()));
                     if (root_nv.type() == lite3cpp::Type::Array) {
                         uint32_t row_count = root_nv.size();
+                        std::vector<std::string> cols;
                         for (uint32_t r = 0; r < row_count; ++r) {
                             if (resp_buf.arr_get_type(0, r) != lite3cpp::Type::Object) continue;
                             size_t row_ofs = resp_buf.arr_get_obj(0, r);
-                            size_t fields_ofs = row_ofs;
-                            if (resp_buf.get_type(row_ofs, "fields") == lite3cpp::Type::Object) {
-                                fields_ofs = resp_buf.get_obj(row_ofs, "fields");
-                            }
                             ResultRow row;
-                            for (auto it = resp_buf.begin(fields_ofs); it != resp_buf.end(fields_ofs); ++it) {
-                                std::string k(it->key);
-                                if (it->value_type == lite3cpp::Type::String) {
-                                    row.fields[k] = std::string(resp_buf.get_str(fields_ofs, k));
-                                } else if (it->value_type == lite3cpp::Type::Int64) {
-                                    row.fields[k] = std::to_string(resp_buf.get_i64(fields_ofs, k));
-                                } else if (it->value_type == lite3cpp::Type::Float64) {
-                                    row.fields[k] = std::to_string(resp_buf.get_f64(fields_ofs, k));
-                                } else if (it->value_type == lite3cpp::Type::Bool) {
-                                    row.fields[k] = resp_buf.get_bool(fields_ofs, k) ? "true" : "false";
-                                } else if (it->value_type == lite3cpp::Type::Null) {
-                                    row.fields[k] = "";
-                                } else {
-                                    row.fields[k] = "";
+                            if (resp_buf.get_type(row_ofs, "cols") == lite3cpp::Type::Array) {
+                                size_t cols_ofs = resp_buf.get_arr(row_ofs, "cols");
+                                lite3cpp::NodeView cnv(reinterpret_cast<const lite3cpp::PackedNodeLayout*>(resp_buf.data() + cols_ofs));
+                                cols.clear();
+                                cols.reserve(cnv.size());
+                                for (uint32_t ci = 0; ci < cnv.size(); ++ci) {
+                                    cols.emplace_back(resp_buf.arr_get_str(cols_ofs, ci));
                                 }
                             }
                             if (resp_buf.get_type(row_ofs, "proj") == lite3cpp::Type::Array) {
@@ -594,6 +584,25 @@ std::future<std::vector<ResultRow>> RemoteL3KVClient::resume_query_async(
                                 row.projected_values.reserve(pnv.size());
                                 for (uint32_t pi = 0; pi < pnv.size(); ++pi) {
                                     row.projected_values.emplace_back(resp_buf.arr_get_str(proj_ofs, pi));
+                                    if (pi < cols.size()) {
+                                        row.fields[cols[pi]] = row.projected_values.back();
+                                    }
+                                }
+                            } else if (resp_buf.get_type(row_ofs, "fields") == lite3cpp::Type::Object) {
+                                size_t fields_ofs = resp_buf.get_obj(row_ofs, "fields");
+                                for (auto it = resp_buf.begin(fields_ofs); it != resp_buf.end(fields_ofs); ++it) {
+                                    std::string_view k(it->key);
+                                    if (it->value_type == lite3cpp::Type::String) {
+                                        row.fields.emplace(k, resp_buf.get_str(fields_ofs, it->key));
+                                    } else if (it->value_type == lite3cpp::Type::Int64) {
+                                        row.fields.emplace(k, std::to_string(resp_buf.get_i64(fields_ofs, it->key)));
+                                    } else if (it->value_type == lite3cpp::Type::Float64) {
+                                        row.fields.emplace(k, std::to_string(resp_buf.get_f64(fields_ofs, it->key)));
+                                    } else if (it->value_type == lite3cpp::Type::Bool) {
+                                        row.fields.emplace(k, resp_buf.get_bool(fields_ofs, it->key) ? "true" : "false");
+                                    } else {
+                                        row.fields.emplace(k, "");
+                                    }
                                 }
                             }
                             results.push_back(std::move(row));

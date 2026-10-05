@@ -651,6 +651,7 @@ std::vector<ResultRow> Query::execute() {
   {
       auto nodes = engine_->fetch_nodes(frontier, principal_id_);
       paths.reserve(nodes.size());
+      std::unordered_map<std::string, std::shared_ptr<Node>> available;
       for (auto& node : nodes) {
           if (!node || !node->is_loaded()) continue;
           if (!root_alias_.empty()) {
@@ -666,7 +667,7 @@ std::vector<ResultRow> Query::execute() {
           std::string key = std::string(KeyBuilder::node_key(node->get_id()));
           auto perm = (principal_id_ == INTERNAL_UID || principal_id_ == 0) ? l3kv::Permission::ADMIN : engine_->get_store()->credentials().check_permission(principal_id_, key);
           if (!(perm & l3kv::Permission::READ) && !(perm & l3kv::Permission::ADMIN)) continue;
-          std::unordered_map<std::string, std::shared_ptr<Node>> available; available[root_alias_] = node;
+          available[root_alias_] = node;
           bool eval_res = evaluate_group(root_filters_, available, root_alias_, engine_);
           if (eval_res) {
               Path p;
@@ -837,34 +838,32 @@ std::vector<ResultRow> Query::execute() {
   }
 
   for (const auto &path : paths) {
-    TriBool tb = evaluate_group_tribool(root_filters_, path.alias_to_node, "", engine_);
-    if (is_federated_branch_ ? (tb == TriBool::False) : (tb != TriBool::True)) {
-        continue;
+    if (!steps_.empty()) {
+        TriBool tb = evaluate_group_tribool(root_filters_, path.alias_to_node, "", engine_);
+        if (is_federated_branch_ ? (tb == TriBool::False) : (tb != TriBool::True)) {
+            continue;
+        }
     }
     ResultRow row;
     row.projected_values.resize(projections_.size());
+    row.projected_names.resize(projections_.size());
     for (const auto& [alias, node] : path.alias_to_node) {
         row.nodes.push_back(node);
         for (size_t i = 0; i < projections_.size(); ++i) {
             if (projections_[i].alias == alias) {
+                row.projected_names[i] = alias + "." + projections_[i].property;
                 if (node->has_attribute(projections_[i].property)) {
                     try {
                         std::string val = node->get_attribute_as_string(projections_[i].property);
                         row.fields[alias + "." + projections_[i].property] = val;
-                        row.fields["idx_" + std::to_string(i)] = val;
                         row.projected_values[i] = val;
                     } catch (...) {
-                        row.fields["idx_" + std::to_string(i)] = "";
                     }
                 }
             }
         }
         for (const auto& s : sorts_) if (s.alias == alias) { std::string k = s.alias + "." + s.property; if (row.fields.find(k) == row.fields.end()) { if (node->has_attribute(s.property)) row.fields[k] = node->get_attribute_as_string(s.property); } }
         for (const auto& g : groups_) if (g.alias == alias) { std::string k = g.alias + "." + g.property; if (row.fields.find(k) == row.fields.end()) { if (node->has_attribute(g.property)) row.fields[k] = node->get_attribute_as_string(g.property); } }
-    }
-    for (size_t i = 0; i < projections_.size(); ++i) {
-        if (!row.fields.contains("idx_" + std::to_string(i))) row.fields["idx_" + std::to_string(i)] = "";
-        row.fields["_col_" + std::to_string(i)] = projections_[i].alias + "." + projections_[i].property;
     }
     results.push_back(std::move(row));
   }
@@ -945,8 +944,10 @@ std::vector<ResultRow> Query::execute() {
               }
           }
           agg_row.projected_values.resize(projections_.size());
+          agg_row.projected_names.resize(projections_.size());
           for (size_t i = 0; i < projections_.size(); ++i) {
               const auto& p = projections_[i]; std::string k = "idx_" + std::to_string(i);
+              agg_row.projected_names[i] = p.alias + "." + p.property;
               agg_row.fields["_col_" + std::to_string(i)] = p.alias + "." + p.property;
               if (p.agg == AggOp::None) { 
                   if (!part.empty()) {
@@ -1077,16 +1078,25 @@ std::vector<ResultRow> Query::execute() {
 lite3cpp::Buffer Query::serialize_results(const std::vector<ResultRow>& rows) {
     lite3cpp::Buffer out_buf;
     out_buf.init_array();
+    bool wrote_cols = false;
     for (const auto& row : rows) {
         size_t row_ofs = out_buf.arr_append_obj(0);
-        size_t fields_ofs = out_buf.set_obj(row_ofs, "fields");
-        for (const auto& [k, v] : row.fields) {
-            out_buf.set_str(fields_ofs, k, v);
-        }
         if (!row.projected_values.empty()) {
+            if (!wrote_cols && !row.projected_names.empty()) {
+                size_t cols_ofs = out_buf.set_arr(row_ofs, "cols");
+                for (const auto& cn : row.projected_names) {
+                    out_buf.arr_append_str(cols_ofs, cn);
+                }
+                wrote_cols = true;
+            }
             size_t proj_ofs = out_buf.set_arr(row_ofs, "proj");
             for (const auto& pv : row.projected_values) {
                 out_buf.arr_append_str(proj_ofs, pv);
+            }
+        } else {
+            size_t fields_ofs = out_buf.set_obj(row_ofs, "fields");
+            for (const auto& [k, v] : row.fields) {
+                out_buf.set_str(fields_ofs, k, v);
             }
         }
     }
