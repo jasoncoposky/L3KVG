@@ -578,6 +578,9 @@ std::future<std::vector<ResultRow>> RemoteL3KVClient::resume_query_async(
                                     cols.emplace_back(resp_buf.arr_get_str(cols_ofs, ci));
                                 }
                             }
+                            if (r == 0) {
+                                row.projected_names = cols;
+                            }
                             if (resp_buf.get_type(row_ofs, "proj") == lite3cpp::Type::Array) {
                                 size_t proj_ofs = resp_buf.get_arr(row_ofs, "proj");
                                 lite3cpp::NodeView pnv(reinterpret_cast<const lite3cpp::PackedNodeLayout*>(resp_buf.data() + proj_ofs));

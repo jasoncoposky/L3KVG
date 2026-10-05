@@ -699,7 +699,6 @@ std::vector<ResultRow> Query::execute() {
 
               ResultRow row;
               row.nodes.push_back(node);
-              row.projected_names = invariant_proj_names;
               row.projected_values.resize(projections_.size());
 
               for (size_t i = 0; i < projections_.size(); ++i) {
@@ -739,6 +738,9 @@ std::vector<ResultRow> Query::execute() {
           }
           if (!local_results.empty()) {
               std::lock_guard<std::mutex> lock(results_mu);
+              if (results.empty() && !local_results.empty()) {
+                  local_results[0].projected_names = invariant_proj_names;
+              }
               results.insert(results.end(), std::make_move_iterator(local_results.begin()), std::make_move_iterator(local_results.end()));
           }
       });
@@ -1183,14 +1185,18 @@ std::vector<ResultRow> Query::execute() {
   });
   if (offset_) { if (*offset_ >= results.size()) results.clear(); else results.erase(results.begin(), results.begin() + *offset_); }
   if (limit_ && results.size() > *limit_) results.resize(*limit_);
+  if (!results.empty() && results[0].projected_names.empty() && !invariant_proj_names.empty()) {
+      results[0].projected_names = invariant_proj_names;
+  }
   L3_LOG(0, "Query::execute() returning results.size=%zu", results.size());
   return results;
 }
 
 lite3cpp::Buffer Query::serialize_results(const std::vector<ResultRow>& rows) {
     lite3cpp::Buffer out_buf;
-    size_t num_proj = (!rows.empty() && !rows[0].projected_values.empty()) ? rows[0].projected_values.size() : (!rows.empty() ? rows[0].fields.size() : 0);
-    out_buf.ensure_capacity(rows.size() * (num_proj * 32 + 64) + 128);
+    size_t num_proj = rows.empty() ? 0 : rows[0].projected_values.size();
+    size_t est_row_bytes = 2 * lite3cpp::config::node_size + num_proj * 48;
+    out_buf.ensure_capacity(rows.size() * est_row_bytes + 512);
     out_buf.init_array();
     bool wrote_cols = false;
     for (const auto& row : rows) {

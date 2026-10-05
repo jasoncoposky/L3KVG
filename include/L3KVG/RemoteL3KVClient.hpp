@@ -93,6 +93,23 @@ public:
         uint32_t principal_id = l3kv::INTERNAL_UID
     );
 
+    std::future<bool> put_raw_async(
+        lite3::NodeID owner_id,
+        const std::string& key,
+        const std::string& value,
+        uint32_t principal_id = l3kv::INTERNAL_UID
+    ) {
+        return put_edge_async(owner_id, key, value, principal_id);
+    }
+
+    std::future<bool> del_raw_async(
+        lite3::NodeID owner_id,
+        const std::string& key,
+        uint32_t principal_id = l3kv::INTERNAL_UID
+    ) {
+        return del_edge_async(owner_id, key, principal_id);
+    }
+
     virtual std::future<std::vector<std::pair<std::string, std::string>>> get_prefix_entries_async(
         lite3::NodeID owner_id,
         const std::string& prefix,
