@@ -359,10 +359,12 @@ bool Node::has_attribute(const std::string &key) {
   if (t != lite3cpp::Type::Null && t != lite3cpp::Type::Invalid) return true;
   if (payload_->get_type(0, "_binary") == lite3cpp::Type::Bytes) {
       auto bin = payload_->get_bytes(0, "_binary");
-      lite3cpp::Buffer nested(reinterpret_cast<const uint8_t*>(bin.data()), bin.size());
-      auto t2 = nested.get_type(0, key);
-      L3_LOG(0, "Node::has_attribute(%s): nested.get_type(0, %s)=%d", key.c_str(), key.c_str(), (int)t2);
-      return t2 != lite3cpp::Type::Null && t2 != lite3cpp::Type::Invalid;
+      if (bin.size() >= sizeof(lite3cpp::PackedNodeLayout)) {
+          lite3cpp::Buffer nested(reinterpret_cast<const uint8_t*>(bin.data()), bin.size());
+          auto t2 = nested.get_type(0, key);
+          L3_LOG(0, "Node::has_attribute(%s): nested.get_type(0, %s)=%d", key.c_str(), key.c_str(), (int)t2);
+          return t2 != lite3cpp::Type::Null && t2 != lite3cpp::Type::Invalid;
+      }
   }
   return false;
 }
@@ -375,8 +377,10 @@ lite3cpp::Type Node::get_attribute_type(std::string_view key) {
   auto type = payload_->get_type(0, key);
   if ((type == lite3cpp::Type::Null || type == lite3cpp::Type::Invalid) && payload_->get_type(0, "_binary") == lite3cpp::Type::Bytes) {
       auto bin = payload_->get_bytes(0, "_binary");
-      lite3cpp::Buffer nested(reinterpret_cast<const uint8_t*>(bin.data()), bin.size());
-      return nested.get_type(0, key);
+      if (bin.size() >= sizeof(lite3cpp::PackedNodeLayout)) {
+          lite3cpp::Buffer nested(reinterpret_cast<const uint8_t*>(bin.data()), bin.size());
+          return nested.get_type(0, key);
+      }
   }
   return type;
 }
@@ -418,8 +422,10 @@ std::string Node::get_attribute_as_string(std::string_view key) {
   std::string val = get_val(*payload_, key);
   if (val.empty() && payload_->get_type(0, "_binary") == lite3cpp::Type::Bytes) {
       auto bin = payload_->get_bytes(0, "_binary");
-      lite3cpp::Buffer nested(reinterpret_cast<const uint8_t*>(bin.data()), bin.size());
-      val = get_val(nested, key);
+      if (bin.size() >= sizeof(lite3cpp::PackedNodeLayout)) {
+          lite3cpp::Buffer nested(reinterpret_cast<const uint8_t*>(bin.data()), bin.size());
+          val = get_val(nested, key);
+      }
   }
   return val;
 }

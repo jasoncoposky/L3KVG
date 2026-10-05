@@ -102,8 +102,9 @@ void Engine::swizzle_node(uint64_t id, std::shared_ptr<Node> ptr) {
   if (auto it = shard.map.find(id); it != shard.map.end()) {
       it->second.node = ptr;
       shard.lru.splice(shard.lru.begin(), shard.lru, it->second.lru_it);
+      metrics_.cache_hits.fetch_add(1, std::memory_order_relaxed);
   } else {
-      if (shard.map.size() >= settings_.node_cache_size_per_shard) {
+      if (shard.map.size() >= settings_.node_cache_size_per_shard && !shard.lru.empty()) {
           uint64_t victim = shard.lru.back();
           shard.map.erase(victim);
           shard.lru.pop_back();
@@ -111,7 +112,6 @@ void Engine::swizzle_node(uint64_t id, std::shared_ptr<Node> ptr) {
       shard.lru.push_front(id);
       shard.map[id] = {ptr, shard.lru.begin()};
   }
-  metrics_.cache_hits.fetch_add(1, std::memory_order_relaxed);
 }
 
 std::shared_ptr<Node> Engine::get_swizzled(uint64_t id) {
