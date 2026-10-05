@@ -173,9 +173,6 @@ static bool evaluate_filter(Node* node, const Query::Filter& f, Engine* engine) 
                 if (type == lite3cpp::Type::Float64) { try { res = (std::stod(s_val) > std::stod(f.value)); } catch(...) { res = false; } }
                 else res = (s_val > f.value);
             }
-            #ifdef IRODS_SERVER
-            rodsLog(LOG_NOTICE, "[Filter] %s.%s: '%s' > '%s' ? %s", f.alias.c_str(), f.key.c_str(), s_val.c_str(), f.value.c_str(), res ? "YES" : "NO");
-            #endif
             break;
         }
         case Query::Op::Ge: {
@@ -193,9 +190,6 @@ static bool evaluate_filter(Node* node, const Query::Filter& f, Engine* engine) 
                 if (type == lite3cpp::Type::Float64) { try { res = (std::stod(s_val) >= std::stod(f.value)); } catch(...) { res = false; } }
                 else res = (s_val >= f.value);
             }
-            #ifdef IRODS_SERVER
-            rodsLog(LOG_NOTICE, "[Filter] %s.%s: '%s' >= '%s' ? %s", f.alias.c_str(), f.key.c_str(), s_val.c_str(), f.value.c_str(), res ? "YES" : "NO");
-            #endif
             break;
         }
         case Query::Op::Lt: {
@@ -213,9 +207,6 @@ static bool evaluate_filter(Node* node, const Query::Filter& f, Engine* engine) 
                 if (type == lite3cpp::Type::Float64) { try { res = (std::stod(s_val) < std::stod(f.value)); } catch(...) { res = false; } }
                 else res = (s_val < f.value);
             }
-            #ifdef IRODS_SERVER
-            rodsLog(LOG_NOTICE, "[Filter] %s.%s: '%s' < '%s' ? %s", f.alias.c_str(), f.key.c_str(), s_val.c_str(), f.value.c_str(), res ? "YES" : "NO");
-            #endif
             break;
         }
         case Query::Op::Le: {
@@ -233,9 +224,6 @@ static bool evaluate_filter(Node* node, const Query::Filter& f, Engine* engine) 
                 if (type == lite3cpp::Type::Float64) { try { res = (std::stod(s_val) <= std::stod(f.value)); } catch(...) { res = false; } }
                 else res = (s_val <= f.value);
             }
-            #ifdef IRODS_SERVER
-            rodsLog(LOG_NOTICE, "[Filter] %s.%s: '%s' <= '%s' ? %s", f.alias.c_str(), f.key.c_str(), s_val.c_str(), f.value.c_str(), res ? "YES" : "NO");
-            #endif
             break;
         }
         case Query::Op::Like:
@@ -732,11 +720,6 @@ std::vector<ResultRow> Query::execute() {
                     }
                     auto node = it_src->second;
                     auto neighbors = node->get_neighbors(s.label, s.min_weight, principal_id_);
-                    #ifdef IRODS_SERVER
-                    rodsLog(LOG_NOTICE, "[Query] Step %zu (OUT %s -> %s): Found %zu neighbors for node %016llx", i, src.c_str(), s.target_alias.c_str(), neighbors.size(), (unsigned long long)node->get_id());
-#else
-                    if(0) std::fprintf(stderr, "[Query] Step %zu (OUT %s -> %s): Found %zu neighbors for node %016llx\n", i, src.c_str(), s.target_alias.c_str(), neighbors.size(), (unsigned long long)node->get_id());
-#endif
                     std::unordered_set<uint64_t> unique_neighbors(neighbors.begin(), neighbors.end());
                     for (const auto& neighbor_id : unique_neighbors) {
                         try {
@@ -772,11 +755,6 @@ std::vector<ResultRow> Query::execute() {
                     }
                     auto node = it_src->second;
                     auto neighbors = node->get_in_neighbors(s.label, principal_id_);
-                    #ifdef IRODS_SERVER
-                    rodsLog(LOG_NOTICE, "[Query] Step %zu (IN %s -> %s): Found %zu neighbors for node %016llx", i, src.c_str(), s.target_alias.c_str(), neighbors.size(), (unsigned long long)node->get_id());
-#else
-                    if(0) std::fprintf(stderr, "[Query] Step %zu (IN %s -> %s): Found %zu neighbors for node %016llx\n", i, src.c_str(), s.target_alias.c_str(), neighbors.size(), (unsigned long long)node->get_id());
-#endif
                     std::unordered_set<uint64_t> unique_neighbors(neighbors.begin(), neighbors.end());
                     for (const auto& neighbor_id : unique_neighbors) {
                         try {
