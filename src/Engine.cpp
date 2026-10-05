@@ -55,6 +55,14 @@ size_t Engine::get_cache_shard(uint64_t id) {
     return std::hash<uint64_t>{}(id) % settings_.node_cache_shards;
 }
 
+void Engine::invalidate_node_cache(uint64_t id) {
+    size_t h = get_cache_shard(id);
+    auto& shard = *cache_shards_[h];
+    std::lock_guard<std::mutex> lock(shard.mutex);
+    shard.map.erase(id);
+    shard.lru.remove(id);
+}
+
 Query Engine::query() { return Query(this); }
 
 std::shared_ptr<Node> Engine::get_node(uint64_t id) {
@@ -184,6 +192,7 @@ void Engine::put_node(uint64_t id, std::string payload) {
   lite3::NodeID owner = resolver_.get_node_owner(id);
   
   if (owner != resolver_.get_local_node_id()) {
+    invalidate_node_cache(id);
     try {
         remote_client_->put_node_async(owner, id, payload);
         return;
@@ -219,13 +228,7 @@ void Engine::put_node(uint64_t id, std::string payload) {
   
   store_->put(std::move(key), std::move(binary_payload));
 
-  size_t h = get_cache_shard(id);
-  auto& shard = *cache_shards_[h];
-  {
-      std::lock_guard<std::mutex> lock(shard.mutex);
-      shard.map.erase(id);
-      shard.lru.remove(id);
-  }
+  invalidate_node_cache(id);
 }
 
 void Engine::put_node(std::string_view uuid, std::string payload) {
@@ -312,11 +315,7 @@ void Engine::replicate_key(const std::string& key, std::string payload, uint16_t
         store_->put(key, std::move(binary_payload));
 
         if (key.starts_with("n:{")) {
-            size_t h = get_cache_shard(id);
-            auto& shard = *cache_shards_[h];
-            std::lock_guard<std::mutex> lock(shard.mutex);
-            shard.map.erase(id);
-            shard.lru.remove(id);
+            invalidate_node_cache(id);
         }
     } catch (...) {
         store_->put(key, std::move(payload));
@@ -358,23 +357,18 @@ void Engine::del_node(uint64_t id) {
   
   if (owner != resolver_.get_local_node_id()) {
     // Phase 5 Pending: Remote del_node RPC
+    invalidate_node_cache(id);
     return;
-  }
-
-  size_t h = get_cache_shard(id);
-  auto& shard = *cache_shards_[h];
-  {
-      std::lock_guard<std::mutex> lock(shard.mutex);
-      shard.map.erase(id);
-      shard.lru.remove(id);
   }
 
   std::string key = std::string(KeyBuilder::node_key(id));
   store_->del(key);
+  invalidate_node_cache(id);
 }
 
 void Engine::flush() {
   store_->wait_all_shards();
+  store_->flush();
 }
 
 std::string Engine::format_weight(double weight) {
@@ -387,16 +381,8 @@ void Engine::add_edge(uint64_t src_id, std::string label,
   edge_coordinator_->atomic_put_edge(src_id, std::move(label), weight, dst_id, std::move(payload)).get();
   
   // Cache Invalidation
-  {
-      size_t h_src = get_cache_shard(src_id);
-      std::lock_guard<std::mutex> lock(cache_shards_[h_src]->mutex);
-      cache_shards_[h_src]->map.erase(src_id);
-  }
-  {
-      size_t h_dst = get_cache_shard(dst_id);
-      std::lock_guard<std::mutex> lock(cache_shards_[h_dst]->mutex);
-      cache_shards_[h_dst]->map.erase(dst_id);
-  }
+  invalidate_node_cache(src_id);
+  invalidate_node_cache(dst_id);
 }
 
 void Engine::add_edge(std::string_view src_uuid, std::string label,
@@ -410,16 +396,8 @@ void Engine::del_edge(uint64_t src_id, std::string label,
   edge_coordinator_->atomic_del_edge(src_id, std::move(label), weight, dst_id).get();
 
   // Cache Invalidation
-  {
-      size_t h_src = get_cache_shard(src_id);
-      std::lock_guard<std::mutex> lock(cache_shards_[h_src]->mutex);
-      cache_shards_[h_src]->map.erase(src_id);
-  }
-  {
-      size_t h_dst = get_cache_shard(dst_id);
-      std::lock_guard<std::mutex> lock(cache_shards_[h_dst]->mutex);
-      cache_shards_[h_dst]->map.erase(dst_id);
-  }
+  invalidate_node_cache(src_id);
+  invalidate_node_cache(dst_id);
 }
 
 bool Engine::apply_batch(const lite3cpp::Buffer& buffer, uint32_t principal_id) {
@@ -431,7 +409,7 @@ bool Engine::apply_batch(const lite3cpp::Buffer& buffer, uint32_t principal_id) 
             MutationItem item = MutationBatch::read_item(buffer, i);
             switch (item.op) {
                 case MutationOp::PutRaw: {
-                    store_->put(std::string(item.key), std::string(item.value));
+                    store_->put(std::string(item.key), std::string(item.value), principal_id);
                     break;
                 }
                 case MutationOp::PutNode: {
@@ -443,7 +421,7 @@ bool Engine::apply_batch(const lite3cpp::Buffer& buffer, uint32_t principal_id) 
                     break;
                 }
                 case MutationOp::DelRaw: {
-                    store_->del(std::string(item.key));
+                    store_->del(std::string(item.key), principal_id);
                     break;
                 }
                 case MutationOp::DelNode: {

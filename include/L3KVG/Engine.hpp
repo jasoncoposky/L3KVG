@@ -108,6 +108,7 @@ private:
   };
 
   size_t get_cache_shard(uint64_t id);
+  void invalidate_node_cache(uint64_t id);
 
   std::unique_ptr<l3kv::Engine> store_;
   FederationResolver resolver_;
