@@ -646,12 +646,12 @@ std::vector<ResultRow> Query::execute() {
   if (frontier_set.empty()) return results;
 
   std::vector<uint64_t> frontier(frontier_set.begin(), frontier_set.end());
+  struct Path { std::unordered_map<std::string, std::shared_ptr<Node>> alias_to_node; std::string last_alias; };
+  std::vector<Path> paths;
   {
-      std::vector<uint64_t> filtered;
       auto nodes = engine_->fetch_nodes(frontier, principal_id_);
+      paths.reserve(nodes.size());
       for (auto& node : nodes) {
-          L3_LOG(0, "Query::execute() checking node %016llx: ptr=%d, loaded=%d", 
-                 (unsigned long long)(node ? node->get_id() : 0), (node != nullptr), (node && node->is_loaded()));
           if (!node || !node->is_loaded()) continue;
           if (!root_alias_.empty()) {
               std::string et;
@@ -660,44 +660,25 @@ std::vector<ResultRow> Query::execute() {
               try { actual_type = node->get_attribute_as_string("t"); } catch (...) {}
               bool has_v = node->has_attribute("v");
               if (!is_entity_type_match(root_alias_, et, actual_type, has_v)) {
-                  L3_LOG(0, "Query::execute() node %016llx skipped: root_alias '%s' mismatch with et '%s', actual_type '%s'",
-                         (unsigned long long)node->get_id(), root_alias_.c_str(), et.c_str(), actual_type.c_str());
                   continue;
               }
           }
           std::string key = std::string(KeyBuilder::node_key(node->get_id()));
           auto perm = (principal_id_ == INTERNAL_UID || principal_id_ == 0) ? l3kv::Permission::ADMIN : engine_->get_store()->credentials().check_permission(principal_id_, key);
-          L3_LOG(0, "Query::execute() node %016llx: perm=0x%x, principal=%u", (unsigned long long)node->get_id(), (unsigned int)perm, principal_id_);
           if (!(perm & l3kv::Permission::READ) && !(perm & l3kv::Permission::ADMIN)) continue;
           std::unordered_map<std::string, std::shared_ptr<Node>> available; available[root_alias_] = node;
           bool eval_res = evaluate_group(root_filters_, available, root_alias_, engine_);
-          L3_LOG(0, "Query::execute() evaluate_group result=%d", eval_res);
-          if (eval_res) filtered.push_back(node->get_id());
+          if (eval_res) {
+              Path p;
+              p.alias_to_node[root_alias_] = node;
+              p.last_alias = root_alias_;
+              paths.push_back(std::move(p));
+          }
       }
-      frontier = std::move(filtered);
-  }
-
-  L3_LOG(0, "Query::execute() filtered frontier count=%zu", frontier.size());
-  if (frontier.empty()) return results;
-  
-  struct Path { std::unordered_map<std::string, std::shared_ptr<Node>> alias_to_node; std::string last_alias; };
-  std::vector<Path> paths;
-  for (const auto& id : frontier) {
-      auto node = engine_->get_node(id);
-      if (!node) continue;
-      std::string actual_type;
-      try { actual_type = node->get_attribute_as_string("t"); } catch (...) { actual_type = ""; }
-      std::string entity_type;
-      try { entity_type = node->get_attribute_as_string("entity_type"); } catch (...) { entity_type = ""; }
-      L3_LOG(0, "Query::execute() checking candidate %016llx: alias='%s', loaded=%d, type='%s', entity_type='%s', has_v=%d", (unsigned long long)id, root_alias_.c_str(), node->is_loaded(), actual_type.c_str(), entity_type.c_str(), node->has_attribute("v"));
-      bool type_match = is_entity_type_match(root_alias_, entity_type, actual_type, node->has_attribute("v"));
-
-      L3_LOG(0, "Query::execute() candidate %016llx: type_match=%d", (unsigned long long)id, type_match);
-      if (!type_match) continue;
-      Path p; p.alias_to_node[root_alias_] = node; p.last_alias = root_alias_; paths.push_back(std::move(p));
   }
 
   L3_LOG(0, "Query::execute() initial paths count=%zu", paths.size());
+  if (paths.empty()) return results;
 
   std::unordered_map<uint16_t, std::vector<std::pair<uint64_t, std::pair<std::string, std::vector<Step>>>>> suspended_branches;
 
@@ -861,6 +842,7 @@ std::vector<ResultRow> Query::execute() {
         continue;
     }
     ResultRow row;
+    row.projected_values.resize(projections_.size());
     for (const auto& [alias, node] : path.alias_to_node) {
         row.nodes.push_back(node);
         for (size_t i = 0; i < projections_.size(); ++i) {
@@ -870,7 +852,10 @@ std::vector<ResultRow> Query::execute() {
                         std::string val = node->get_attribute_as_string(projections_[i].property);
                         row.fields[alias + "." + projections_[i].property] = val;
                         row.fields["idx_" + std::to_string(i)] = val;
-                    } catch (...) { row.fields["idx_" + std::to_string(i)] = ""; }
+                        row.projected_values[i] = val;
+                    } catch (...) {
+                        row.fields["idx_" + std::to_string(i)] = "";
+                    }
                 }
             }
         }
@@ -959,6 +944,7 @@ std::vector<ResultRow> Query::execute() {
                   agg_row.fields[gk] = part[0].fields.at(gk);
               }
           }
+          agg_row.projected_values.resize(projections_.size());
           for (size_t i = 0; i < projections_.size(); ++i) {
               const auto& p = projections_[i]; std::string k = "idx_" + std::to_string(i);
               agg_row.fields["_col_" + std::to_string(i)] = p.alias + "." + p.property;
@@ -1028,6 +1014,7 @@ std::vector<ResultRow> Query::execute() {
                   }
                   agg_row.fields[p.alias + "." + p.property] = agg_row.fields[k];
               }
+              agg_row.projected_values[i] = agg_row.fields[k];
           }
           final_res.push_back(std::move(agg_row));
       }
@@ -1095,6 +1082,12 @@ lite3cpp::Buffer Query::serialize_results(const std::vector<ResultRow>& rows) {
         size_t fields_ofs = out_buf.set_obj(row_ofs, "fields");
         for (const auto& [k, v] : row.fields) {
             out_buf.set_str(fields_ofs, k, v);
+        }
+        if (!row.projected_values.empty()) {
+            size_t proj_ofs = out_buf.set_arr(row_ofs, "proj");
+            for (const auto& pv : row.projected_values) {
+                out_buf.arr_append_str(proj_ofs, pv);
+            }
         }
     }
     return out_buf;
