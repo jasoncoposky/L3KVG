@@ -143,6 +143,10 @@ add_executable(test_secure_mesh tests/test_secure_mesh.cpp)
 target_link_libraries(test_secure_mesh PRIVATE l3kvg_engine gtest_main Threads::Threads $<$<BOOL:${WIN32}>:ws2_32>)
 add_test(NAME test_secure_mesh COMMAND test_secure_mesh)
 
+add_executable(test_server_concurrency tests/test_server_concurrency.cpp)
+target_link_libraries(test_server_concurrency PRIVATE l3kvg_engine gtest_main Threads::Threads $<$<BOOL:${WIN32}>:ws2_32>)
+add_test(NAME test_server_concurrency COMMAND test_server_concurrency)
+
 add_executable(l3kvg_server src/server/main.cpp)
 target_link_libraries(l3kvg_server PRIVATE l3kvg_engine Threads::Threads $<$<BOOL:${WIN32}>:ws2_32> $<$<BOOL:${WIN32}>:wsock32> $<$<BOOL:${WIN32}>:crypt32>)
 
