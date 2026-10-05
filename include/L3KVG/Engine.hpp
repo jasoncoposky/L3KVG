@@ -103,8 +103,13 @@ public:
 private:
   struct CacheShard {
     std::mutex mutex;
-    std::unordered_map<uint64_t, std::shared_ptr<Node>> map;
-    std::list<uint64_t> lru;
+    using LruList = std::list<uint64_t>;
+    struct CacheEntry {
+      std::shared_ptr<Node> node;
+      LruList::iterator lru_it;
+    };
+    std::unordered_map<uint64_t, CacheEntry> map;
+    LruList lru;
   };
 
   size_t get_cache_shard(uint64_t id);
