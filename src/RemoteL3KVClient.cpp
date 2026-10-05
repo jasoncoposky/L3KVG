@@ -753,21 +753,20 @@ std::future<std::vector<std::pair<std::string, std::string>>> RemoteL3KVClient::
             std::vector<zmq::message_t> recv_msgs;
             auto res = zmq::recv_multipart(*session->socket, std::back_inserter(recv_msgs));
             if (res && recv_msgs.size() >= 2) {
-                std::string resp = recv_msgs[1].to_string();
-                if (resp.starts_with("ERR_") || resp == "ERR") {
+                const auto& msg = recv_msgs[1];
+                if (msg.size() >= 3 && std::memcmp(msg.data(), "ERR", 3) == 0) {
                     return {};
                 }
                 report_success(owner_id);
 
                 std::vector<std::pair<std::string, std::string>> entries;
-                if (recv_msgs[1].size() > 0) {
-                    std::vector<uint8_t> bytes(static_cast<const uint8_t*>(recv_msgs[1].data()),
-                                               static_cast<const uint8_t*>(recv_msgs[1].data()) + recv_msgs[1].size());
-                    lite3cpp::Buffer buf(std::move(bytes));
+                if (msg.size() > 0) {
+                    lite3cpp::Buffer buf(static_cast<const uint8_t*>(msg.data()), msg.size());
                     if (buf.size() >= sizeof(lite3cpp::PackedNodeLayout)) {
                         lite3cpp::NodeView nv(reinterpret_cast<const lite3cpp::PackedNodeLayout*>(buf.data()));
                         if (nv.type() == lite3cpp::Type::Array) {
                             uint32_t arr_size = nv.size();
+                            entries.reserve(arr_size);
                             for (uint32_t i = 0; i < arr_size; ++i) {
                                 auto elem_type = buf.arr_get_type(0, i);
                                 if (elem_type == lite3cpp::Type::Object) {
@@ -789,11 +788,19 @@ std::future<std::vector<std::pair<std::string, std::string>>> RemoteL3KVClient::
                     }
                 }
                 return entries;
+            } else {
+                report_failure(owner_id);
+                throw FederationTimeoutException("Prefix scan timed out");
             }
+        } catch (const FederationTimeoutException&) {
+            throw;
+        } catch (const std::exception& e) {
+            report_failure(owner_id);
+            throw;
         } catch (...) {
             report_failure(owner_id);
+            throw;
         }
-        return {};
     });
 }
 
@@ -808,15 +815,70 @@ std::future<std::vector<std::string>> RemoteL3KVClient::get_prefix_keys_async(
         return p.get_future();
     }
 
-    auto entries_fut = get_prefix_entries_async(owner_id, prefix, principal_id);
-    return task_pool_->enqueue([fut = std::move(entries_fut)]() mutable -> std::vector<std::string> {
-        auto entries = fut.get();
-        std::vector<std::string> keys;
-        keys.reserve(entries.size());
-        for (auto& [k, v] : entries) {
-            keys.push_back(std::move(k));
+    return task_pool_->enqueue([this, owner_id, prefix, principal_id]() -> std::vector<std::string> {
+        auto session = get_session(owner_id);
+        if (!session) return {};
+
+        try {
+            check_circuit(session);
+            ensure_authenticated(session, owner_id);
+        } catch (...) {
+            return {};
         }
-        return keys;
+
+        std::lock_guard<std::recursive_mutex> lock(session->mu);
+        try {
+            session->socket->send(zmq::message_t(), zmq::send_flags::sndmore);
+            uint32_t pid = principal_id;
+            session->socket->send(zmq::message_t(&pid, 4), zmq::send_flags::sndmore);
+            session->socket->send(zmq::message_t("K", 1), zmq::send_flags::sndmore);
+            session->socket->send(zmq::message_t(prefix.data(), prefix.size()), zmq::send_flags::none);
+
+            std::vector<zmq::message_t> recv_msgs;
+            auto res = zmq::recv_multipart(*session->socket, std::back_inserter(recv_msgs));
+            if (res && recv_msgs.size() >= 2) {
+                const auto& msg = recv_msgs[1];
+                if (msg.size() >= 3 && std::memcmp(msg.data(), "ERR", 3) == 0) {
+                    return {};
+                }
+                report_success(owner_id);
+
+                std::vector<std::string> keys;
+                if (msg.size() > 0) {
+                    lite3cpp::Buffer buf(static_cast<const uint8_t*>(msg.data()), msg.size());
+                    if (buf.size() >= sizeof(lite3cpp::PackedNodeLayout)) {
+                        lite3cpp::NodeView nv(reinterpret_cast<const lite3cpp::PackedNodeLayout*>(buf.data()));
+                        if (nv.type() == lite3cpp::Type::Array) {
+                            uint32_t arr_size = nv.size();
+                            keys.reserve(arr_size);
+                            for (uint32_t i = 0; i < arr_size; ++i) {
+                                auto elem_type = buf.arr_get_type(0, i);
+                                if (elem_type == lite3cpp::Type::Object) {
+                                    size_t obj_ofs = buf.arr_get_obj(0, i);
+                                    if (buf.get_type(obj_ofs, "k") == lite3cpp::Type::String) {
+                                        keys.emplace_back(buf.get_str(obj_ofs, "k"));
+                                    }
+                                } else if (elem_type == lite3cpp::Type::String) {
+                                    keys.emplace_back(buf.arr_get_str(0, i));
+                                }
+                            }
+                        }
+                    }
+                }
+                return keys;
+            } else {
+                report_failure(owner_id);
+                throw FederationTimeoutException("Prefix scan timed out");
+            }
+        } catch (const FederationTimeoutException&) {
+            throw;
+        } catch (const std::exception& e) {
+            report_failure(owner_id);
+            throw;
+        } catch (...) {
+            report_failure(owner_id);
+            throw;
+        }
     });
 }
 

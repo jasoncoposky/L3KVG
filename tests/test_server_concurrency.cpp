@@ -342,6 +342,13 @@ private:
             }
             try {
                 std::string prefix = recv_msgs[data_idx].to_string(); data_idx++;
+                auto perm = engine_->get_store()->credentials().check_permission(principal_id, prefix);
+                if (!(perm & l3kv::Permission::READ) && !(perm & l3kv::Permission::ADMIN)) {
+                    sock.send(identity, zmq::send_flags::sndmore);
+                    sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                    sock.send(zmq::message_t("ERR_AUTH", 8), zmq::send_flags::none);
+                    return;
+                }
                 size_t limit = 100000;
                 auto entries = engine_->get_store()->get_prefix_entries_all_shards(prefix, "", limit);
                 lite3cpp::Buffer kbuf;
