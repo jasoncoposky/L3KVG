@@ -22,6 +22,9 @@ struct HLCTimestamp {
     }
 
     void write_to_buffer(lite3cpp::Buffer& buf, size_t parent_ofs = 0, std::string_view key = "_hlc") const {
+        if (parent_ofs == 0 && buf.size() == 0) {
+            buf.init_object();
+        }
         size_t hlc_ofs = buf.set_obj(parent_ofs, key);
         buf.set_i64(hlc_ofs, "wall_time", static_cast<int64_t>(wall_time));
         buf.set_i64(hlc_ofs, "logical", static_cast<int64_t>(logical));
@@ -83,7 +86,7 @@ public:
         } else if (last_wall_time_ == current_wall) {
             logical_counter_++;
         } else {
-            logical_counter_ = 0;
+            logical_counter_++;
         }
     }
 

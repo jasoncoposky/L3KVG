@@ -44,6 +44,14 @@ Engine::~Engine() {
   store_.reset();
 }
 
+void Engine::set_remote_client(std::unique_ptr<RemoteL3KVClient> client) {
+  remote_client_ = std::move(client);
+  auto replication_cb = [this](const std::string& key, const std::string& payload) {
+      this->broadcast_replication(key, payload, this->resolver_.get_local_cluster_id());
+  };
+  edge_coordinator_ = std::make_unique<EdgeCoordinator>(store_.get(), resolver_, *remote_client_, settings_.node_id, pool_, settings_, replication_cb);
+}
+
 size_t Engine::get_cache_shard(uint64_t id) {
     return std::hash<uint64_t>{}(id) % settings_.node_cache_shards;
 }
@@ -189,7 +197,7 @@ void Engine::put_node(uint64_t id, std::string payload) {
   std::string binary_payload;
   auto ts = hlc_.now();
 
-  if (payload.size() >= 4 && (ptr[0] == 0x06 || ptr[0] == 0x07)) {
+  if (payload.size() >= sizeof(lite3cpp::PackedNodeLayout) && (ptr[0] == 0x06 || ptr[0] == 0x07)) {
       try {
           lite3cpp::Buffer buf(std::vector<uint8_t>(ptr, ptr + payload.size()));
           ts.write_to_buffer(buf, 0, "_hlc");
@@ -210,7 +218,6 @@ void Engine::put_node(uint64_t id, std::string payload) {
   std::string key = std::string(KeyBuilder::node_key(id));
   broadcast_replication(key, binary_payload, resolver_.get_local_cluster_id());
   
-  store_->del(key);
   store_->put(std::move(key), std::move(binary_payload));
   store_->wait_all_shards();
 
@@ -265,11 +272,11 @@ void Engine::replicate_key(const std::string& key, std::string payload, uint16_t
             lite3cpp::Buffer in_buf;
             bool is_binary = false;
             const uint8_t* in_ptr = reinterpret_cast<const uint8_t*>(payload.data());
-            if (payload.size() >= 4 && (in_ptr[0] == 0x06 || in_ptr[0] == 0x07 || in_ptr[0] == 0x00)) {
+            if (payload.size() >= sizeof(lite3cpp::PackedNodeLayout) && (in_ptr[0] == 0x06 || in_ptr[0] == 0x07)) {
                 try {
                     in_buf = lite3cpp::Buffer(std::vector<uint8_t>(in_ptr, in_ptr + payload.size()));
                     is_binary = true;
-                    binary_payload = std::move(payload);
+                    binary_payload = payload;
                 } catch (...) {}
             }
             if (!is_binary) {
@@ -277,7 +284,7 @@ void Engine::replicate_key(const std::string& key, std::string payload, uint16_t
                     in_buf = lite3cpp::lite3_json::from_json_string(payload);
                     binary_payload = std::string(reinterpret_cast<const char*>(in_buf.data()), in_buf.size());
                 } catch (...) {
-                    binary_payload = std::move(payload);
+                    binary_payload = payload;
                 }
             }
 
@@ -301,10 +308,9 @@ void Engine::replicate_key(const std::string& key, std::string payload, uint16_t
                 }
             }
         } catch (...) {
-            binary_payload = std::move(payload);
+            binary_payload = payload;
         }
 
-        store_->del(key);
         store_->put(key, std::move(binary_payload));
         store_->wait_all_shards();
 
@@ -316,7 +322,7 @@ void Engine::replicate_key(const std::string& key, std::string payload, uint16_t
             shard.lru.remove(id);
         }
     } catch (...) {
-        store_->put(key, payload);
+        store_->put(key, std::move(payload));
     }
 }
 

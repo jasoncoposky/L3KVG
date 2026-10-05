@@ -2,12 +2,99 @@
 #include "engine/store.hpp"
 #include "L3KVG/Engine.hpp" 
 #include "L3KVG/KeyBuilder.hpp"
+#include "L3KVG/MutationBatch.hpp"
 #include <cstdio>
 #include <stdexcept>
 #include <vector>
 #include <future>
 
 namespace l3kvg {
+
+namespace {
+
+void copy_array(const lite3cpp::Buffer& src, size_t src_arr_ofs, lite3cpp::Buffer& dst, size_t dst_arr_ofs);
+
+void copy_properties(const lite3cpp::Buffer& src, size_t src_obj_ofs, lite3cpp::Buffer& dst, size_t dst_obj_ofs) {
+    for (auto it = src.begin(src_obj_ofs); it != src.end(src_obj_ofs); ++it) {
+        switch (it->value_type) {
+            case lite3cpp::Type::Int64:
+                dst.set_i64(dst_obj_ofs, it->key, src.get_i64(src_obj_ofs, it->key));
+                break;
+            case lite3cpp::Type::Float64:
+                dst.set_f64(dst_obj_ofs, it->key, src.get_f64(src_obj_ofs, it->key));
+                break;
+            case lite3cpp::Type::String:
+                dst.set_str(dst_obj_ofs, it->key, src.get_str(src_obj_ofs, it->key));
+                break;
+            case lite3cpp::Type::Bool:
+                dst.set_bool(dst_obj_ofs, it->key, src.get_bool(src_obj_ofs, it->key));
+                break;
+            case lite3cpp::Type::Null:
+                dst.set_null(dst_obj_ofs, it->key);
+                break;
+            case lite3cpp::Type::Bytes:
+                dst.set_bytes(dst_obj_ofs, it->key, src.get_bytes(src_obj_ofs, it->key));
+                break;
+            case lite3cpp::Type::Object: {
+                size_t child_src_obj = src.get_obj(src_obj_ofs, it->key);
+                size_t child_dst_obj = dst.set_obj(dst_obj_ofs, it->key);
+                copy_properties(src, child_src_obj, dst, child_dst_obj);
+                break;
+            }
+            case lite3cpp::Type::Array: {
+                size_t child_src_arr = src.get_arr(src_obj_ofs, it->key);
+                size_t child_dst_arr = dst.set_arr(dst_obj_ofs, it->key);
+                copy_array(src, child_src_arr, dst, child_dst_arr);
+                break;
+            }
+            default:
+                break;
+        }
+    }
+}
+
+void copy_array(const lite3cpp::Buffer& src, size_t src_arr_ofs, lite3cpp::Buffer& dst, size_t dst_arr_ofs) {
+    lite3cpp::NodeView node(reinterpret_cast<const lite3cpp::PackedNodeLayout*>(src.data() + src_arr_ofs));
+    for (uint32_t i = 0; i < node.size(); ++i) {
+        lite3cpp::Type val_type = src.arr_get_type(src_arr_ofs, i);
+        switch (val_type) {
+            case lite3cpp::Type::Int64:
+                dst.arr_append_i64(dst_arr_ofs, src.arr_get_i64(src_arr_ofs, i));
+                break;
+            case lite3cpp::Type::Float64:
+                dst.arr_append_f64(dst_arr_ofs, src.arr_get_f64(src_arr_ofs, i));
+                break;
+            case lite3cpp::Type::String:
+                dst.arr_append_str(dst_arr_ofs, src.arr_get_str(src_arr_ofs, i));
+                break;
+            case lite3cpp::Type::Bool:
+                dst.arr_append_bool(dst_arr_ofs, src.arr_get_bool(src_arr_ofs, i));
+                break;
+            case lite3cpp::Type::Null:
+                dst.arr_append_null(dst_arr_ofs);
+                break;
+            case lite3cpp::Type::Bytes:
+                dst.arr_append_bytes(dst_arr_ofs, src.arr_get_bytes(src_arr_ofs, i));
+                break;
+            case lite3cpp::Type::Object: {
+                size_t child_src_obj = src.arr_get_obj(src_arr_ofs, i);
+                size_t child_dst_obj = dst.arr_append_obj(dst_arr_ofs);
+                copy_properties(src, child_src_obj, dst, child_dst_obj);
+                break;
+            }
+            case lite3cpp::Type::Array: {
+                size_t child_src_arr = src.arr_get_arr(src_arr_ofs, i);
+                size_t child_dst_arr = dst.arr_append_arr(dst_arr_ofs);
+                copy_array(src, child_src_arr, dst, child_dst_arr);
+                break;
+            }
+            default:
+                break;
+        }
+    }
+}
+
+} // anonymous namespace
 
 EdgeCoordinator::EdgeCoordinator(l3kv::Engine* store, FederationResolver& resolver, RemoteL3KVClient& remote_client, uint32_t node_id, std::shared_ptr<ThreadPool> pool, const Settings& settings, 
                                  std::function<void(const std::string&, const std::string&)> replication_cb)
@@ -37,28 +124,11 @@ std::future<void> EdgeCoordinator::atomic_put_edge(uint64_t src_id, const std::s
     ts.write_to_buffer(buf, 0, "ts");
     if (!payload.empty()) {
         const uint8_t* ptr = reinterpret_cast<const uint8_t*>(payload.data());
-        if (payload.size() >= 4 && (ptr[0] == 0x06 || ptr[0] == 0x07)) {
+        if (payload.size() >= sizeof(lite3cpp::PackedNodeLayout) && (ptr[0] == 0x06 || ptr[0] == 0x07)) {
             try {
                 lite3cpp::Buffer props_buf(std::vector<uint8_t>(ptr, ptr + payload.size()));
                 size_t props_ofs = buf.set_obj(0, "props");
-                for (auto it = props_buf.begin(0); it != props_buf.end(0); ++it) {
-                    switch (it->value_type) {
-                        case lite3cpp::Type::Int64:
-                            buf.set_i64(props_ofs, it->key, props_buf.get_i64(0, it->key));
-                            break;
-                        case lite3cpp::Type::Float64:
-                            buf.set_f64(props_ofs, it->key, props_buf.get_f64(0, it->key));
-                            break;
-                        case lite3cpp::Type::String:
-                            buf.set_str(props_ofs, it->key, props_buf.get_str(0, it->key));
-                            break;
-                        case lite3cpp::Type::Bool:
-                            buf.set_bool(props_ofs, it->key, props_buf.get_bool(0, it->key));
-                            break;
-                        default:
-                            break;
-                    }
-                }
+                copy_properties(props_buf, 0, buf, props_ofs);
             } catch (...) {
                 buf.set_str(0, "props", payload);
             }
@@ -66,24 +136,7 @@ std::future<void> EdgeCoordinator::atomic_put_edge(uint64_t src_id, const std::s
             try {
                 lite3cpp::Buffer props_buf = lite3cpp::lite3_json::from_json_string(payload);
                 size_t props_ofs = buf.set_obj(0, "props");
-                for (auto it = props_buf.begin(0); it != props_buf.end(0); ++it) {
-                    switch (it->value_type) {
-                        case lite3cpp::Type::Int64:
-                            buf.set_i64(props_ofs, it->key, props_buf.get_i64(0, it->key));
-                            break;
-                        case lite3cpp::Type::Float64:
-                            buf.set_f64(props_ofs, it->key, props_buf.get_f64(0, it->key));
-                            break;
-                        case lite3cpp::Type::String:
-                            buf.set_str(props_ofs, it->key, props_buf.get_str(0, it->key));
-                            break;
-                        case lite3cpp::Type::Bool:
-                            buf.set_bool(props_ofs, it->key, props_buf.get_bool(0, it->key));
-                            break;
-                        default:
-                            break;
-                    }
-                }
+                copy_properties(props_buf, 0, buf, props_ofs);
             } catch (...) {
                 buf.set_str(0, "props", payload);
             }
@@ -227,46 +280,59 @@ void EdgeCoordinator::flush_loop() {
 }
 
 void EdgeCoordinator::flush_shard(size_t shard_idx) {
-    std::vector<BatchEntry> to_flush;
-    std::vector<std::shared_ptr<std::promise<void>>> promises;
-    
-    auto& shard = shards_[shard_idx];
-    {
-        std::lock_guard<std::mutex> lock(shard.mu);
-        if (shard.buffer.empty()) return;
-        to_flush.swap(shard.buffer);
-        promises.swap(shard.promises);
-    }
-
-    std::unordered_map<lite3::NodeID, lite3cpp::Buffer> node_batches;
-    std::unordered_map<lite3::NodeID, std::vector<std::shared_ptr<std::promise<void>>>> node_promises;
-
-    for (size_t i = 0; i < to_flush.size(); ++i) {
-        auto const& entry = to_flush[i];
-        lite3::NodeID owner;
-        if (entry.key.starts_with("e:out:")) {
-            size_t start = entry.key.find('{');
-            size_t end = entry.key.find('}', start);
-            std::string id_str = entry.key.substr(start + 1, end - start - 1);
-            owner = resolver_.get_node_owner(std::stoull(id_str, nullptr, 16));
-        } else {
-            size_t start = entry.key.find('{');
-            size_t end = entry.key.find('}', start);
-            std::string id_str = entry.key.substr(start + 1, end - start - 1);
-            owner = resolver_.get_node_owner(std::stoull(id_str, nullptr, 16));
+    try {
+        std::vector<BatchEntry> to_flush;
+        std::vector<std::shared_ptr<std::promise<void>>> promises;
+        
+        auto& shard = shards_[shard_idx];
+        {
+            std::lock_guard<std::mutex> lock(shard.mu);
+            if (shard.buffer.empty()) return;
+            to_flush.swap(shard.buffer);
+            promises.swap(shard.promises);
         }
 
-        if (!node_batches.contains(owner)) {
-            node_batches[owner].init_object();
-        }
-        node_batches[owner].set_bytes(0, entry.key, {reinterpret_cast<const std::byte*>(entry.val.data()), entry.val.size()});
-        node_promises[owner].push_back(promises[i]);
-    }
+        std::unordered_map<lite3::NodeID, MutationBatch> node_batches;
+        std::unordered_map<lite3::NodeID, std::vector<std::shared_ptr<std::promise<void>>>> node_promises;
 
-    for (auto& [owner, batch_buf] : node_batches) {
-        remote_client_.put_batch_binary_async(owner, batch_buf);
-        auto p_list = std::move(node_promises[owner]);
-        for (auto& p : p_list) p->set_value();
+        for (size_t i = 0; i < to_flush.size(); ++i) {
+            auto const& entry = to_flush[i];
+            size_t start = entry.key.find('{');
+            size_t end = (start != std::string::npos) ? entry.key.find('}', start) : std::string::npos;
+            if (start == std::string::npos || end == std::string::npos || end <= start + 1) {
+                try { promises[i]->set_exception(std::make_exception_ptr(std::runtime_error("Invalid edge key format"))); } catch (...) {}
+                continue;
+            }
+            std::string id_str = entry.key.substr(start + 1, end - start - 1);
+            uint64_t node_id = 0;
+            try { node_id = std::stoull(id_str, nullptr, 16); } catch (...) {
+                try { promises[i]->set_exception(std::make_exception_ptr(std::runtime_error("Invalid node id in key"))); } catch (...) {}
+                continue;
+            }
+            lite3::NodeID owner = resolver_.get_node_owner(node_id);
+
+            node_batches[owner].put_raw(entry.key, std::string_view(reinterpret_cast<const char*>(entry.val.data()), entry.val.size()));
+            node_promises[owner].push_back(promises[i]);
+        }
+
+        std::vector<std::pair<std::future<bool>, std::vector<std::shared_ptr<std::promise<void>>>>> pending_batches;
+        for (auto& [owner, batch] : node_batches) {
+            auto fut = remote_client_.execute_batch_async(owner, batch);
+            pending_batches.emplace_back(std::move(fut), std::move(node_promises[owner]));
+        }
+
+        for (auto& [fut, p_list] : pending_batches) {
+            try {
+                fut.get();
+            } catch (...) {}
+            for (auto& p : p_list) {
+                try { p->set_value(); } catch (...) {}
+            }
+        }
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "[EdgeCoordinator::flush_shard] Uncaught exception: %s\n", e.what());
+    } catch (...) {
+        std::fprintf(stderr, "[EdgeCoordinator::flush_shard] Unknown uncaught exception\n");
     }
 }
 

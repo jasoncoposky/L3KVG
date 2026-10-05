@@ -30,6 +30,24 @@ public:
         p.set_value(std::move(results));
         return p.get_future();
     }
+
+    std::future<bool> execute_batch_async(
+        lite3::NodeID owner_id,
+        const MutationBatch& batch,
+        uint32_t principal_id = l3kv::INTERNAL_UID) override {
+        std::promise<bool> p;
+        p.set_value(true);
+        return p.get_future();
+    }
+
+    std::future<bool> put_batch_binary_async(
+        lite3::NodeID owner_id,
+        const lite3cpp::Buffer& batch_buffer,
+        uint32_t principal_id = l3kv::INTERNAL_UID) override {
+        std::promise<bool> p;
+        p.set_value(true);
+        return p.get_future();
+    }
 };
 }
 

@@ -65,8 +65,26 @@ void run_mock_server(uint16_t port, uint16_t cluster_id, const std::string& db_p
                 sock.send(zmq::message_t(resp_json.data(), resp_json.size()), zmq::send_flags::none);
                 running = false;
             } catch (...) {
+                sock.send(identity, zmq::send_flags::sndmore);
+                sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                sock.send(zmq::message_t("[]", 2), zmq::send_flags::none);
+                running = false;
             }
         } else if (opcode == "H") {
+            sock.send(identity, zmq::send_flags::sndmore);
+            sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+            sock.send(zmq::message_t("OK", 2), zmq::send_flags::none);
+        } else if (opcode == "B") {
+            try {
+                if (recv_msgs.size() >= 5) {
+                    const auto& msg = recv_msgs[4];
+                    lite3cpp::Buffer batch_buf(std::vector<uint8_t>(
+                        static_cast<const uint8_t*>(msg.data()),
+                        static_cast<const uint8_t*>(msg.data()) + msg.size()
+                    ));
+                    engine->apply_batch(batch_buf);
+                }
+            } catch (...) {}
             sock.send(identity, zmq::send_flags::sndmore);
             sock.send(zmq::message_t(), zmq::send_flags::sndmore);
             sock.send(zmq::message_t("OK", 2), zmq::send_flags::none);
