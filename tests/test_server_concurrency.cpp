@@ -12,9 +12,11 @@
 #include <vector>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <future>
 #include <algorithm>
 
@@ -65,7 +67,10 @@ public:
 
         flusher_thread_ = std::thread([this]() {
             while (running_.load(std::memory_order_relaxed)) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                std::unique_lock<std::mutex> lock(flusher_mu_);
+                flusher_cv_.wait_for(lock, std::chrono::milliseconds(50), [this] {
+                    return !running_.load(std::memory_order_relaxed);
+                });
                 if (!running_.load(std::memory_order_relaxed)) break;
                 try {
                     if (engine_ && engine_->get_store()) {
@@ -78,6 +83,7 @@ public:
 
     void stop() {
         if (!running_.exchange(false)) return;
+        flusher_cv_.notify_all();
 
         try {
             if (ctx_) {
@@ -98,8 +104,8 @@ public:
             if (ctx_) { ctx_->close(); ctx_.reset(); }
         } catch (...) {}
 
-        if (engine_ && engine_->get_store()) {
-            try { engine_->get_store()->flush(); } catch (...) {}
+        if (engine_) {
+            try { engine_->flush(); } catch (...) {}
         }
         std::filesystem::remove_all(db_path_);
     }
@@ -146,9 +152,10 @@ private:
 
         if (data_idx >= recv_msgs.size()) return;
 
-        std::string opcode = recv_msgs[data_idx].to_string(); data_idx++;
+        std::string_view opcode(static_cast<const char*>(recv_msgs[data_idx].data()), recv_msgs[data_idx].size());
+        data_idx++;
 
-                if (opcode == "+") {
+        if (opcode == "+") {
             if (data_idx + 1 > recv_msgs.size()) {
                 sock.send(identity, zmq::send_flags::sndmore);
                 sock.send(zmq::message_t(), zmq::send_flags::sndmore);
@@ -167,16 +174,15 @@ private:
                 size_t lidx = std::hash<std::string>{}(key) % 64;
                 std::lock_guard<std::mutex> lock(inc_locks[lidx]);
 
-                auto buf = engine_->get_store()->get(key);
+                auto buf = engine_->get_store()->get(key, principal_id);
                 int64_t val = 0;
                 if (buf.size() > 0) {
-                    lite3cpp::Buffer lbuf(std::vector<uint8_t>(buf.data(), buf.data() + buf.size()));
-                    val = lbuf.get_i64(0, "v");
+                    val = buf.get_i64(0, "v");
                 }
                 val += delta;
 
                 lite3cpp::Buffer nbuf; nbuf.init_object(); nbuf.set_i64(0, "v", val);
-                engine_->get_store()->put(key, nbuf.move_to_string());
+                engine_->get_store()->put(key, nbuf.move_to_string(), principal_id);
 
                 sock.send(identity, zmq::send_flags::sndmore);
                 sock.send(zmq::message_t(), zmq::send_flags::sndmore);
@@ -204,20 +210,20 @@ private:
                     uint64_t src = 0, dst = 0; double weight = 0; char label_buf[256] = {0};
                     int parsed = std::sscanf(key.c_str(), "e:out:{%llx\x7d:%255[^:]:%lf:{%llx\x7d", (unsigned long long*)&src, label_buf, &weight, (unsigned long long*)&dst);
                     if (parsed == 4) {
-                        engine_->add_edge(src, label_buf, weight, dst, payload);
+                        engine_->add_edge(src, label_buf, weight, dst, std::move(payload));
                     } else {
-                        engine_->get_store()->put(key, payload);
+                        engine_->get_store()->put(key, std::move(payload), principal_id);
                     }
                 } else if (key.starts_with("n:{")) {
                     uint64_t id = 0;
                     int parsed = std::sscanf(key.c_str(), "n:{%llx\x7d", (unsigned long long*)&id);
                     if (parsed == 1) {
-                        engine_->put_node(id, payload);
+                        engine_->put_node(id, std::move(payload));
                     } else {
-                        engine_->get_store()->put(key, payload);
+                        engine_->get_store()->put(key, std::move(payload), principal_id);
                     }
                 } else {
-                    engine_->get_store()->put(key, payload);
+                    engine_->get_store()->put(key, std::move(payload), principal_id);
                 }
 
                 sock.send(identity, zmq::send_flags::sndmore);
@@ -240,7 +246,7 @@ private:
             }
             try {
                 std::string key = recv_msgs[data_idx].to_string();
-                auto buf = engine_->get_store()->get(key);
+                auto buf = engine_->get_store()->get(key, principal_id);
                 sock.send(identity, zmq::send_flags::sndmore);
                 sock.send(zmq::message_t(), zmq::send_flags::sndmore);
                 sock.send(zmq::message_t(buf.data(), buf.size()), zmq::send_flags::none);
@@ -261,10 +267,7 @@ private:
             }
             try {
                 const auto& msg = recv_msgs[data_idx];
-                lite3cpp::Buffer batch_buf(std::vector<uint8_t>(
-                    static_cast<const uint8_t*>(msg.data()),
-                    static_cast<const uint8_t*>(msg.data()) + msg.size()
-                ));
+                lite3cpp::Buffer batch_buf(static_cast<const uint8_t*>(msg.data()), msg.size());
                 bool ok = engine_->apply_batch(batch_buf, principal_id);
                 sock.send(identity, zmq::send_flags::sndmore);
                 sock.send(zmq::message_t(), zmq::send_flags::sndmore);
@@ -342,6 +345,8 @@ private:
     std::vector<std::thread> workers_;
     std::thread proxy_thread_;
     std::thread flusher_thread_;
+    std::mutex flusher_mu_;
+    std::condition_variable flusher_cv_;
     std::atomic<bool> running_{false};
 };
 
