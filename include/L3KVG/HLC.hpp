@@ -4,7 +4,9 @@
 #include <chrono>
 #include <mutex>
 #include <cstdint>
-#include <nlohmann/json.hpp>
+#include <string_view>
+#include <algorithm>
+#include "buffer.hpp"
 
 namespace l3kvg {
 
@@ -19,18 +21,30 @@ struct HLCTimestamp {
         return node_id > other.node_id;
     }
 
+    void write_to_buffer(lite3cpp::Buffer& buf, size_t parent_ofs = 0, std::string_view key = "_hlc") const {
+        size_t hlc_ofs = buf.set_obj(parent_ofs, key);
+        buf.set_i64(hlc_ofs, "wall_time", static_cast<int64_t>(wall_time));
+        buf.set_i64(hlc_ofs, "logical", static_cast<int64_t>(logical));
+        buf.set_i64(hlc_ofs, "node_id", static_cast<int64_t>(node_id));
+    }
+
+    static HLCTimestamp read_from_buffer(const lite3cpp::Buffer& buf, size_t parent_ofs = 0, std::string_view key = "_hlc") {
+        HLCTimestamp ts;
+        try {
+            size_t hlc_ofs = buf.get_obj(parent_ofs, key);
+            if (hlc_ofs != static_cast<size_t>(-1)) {
+                ts.wall_time = static_cast<uint64_t>(buf.get_i64(hlc_ofs, "wall_time"));
+                ts.logical = static_cast<uint16_t>(buf.get_i64(hlc_ofs, "logical"));
+                ts.node_id = static_cast<uint32_t>(buf.get_i64(hlc_ofs, "node_id"));
+            }
+        } catch (...) {}
+        return ts;
+    }
+
     std::string to_json_string() const {
         return "{\"wall_time\": " + std::to_string(wall_time) + 
                ", \"logical\": " + std::to_string(logical) + 
                ", \"node_id\": " + std::to_string(node_id) + "}";
-    }
-
-    static HLCTimestamp from_json(const nlohmann::json& j) {
-        HLCTimestamp ts;
-        ts.wall_time = j.value("wall_time", 0ULL);
-        ts.logical = j.value("logical", (uint16_t)0);
-        ts.node_id = j.value("node_id", 0U);
-        return ts;
     }
 };
 

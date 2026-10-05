@@ -9,7 +9,6 @@
 #include <sstream>
 #include <iostream>
 
-using json = nlohmann::json;
 
 namespace l3kvg {
 
@@ -188,33 +187,23 @@ void Engine::put_node(uint64_t id, std::string payload) {
 
   const uint8_t* ptr = reinterpret_cast<const uint8_t*>(payload.data());
   std::string binary_payload;
+  auto ts = hlc_.now();
 
   if (payload.size() >= 4 && (ptr[0] == 0x06 || ptr[0] == 0x07)) {
-      binary_payload = std::move(payload);
-  } else {
-      auto ts = hlc_.now();
-      json j_meta;
-      bool is_json = false;
       try {
-          j_meta = json::parse(payload);
-          is_json = true;
+          lite3cpp::Buffer buf(std::vector<uint8_t>(ptr, ptr + payload.size()));
+          ts.write_to_buffer(buf, 0, "_hlc");
+          binary_payload = std::string(reinterpret_cast<const char*>(buf.data()), buf.size());
       } catch (...) {
-          // Payload is not JSON. It might be binary.
-          // We can't put it in j_meta["_raw"] if it's not valid UTF-8.
-          // For now, if it's not JSON, we'll just treat it as a raw Lite3 Bytes object if possible,
-          // or just store it as-is if it's already someone else's binary format.
-          // BUT, we need HLC for replication.
-          // Let's just store it as-is and hope for the best, or wrap it properly.
           binary_payload = std::move(payload);
       }
-
-      if (is_json) {
-          j_meta["_hlc"] = json::parse(ts.to_json_string());
-          std::string final_json = j_meta.dump();
-
-          // Convert to Lite3 binary for consistent storage
-          lite3cpp::Buffer buf = lite3cpp::lite3_json::from_json_string(final_json);
+  } else {
+      try {
+          lite3cpp::Buffer buf = lite3cpp::lite3_json::from_json_string(payload.empty() ? "{}" : payload);
+          ts.write_to_buffer(buf, 0, "_hlc");
           binary_payload = std::string(reinterpret_cast<const char*>(buf.data()), buf.size());
+      } catch (...) {
+          binary_payload = std::move(payload);
       }
   }
 
@@ -271,63 +260,48 @@ void Engine::replicate_key(const std::string& key, std::string payload, uint16_t
         }
 
         // Conflict Resolution: Last-Writer-Wins using HLC
+        std::string binary_payload;
         try {
-            std::string incoming_json_str;
+            lite3cpp::Buffer in_buf;
+            bool is_binary = false;
             const uint8_t* in_ptr = reinterpret_cast<const uint8_t*>(payload.data());
-            if (payload.size() > 8 && (in_ptr[0] == 0x06 || in_ptr[0] == 0x07)) {
+            if (payload.size() >= 4 && (in_ptr[0] == 0x06 || in_ptr[0] == 0x07 || in_ptr[0] == 0x00)) {
                 try {
-                    lite3cpp::Buffer in_buf(std::vector<uint8_t>(in_ptr, in_ptr + payload.size()));
-                    incoming_json_str = lite3cpp::lite3_json::to_json_string(in_buf, 0);
-                } catch (...) { incoming_json_str = payload; }
-            } else {
-                incoming_json_str = payload;
+                    in_buf = lite3cpp::Buffer(std::vector<uint8_t>(in_ptr, in_ptr + payload.size()));
+                    is_binary = true;
+                    binary_payload = std::move(payload);
+                } catch (...) {}
+            }
+            if (!is_binary) {
+                try {
+                    in_buf = lite3cpp::lite3_json::from_json_string(payload);
+                    binary_payload = std::string(reinterpret_cast<const char*>(in_buf.data()), in_buf.size());
+                } catch (...) {
+                    binary_payload = std::move(payload);
+                }
             }
 
-            json incoming = json::parse(incoming_json_str);
-            if (incoming.contains("_hlc")) {
-                HLCTimestamp remote_ts = HLCTimestamp::from_json(incoming["_hlc"]);
+            HLCTimestamp remote_ts = HLCTimestamp::read_from_buffer(in_buf, 0, "_hlc");
+            if (remote_ts.wall_time == 0) {
+                remote_ts = HLCTimestamp::read_from_buffer(in_buf, 0, "ts");
+            }
+            if (remote_ts.wall_time > 0) {
                 hlc_.update(remote_ts);
 
                 auto local_data = store_->get(key);
                 if (local_data.size() > 0) {
-                    std::string local_json_str;
-                    const uint8_t* loc_ptr = reinterpret_cast<const uint8_t*>(local_data.data());
-                    if (local_data.size() > 8 && (loc_ptr[0] == 0x06 || loc_ptr[0] == 0x07)) {
-                        try {
-                            local_json_str = lite3cpp::lite3_json::to_json_string(local_data, 0);
-                        } catch (...) { 
-                            local_json_str = std::string(reinterpret_cast<const char*>(loc_ptr), local_data.size());
-                        }
-                    } else {
-                        local_json_str = std::string(reinterpret_cast<const char*>(loc_ptr), local_data.size());
+                    HLCTimestamp local_ts = HLCTimestamp::read_from_buffer(local_data, 0, "_hlc");
+                    if (local_ts.wall_time == 0) {
+                        local_ts = HLCTimestamp::read_from_buffer(local_data, 0, "ts");
                     }
-
-                    try {
-                        json local_json = json::parse(local_json_str);
-                        if (local_json.contains("_hlc")) {
-                            HLCTimestamp local_ts = HLCTimestamp::from_json(local_json["_hlc"]);
-                            if (!(remote_ts > local_ts)) {
-                                // Stale update, ignore
-                                return;
-                            }
-                        }
-                    } catch (...) {}
+                    if (local_ts.wall_time > 0 && !(remote_ts > local_ts)) {
+                        // Stale update, ignore
+                        return;
+                    }
                 }
             }
-        } catch (...) {}
-
-        // Final payload preparation: ensure it's in Lite3 binary format
-        std::string binary_payload;
-        const uint8_t* in_ptr = reinterpret_cast<const uint8_t*>(payload.data());
-        if (payload.size() > 8 && (in_ptr[0] == 0x06 || in_ptr[0] == 0x00)) {
+        } catch (...) {
             binary_payload = std::move(payload);
-        } else {
-            try {
-                lite3cpp::Buffer buf = lite3cpp::lite3_json::from_json_string(payload);
-                binary_payload = std::string(reinterpret_cast<const char*>(buf.data()), buf.size());
-            } catch (...) {
-                binary_payload = std::move(payload);
-            }
         }
 
         store_->del(key);

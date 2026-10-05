@@ -11,6 +11,7 @@
 #include <mutex>
 #include <sstream>
 #include <regex>
+#include <nlohmann/json.hpp>
 #include "engine/store.hpp"
 
 #include <cstdio>

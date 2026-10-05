@@ -32,16 +32,65 @@ EdgeCoordinator::~EdgeCoordinator() {
 std::future<void> EdgeCoordinator::atomic_put_edge(uint64_t src_id, const std::string& label, double weight, uint64_t dst_id, const std::string& payload) {
     auto ts = hlc_.now();
     
-    // Create a pure lite3-cpp buffer for the payload
-    std::string full_json = "{\"ts\":" + ts.to_json_string();
+    lite3cpp::Buffer buf;
+    buf.init_object();
+    ts.write_to_buffer(buf, 0, "ts");
     if (!payload.empty()) {
-        full_json += ",\"props\":" + payload;
+        const uint8_t* ptr = reinterpret_cast<const uint8_t*>(payload.data());
+        if (payload.size() >= 4 && (ptr[0] == 0x06 || ptr[0] == 0x07)) {
+            try {
+                lite3cpp::Buffer props_buf(std::vector<uint8_t>(ptr, ptr + payload.size()));
+                size_t props_ofs = buf.set_obj(0, "props");
+                for (auto it = props_buf.begin(0); it != props_buf.end(0); ++it) {
+                    switch (it->value_type) {
+                        case lite3cpp::Type::Int64:
+                            buf.set_i64(props_ofs, it->key, props_buf.get_i64(0, it->key));
+                            break;
+                        case lite3cpp::Type::Float64:
+                            buf.set_f64(props_ofs, it->key, props_buf.get_f64(0, it->key));
+                            break;
+                        case lite3cpp::Type::String:
+                            buf.set_str(props_ofs, it->key, props_buf.get_str(0, it->key));
+                            break;
+                        case lite3cpp::Type::Bool:
+                            buf.set_bool(props_ofs, it->key, props_buf.get_bool(0, it->key));
+                            break;
+                        default:
+                            break;
+                    }
+                }
+            } catch (...) {
+                buf.set_str(0, "props", payload);
+            }
+        } else if (payload.front() == '{') {
+            try {
+                lite3cpp::Buffer props_buf = lite3cpp::lite3_json::from_json_string(payload);
+                size_t props_ofs = buf.set_obj(0, "props");
+                for (auto it = props_buf.begin(0); it != props_buf.end(0); ++it) {
+                    switch (it->value_type) {
+                        case lite3cpp::Type::Int64:
+                            buf.set_i64(props_ofs, it->key, props_buf.get_i64(0, it->key));
+                            break;
+                        case lite3cpp::Type::Float64:
+                            buf.set_f64(props_ofs, it->key, props_buf.get_f64(0, it->key));
+                            break;
+                        case lite3cpp::Type::String:
+                            buf.set_str(props_ofs, it->key, props_buf.get_str(0, it->key));
+                            break;
+                        case lite3cpp::Type::Bool:
+                            buf.set_bool(props_ofs, it->key, props_buf.get_bool(0, it->key));
+                            break;
+                        default:
+                            break;
+                    }
+                }
+            } catch (...) {
+                buf.set_str(0, "props", payload);
+            }
+        } else {
+            buf.set_str(0, "props", payload);
+        }
     }
-    full_json += "}";
-    
-    lite3cpp::Buffer buf = lite3cpp::lite3_json::from_json_string(full_json);
-
-    // Capture raw buffer data
     std::vector<uint8_t> final_payload_data(buf.data(), buf.data() + buf.size());
 
     lite3::NodeID src_owner = resolver_.get_node_owner(src_id);
