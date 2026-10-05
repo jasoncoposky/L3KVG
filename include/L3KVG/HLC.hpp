@@ -78,15 +78,16 @@ public:
         uint64_t current_wall = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
         
-        last_wall_time_ = std::max({last_wall_time_, remote.wall_time, current_wall});
-        if (last_wall_time_ == remote.wall_time && last_wall_time_ == current_wall) {
-            logical_counter_ = std::max((uint16_t)logical_counter_, remote.logical) + 1;
+        uint64_t prev_wall = last_wall_time_;
+        last_wall_time_ = std::max({prev_wall, remote.wall_time, current_wall});
+        if (last_wall_time_ == prev_wall && last_wall_time_ == remote.wall_time) {
+            logical_counter_ = std::max(static_cast<uint16_t>(logical_counter_), remote.logical) + 1;
+        } else if (last_wall_time_ == prev_wall) {
+            logical_counter_++;
         } else if (last_wall_time_ == remote.wall_time) {
             logical_counter_ = remote.logical + 1;
-        } else if (last_wall_time_ == current_wall) {
-            logical_counter_++;
         } else {
-            logical_counter_++;
+            logical_counter_ = 0;
         }
     }
 

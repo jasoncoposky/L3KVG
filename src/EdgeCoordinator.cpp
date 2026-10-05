@@ -322,11 +322,19 @@ void EdgeCoordinator::flush_shard(size_t shard_idx) {
         }
 
         for (auto& [fut, p_list] : pending_batches) {
+            std::exception_ptr ep = nullptr;
             try {
-                fut.get();
-            } catch (...) {}
+                if (!fut.get()) {
+                    ep = std::make_exception_ptr(std::runtime_error("Remote batch mutation failed"));
+                }
+            } catch (...) {
+                ep = std::current_exception();
+            }
             for (auto& p : p_list) {
-                try { p->set_value(); } catch (...) {}
+                try {
+                    if (ep) p->set_exception(ep);
+                    else p->set_value();
+                } catch (...) {}
             }
         }
     } catch (const std::exception& e) {
