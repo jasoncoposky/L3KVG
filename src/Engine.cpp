@@ -218,7 +218,6 @@ void Engine::put_node(uint64_t id, std::string payload) {
   broadcast_replication(key, binary_payload, resolver_.get_local_cluster_id());
   
   store_->put(std::move(key), std::move(binary_payload));
-  store_->wait_all_shards();
 
   size_t h = get_cache_shard(id);
   auto& shard = *cache_shards_[h];
@@ -311,7 +310,6 @@ void Engine::replicate_key(const std::string& key, std::string payload, uint16_t
         }
 
         store_->put(key, std::move(binary_payload));
-        store_->wait_all_shards();
 
         if (key.starts_with("n:{")) {
             size_t h = get_cache_shard(id);
@@ -353,7 +351,6 @@ void Engine::put_system_key(const std::string& key, const std::string& payload, 
     }
     
     store_->put(key, payload);
-    store_->wait_all_shards();
 }
 
 void Engine::del_node(uint64_t id) {
@@ -374,7 +371,6 @@ void Engine::del_node(uint64_t id) {
 
   std::string key = std::string(KeyBuilder::node_key(id));
   store_->del(key);
-  store_->wait_all_shards();
 }
 
 void Engine::flush() {
@@ -401,8 +397,6 @@ void Engine::add_edge(uint64_t src_id, std::string label,
       std::lock_guard<std::mutex> lock(cache_shards_[h_dst]->mutex);
       cache_shards_[h_dst]->map.erase(dst_id);
   }
-
-  store_->wait_all_shards();
 }
 
 void Engine::add_edge(std::string_view src_uuid, std::string label,
@@ -426,8 +420,6 @@ void Engine::del_edge(uint64_t src_id, std::string label,
       std::lock_guard<std::mutex> lock(cache_shards_[h_dst]->mutex);
       cache_shards_[h_dst]->map.erase(dst_id);
   }
-
-  store_->wait_all_shards();
 }
 
 bool Engine::apply_batch(const lite3cpp::Buffer& buffer, uint32_t principal_id) {
@@ -464,7 +456,6 @@ bool Engine::apply_batch(const lite3cpp::Buffer& buffer, uint32_t principal_id) 
                 }
             }
         }
-        store_->wait_all_shards();
         return true;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "[Engine::apply_batch] Exception: %s\n", e.what());
