@@ -540,12 +540,10 @@ std::vector<ResultRow> Query::execute() {
                                 had_eq_filter = true;
                             }
                             std::string idx_prefix = "idx:" + f->alias + ":" + f->key + ":" + f->value;
-                            auto idx_keys = engine_->get_store()->get_prefix_keys_all_shards(idx_prefix, "", 100000);
-                            for (const auto& k : idx_keys) {
-                                auto idx_buf = engine_->get_store()->get(k);
-                                if (idx_buf.size() > 0) {
-                                    std::string id_str(reinterpret_cast<const char*>(idx_buf.data()), idx_buf.size());
-                                    try { frontier_set.insert(std::stoull(id_str, nullptr, 16)); } catch(...) {}
+                            auto idx_entries = engine_->get_store()->get_prefix_entries_all_shards(idx_prefix, "", 100000);
+                            for (const auto& [k, v] : idx_entries) {
+                                if (!v.empty()) {
+                                    try { frontier_set.insert(std::stoull(v, nullptr, 16)); } catch(...) {}
                                 }
                             }
                         } else if (f->op == Op::Like) {
@@ -553,12 +551,10 @@ std::vector<ResultRow> Query::execute() {
                             std::string prefix_literal = (first_wc == std::string::npos) ? f->value : f->value.substr(0, first_wc);
                             if (!prefix_literal.empty()) {
                                 std::string idx_prefix = "idx:" + f->alias + ":" + f->key + ":" + prefix_literal;
-                                auto idx_keys = engine_->get_store()->get_prefix_keys_all_shards(idx_prefix, "", 100000);
-                                for (const auto& k : idx_keys) {
-                                    auto idx_buf = engine_->get_store()->get(k);
-                                    if (idx_buf.size() > 0) {
-                                        std::string id_str(reinterpret_cast<const char*>(idx_buf.data()), idx_buf.size());
-                                        try { frontier_set.insert(std::stoull(id_str, nullptr, 16)); } catch(...) {}
+                                auto idx_entries = engine_->get_store()->get_prefix_entries_all_shards(idx_prefix, "", 100000);
+                                for (const auto& [k, v] : idx_entries) {
+                                    if (!v.empty()) {
+                                        try { frontier_set.insert(std::stoull(v, nullptr, 16)); } catch(...) {}
                                     }
                                 }
                             } else {
@@ -587,13 +583,11 @@ std::vector<ResultRow> Query::execute() {
                                     bool first_tri = true;
                                     for (const auto& tri : trigrams) {
                                         std::string tri_prefix = "idx:" + f->alias + ":tri:" + tri + ":";
-                                        auto idx_keys = engine_->get_store()->get_prefix_keys_all_shards(tri_prefix, "", 100000);
+                                        auto idx_entries = engine_->get_store()->get_prefix_entries_all_shards(tri_prefix, "", 100000);
                                         std::set<uint64_t> cur_tri_set;
-                                        for (const auto& k : idx_keys) {
-                                            auto idx_buf = engine_->get_store()->get(k);
-                                            if (idx_buf.size() > 0) {
-                                                std::string id_str(reinterpret_cast<const char*>(idx_buf.data()), idx_buf.size());
-                                                try { cur_tri_set.insert(std::stoull(id_str, nullptr, 16)); } catch(...) {}
+                                        for (const auto& [k, v] : idx_entries) {
+                                            if (!v.empty()) {
+                                                try { cur_tri_set.insert(std::stoull(v, nullptr, 16)); } catch(...) {}
                                             }
                                         }
                                         if (first_tri) {
@@ -628,22 +622,18 @@ std::vector<ResultRow> Query::execute() {
         if (!root_alias_.empty()) {
             std::string entity_name = (root_alias_ == "Group" ? "User" : root_alias_);
             std::string idx_id_prefix = "idx:" + entity_name + ":id:";
-            auto idx_keys = engine_->get_store()->get_prefix_keys_all_shards(idx_id_prefix, "", 10000);
-            for (const auto& k : idx_keys) {
-                auto idx_buf = engine_->get_store()->get(k);
-                if (idx_buf.size() > 0) {
-                    std::string id_str(reinterpret_cast<const char*>(idx_buf.data()), idx_buf.size());
-                    try { frontier_set.insert(std::stoull(id_str, nullptr, 16)); } catch(...) {}
+            auto idx_entries = engine_->get_store()->get_prefix_entries_all_shards(idx_id_prefix, "", 10000);
+            for (const auto& [k, v] : idx_entries) {
+                if (!v.empty()) {
+                    try { frontier_set.insert(std::stoull(v, nullptr, 16)); } catch(...) {}
                 }
             }
             if (frontier_set.empty()) {
                 std::string idx_n_prefix = "idx:" + entity_name + ":n:";
-                auto idx_keys_n = engine_->get_store()->get_prefix_keys_all_shards(idx_n_prefix, "", 10000);
-                for (const auto& k : idx_keys_n) {
-                    auto idx_buf = engine_->get_store()->get(k);
-                    if (idx_buf.size() > 0) {
-                        std::string id_str(reinterpret_cast<const char*>(idx_buf.data()), idx_buf.size());
-                        try { frontier_set.insert(std::stoull(id_str, nullptr, 16)); } catch(...) {}
+                auto idx_entries_n = engine_->get_store()->get_prefix_entries_all_shards(idx_n_prefix, "", 10000);
+                for (const auto& [k, v] : idx_entries_n) {
+                    if (!v.empty()) {
+                        try { frontier_set.insert(std::stoull(v, nullptr, 16)); } catch(...) {}
                     }
                 }
             }
