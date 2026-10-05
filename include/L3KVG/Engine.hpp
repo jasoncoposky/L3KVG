@@ -87,6 +87,7 @@ public:
 
   // Pointer Swizzling Registry
   void swizzle_node(uint64_t id, std::shared_ptr<Node> ptr);
+  void swizzle_node(uint64_t id, const std::string& payload);
   std::shared_ptr<Node> get_swizzled(uint64_t id);
 
   l3kv::Engine *get_store() const { return store_.get(); }

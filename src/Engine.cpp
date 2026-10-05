@@ -128,24 +128,38 @@ std::shared_ptr<Node> Engine::get_swizzled(uint64_t id) {
   return nullptr;
 }
 
-std::vector<std::shared_ptr<Node>> Engine::fetch_nodes(const std::vector<uint64_t>& ids, uint32_t principal_id) {
-  if(0) std::fprintf(stderr, "  [Engine] fetch_nodes: requested %zu nodes\n", ids.size()); //std::fflush(stderr);
-  std::unordered_map<lite3::NodeID, std::vector<uint64_t>> remote_requests;
-  std::vector<std::shared_ptr<Node>> result;
-  result.reserve(ids.size());
+void Engine::swizzle_node(uint64_t id, const std::string& payload) {
+  auto node = get_node(id);
+  if (node) {
+    node->hydrate(payload);
+  }
+}
 
-  for (const auto& id : ids) {
-    auto node = get_node(id);
+std::vector<std::shared_ptr<Node>> Engine::fetch_nodes(const std::vector<uint64_t>& ids, uint32_t principal_id) {
+  if (ids.empty()) return {};
+
+  std::vector<std::shared_ptr<Node>> result(ids.size());
+
+  get_thread_pool().parallel_for(0, ids.size(), [&](size_t first, size_t last) {
+    for (size_t i = first; i < last; ++i) {
+      uint64_t id = ids[i];
+      auto node = get_node(id);
+      if (node && !node->is_loaded()) {
+        node->ensure_loaded();
+      }
+      result[i] = std::move(node);
+    }
+  });
+
+  std::unordered_map<lite3::NodeID, std::vector<uint64_t>> remote_requests;
+  for (size_t i = 0; i < ids.size(); ++i) {
+    auto& node = result[i];
     if (node && !node->is_loaded()) {
-      node->ensure_loaded();
-      if (!node->is_loaded()) {
-        lite3::NodeID owner = resolver_.get_node_owner(id);
-        if (owner != resolver_.get_local_node_id()) {
-          remote_requests[owner].push_back(id);
-        }
+      lite3::NodeID owner = resolver_.get_node_owner(ids[i]);
+      if (owner != resolver_.get_local_node_id()) {
+        remote_requests[owner].push_back(ids[i]);
       }
     }
-    result.push_back(node);
   }
 
   if (remote_requests.empty()) return result;
@@ -159,13 +173,14 @@ std::vector<std::shared_ptr<Node>> Engine::fetch_nodes(const std::vector<uint64_
     try {
       auto batch_results = pair.second.get();
       for (auto& [id, payload] : batch_results) {
-        auto node = get_node(id);
-        if (node) {
-            node->hydrate(payload);
-        }
+        swizzle_node(id, payload);
       }
-    } catch (const std::exception& e) {
-      std::cerr << "[Engine::fetch_nodes] Batch RPC to node " << pair.first << " failed: " << e.what() << "\n";
+    } catch (...) {}
+  }
+
+  for (size_t i = 0; i < ids.size(); ++i) {
+    if (result[i] && !result[i]->is_loaded()) {
+      result[i] = get_node(ids[i]);
     }
   }
 

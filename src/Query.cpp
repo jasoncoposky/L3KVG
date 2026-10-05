@@ -650,32 +650,42 @@ std::vector<ResultRow> Query::execute() {
   std::vector<Path> paths;
   {
       auto nodes = engine_->fetch_nodes(frontier, principal_id_);
+      std::mutex paths_mu;
       paths.reserve(nodes.size());
-      std::unordered_map<std::string, std::shared_ptr<Node>> available;
-      for (auto& node : nodes) {
-          if (!node || !node->is_loaded()) continue;
-          if (!root_alias_.empty()) {
-              std::string et;
-              try { et = node->get_attribute_as_string("entity_type"); } catch (...) {}
-              std::string actual_type;
-              try { actual_type = node->get_attribute_as_string("t"); } catch (...) {}
-              bool has_v = node->has_attribute("v");
-              if (!is_entity_type_match(root_alias_, et, actual_type, has_v)) {
-                  continue;
+
+      engine_->get_thread_pool().parallel_for(0, nodes.size(), [&](size_t first, size_t last) {
+          std::vector<Path> local_paths;
+          std::unordered_map<std::string, std::shared_ptr<Node>> available;
+          for (size_t idx = first; idx < last; ++idx) {
+              auto& node = nodes[idx];
+              if (!node || !node->is_loaded()) continue;
+              if (!root_alias_.empty()) {
+                  std::string et;
+                  try { et = node->get_attribute_as_string("entity_type"); } catch (...) {}
+                  std::string actual_type;
+                  try { actual_type = node->get_attribute_as_string("t"); } catch (...) {}
+                  bool has_v = node->has_attribute("v");
+                  if (!is_entity_type_match(root_alias_, et, actual_type, has_v)) {
+                      continue;
+                  }
+              }
+              std::string key = std::string(KeyBuilder::node_key(node->get_id()));
+              auto perm = (principal_id_ == INTERNAL_UID || principal_id_ == 0) ? l3kv::Permission::ADMIN : engine_->get_store()->credentials().check_permission(principal_id_, key);
+              if (!(perm & l3kv::Permission::READ) && !(perm & l3kv::Permission::ADMIN)) continue;
+              available[root_alias_] = node;
+              bool eval_res = evaluate_group(root_filters_, available, root_alias_, engine_);
+              if (eval_res) {
+                  Path p;
+                  p.alias_to_node[root_alias_] = node;
+                  p.last_alias = root_alias_;
+                  local_paths.push_back(std::move(p));
               }
           }
-          std::string key = std::string(KeyBuilder::node_key(node->get_id()));
-          auto perm = (principal_id_ == INTERNAL_UID || principal_id_ == 0) ? l3kv::Permission::ADMIN : engine_->get_store()->credentials().check_permission(principal_id_, key);
-          if (!(perm & l3kv::Permission::READ) && !(perm & l3kv::Permission::ADMIN)) continue;
-          available[root_alias_] = node;
-          bool eval_res = evaluate_group(root_filters_, available, root_alias_, engine_);
-          if (eval_res) {
-              Path p;
-              p.alias_to_node[root_alias_] = node;
-              p.last_alias = root_alias_;
-              paths.push_back(std::move(p));
+          if (!local_paths.empty()) {
+              std::lock_guard<std::mutex> lock(paths_mu);
+              paths.insert(paths.end(), std::make_move_iterator(local_paths.begin()), std::make_move_iterator(local_paths.end()));
           }
-      }
+      });
   }
 
   L3_LOG(0, "Query::execute() initial paths count=%zu", paths.size());
