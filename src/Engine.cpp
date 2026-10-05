@@ -403,38 +403,105 @@ bool Engine::apply_batch(const lite3cpp::Buffer& buffer, uint32_t principal_id) 
     if (count == 0) return true;
 
     try {
+        std::vector<l3kv::BatchOp> wal_batch;
+        std::map<size_t, l3kv::Engine::ShardMutation> shard_works;
+        std::vector<uint64_t> nodes_to_invalidate;
+        nodes_to_invalidate.reserve(count);
+
+        auto now = store_->get_clock().now();
+
+        auto add_put = [&](const std::string& key, const std::string& val) {
+            auto perm = (principal_id == INTERNAL_UID || principal_id == 0) ? l3kv::Permission::ADMIN : store_->credentials().check_permission(principal_id, key);
+            if (!(perm & l3kv::Permission::WRITE) && !(perm & l3kv::Permission::ADMIN)) {
+                throw std::runtime_error("Unauthorized: Access Denied for key " + key);
+            }
+            std::string mkey_s(KeyBuilder::meta_key(key));
+            lite3cpp::Buffer mbuf; mbuf.init_object();
+            mbuf.set_i64(0, "ts", now.wall_time); mbuf.set_i64(0, "l", now.logical); mbuf.set_i64(0, "n", now.node_id);
+            std::string meta_val = mbuf.move_to_string();
+
+            wal_batch.push_back({l3kv::WalOp::PUT, key, val});
+            wal_batch.push_back({l3kv::WalOp::PUT, mkey_s, meta_val});
+
+            shard_works[store_->get_routing_shard(key)].puts.emplace_back(key, val);
+            shard_works[store_->get_routing_shard(mkey_s)].puts.emplace_back(mkey_s, meta_val);
+        };
+
+        auto add_del = [&](const std::string& key) {
+            auto perm = (principal_id == INTERNAL_UID || principal_id == 0) ? l3kv::Permission::ADMIN : store_->credentials().check_permission(principal_id, key);
+            if (!(perm & l3kv::Permission::WRITE) && !(perm & l3kv::Permission::ADMIN)) {
+                return; // skip or unauthorized
+            }
+            std::string mkey_s(KeyBuilder::meta_key(key));
+            lite3cpp::Buffer mbuf; mbuf.init_object();
+            mbuf.set_i64(0, "ts", now.wall_time); mbuf.set_i64(0, "l", now.logical); mbuf.set_i64(0, "n", now.node_id);
+            mbuf.set_bool(0, "tombstone", true);
+            std::string meta_val = mbuf.move_to_string();
+
+            wal_batch.push_back({l3kv::WalOp::DELETE_, key, ""});
+            wal_batch.push_back({l3kv::WalOp::PUT, mkey_s, meta_val});
+
+            shard_works[store_->get_routing_shard(key)].dels.push_back(key);
+            shard_works[store_->get_routing_shard(mkey_s)].puts.emplace_back(mkey_s, meta_val);
+        };
+
         for (size_t i = 0; i < count; ++i) {
             MutationItem item = MutationBatch::read_item(buffer, i);
             switch (item.op) {
                 case MutationOp::PutRaw: {
-                    store_->put(std::string(item.key), std::string(item.value), principal_id);
-                    break;
-                }
-                case MutationOp::PutNode: {
-                    put_node(item.src, std::string(item.value));
-                    break;
-                }
-                case MutationOp::AddEdge: {
-                    add_edge(item.src, std::string(item.label), item.weight, item.dst, std::string(item.value));
+                    add_put(std::string(item.key), std::string(item.value));
                     break;
                 }
                 case MutationOp::DelRaw: {
-                    store_->del(std::string(item.key), principal_id);
+                    add_del(std::string(item.key));
+                    break;
+                }
+                case MutationOp::PutNode: {
+                    nodes_to_invalidate.push_back(item.src);
+                    std::string key = std::string(KeyBuilder::node_key(item.src));
+                    add_put(key, std::string(item.value));
                     break;
                 }
                 case MutationOp::DelNode: {
-                    del_node(item.src);
+                    nodes_to_invalidate.push_back(item.src);
+                    std::string key = std::string(KeyBuilder::node_key(item.src));
+                    add_del(key);
+                    break;
+                }
+                case MutationOp::AddEdge: {
+                    nodes_to_invalidate.push_back(item.src);
+                    nodes_to_invalidate.push_back(item.dst);
+                    std::string out_key = std::string(KeyBuilder::edge_out_key(item.src, std::string(item.label), item.weight, item.dst));
+                    std::string in_key = std::string(KeyBuilder::edge_in_key(item.dst, std::string(item.label), item.src));
+                    
+                    lite3cpp::Buffer ebuf; ebuf.init_object();
+                    if (!item.value.empty()) {
+                        ebuf.set_str(0, "props", std::string(item.value));
+                    }
+                    std::string epayload(reinterpret_cast<const char*>(ebuf.data()), ebuf.size());
+                    add_put(out_key, epayload);
+                    add_put(in_key, epayload);
                     break;
                 }
                 case MutationOp::DelEdge: {
-                    del_edge(item.src, std::string(item.label), item.weight, item.dst);
+                    nodes_to_invalidate.push_back(item.src);
+                    nodes_to_invalidate.push_back(item.dst);
+                    std::string out_key = std::string(KeyBuilder::edge_out_key(item.src, std::string(item.label), item.weight, item.dst));
+                    std::string in_key = std::string(KeyBuilder::edge_in_key(item.dst, std::string(item.label), item.src));
+                    add_del(out_key);
+                    add_del(in_key);
                     break;
                 }
             }
         }
+
+        store_->apply_batch_mutations(wal_batch, std::move(shard_works));
+
+        for (uint64_t nid : nodes_to_invalidate) {
+            invalidate_node_cache(nid);
+        }
         return true;
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "[Engine::apply_batch] Exception: %s\n", e.what());
         return false;
     }
 }

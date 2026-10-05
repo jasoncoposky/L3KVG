@@ -13,6 +13,15 @@ class KeyBuilder {
 public:
     static constexpr size_t MAX_KEY_SIZE = 1024;
 
+    // Build meta key: {key}:meta
+    static std::string_view meta_key(std::string_view key) {
+        char* buf = get_buffer();
+        int len = std::snprintf(buf, MAX_KEY_SIZE, "%.*s:meta", 
+                                static_cast<int>(key.size()), key.data());
+        if (len < 0 || len >= static_cast<int>(MAX_KEY_SIZE)) return {};
+        return std::string_view(buf, static_cast<size_t>(len));
+    }
+
     // Build node key: n:{id}
     static std::string_view node_key(uint64_t id) {
         char* buf = get_buffer();

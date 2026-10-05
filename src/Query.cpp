@@ -856,6 +856,7 @@ std::vector<ResultRow> Query::execute() {
                     try {
                         std::string val = node->get_attribute_as_string(projections_[i].property);
                         row.fields[alias + "." + projections_[i].property] = val;
+                        row.fields["idx_" + std::to_string(i)] = val;
                         row.projected_values[i] = val;
                     } catch (...) {
                     }
@@ -1027,10 +1028,14 @@ std::vector<ResultRow> Query::execute() {
       for (auto& row : results) {
           std::string key; 
           for (size_t i = 0; i < projections_.size(); ++i) {
-              std::string k = "idx_" + std::to_string(i);
-              auto it = row.fields.find(k);
-              if (it != row.fields.end()) key += it->second + "|";
-              else key += "|";
+              if (i < row.projected_values.size() && !row.projected_values[i].empty()) {
+                  key += row.projected_values[i] + "|";
+              } else {
+                  std::string k = "idx_" + std::to_string(i);
+                  auto it = row.fields.find(k);
+                  if (it != row.fields.end()) key += it->second + "|";
+                  else key += "|";
+              }
           }
           if (seen.insert(key).second) unique_res.push_back(std::move(row));
       }
@@ -1052,11 +1057,15 @@ std::vector<ResultRow> Query::execute() {
           }
       }
       for (size_t i = 0; i < projections_.size(); ++i) {
-          std::string k = "idx_" + std::to_string(i);
-          auto it_a = a.fields.find(k);
-          auto it_b = b.fields.find(k);
-          const std::string& v_a = (it_a != a.fields.end()) ? it_a->second : "";
-          const std::string& v_b = (it_b != b.fields.end()) ? it_b->second : "";
+          std::string v_a = (i < a.projected_values.size()) ? a.projected_values[i] : "";
+          std::string v_b = (i < b.projected_values.size()) ? b.projected_values[i] : "";
+          if (v_a.empty() && v_b.empty()) {
+              std::string k = "idx_" + std::to_string(i);
+              auto it_a = a.fields.find(k);
+              auto it_b = b.fields.find(k);
+              if (it_a != a.fields.end()) v_a = it_a->second;
+              if (it_b != b.fields.end()) v_b = it_b->second;
+          }
           if (v_a != v_b) return v_a < v_b;
       }
       size_t min_nodes = std::min(a.nodes.size(), b.nodes.size());

@@ -140,33 +140,25 @@ std::vector<uint64_t> Node::get_neighbors(std::string_view label,
   std::string current_start = start_key;
   size_t limit = engine_->get_settings().prefix_scan_limit;
   while (true) {
-    auto chunk = store->get_prefix_keys(std::string(prefix), target_shard, current_start, limit);
-    L3_LOG(0, "Node::get_neighbors() node=%016llx current_start='%s' chunk_size=%zu", 
-           (unsigned long long)id_, current_start.c_str(), chunk.size());
+    auto chunk = store->get_prefix_chunk(std::string(prefix), target_shard, current_start, limit);
     if (chunk.empty()) {
       break;
     }
-    for (const auto &key : chunk) {
-      L3_LOG(0, "Node::get_neighbors() node=%016llx key='%s' val_len=%zu", 
-             (unsigned long long)id_, key.c_str(), store->get(key).size());
+    for (const auto &[key, val] : chunk) {
       if (key.ends_with(":meta"))
-        continue;
-      if (store->get(key).size() == 0)
         continue;
       size_t start_brace = key.find_last_of('{');
       size_t end_brace = key.find_last_of('}');
       if (start_brace != std::string::npos && end_brace != std::string::npos && end_brace > start_brace) {
         std::string id_str = key.substr(start_brace + 1, end_brace - start_brace - 1);
         uint64_t nid = std::stoull(id_str, nullptr, 16);
-        L3_LOG(0, "Node::get_neighbors() node=%016llx found neighbor: %016llx", 
-               (unsigned long long)id_, (unsigned long long)nid);
         neighbors.push_back(nid);
       }
     }
     if (chunk.size() < limit) {
       break;
     }
-    current_start = chunk.back() + '\0';
+    current_start = chunk.back().first + '\0';
   }
 
   L3_LOG(0, "Node::get_neighbors() node=%016llx total local neighbors=%zu", 
@@ -202,33 +194,25 @@ std::vector<uint64_t> Node::get_in_neighbors(std::string_view label, uint32_t pr
   std::string current_start = std::string(prefix);
   size_t limit = engine_->get_settings().prefix_scan_limit;
   while (true) {
-    auto chunk = store->get_prefix_keys(std::string(prefix), target_shard, current_start, limit);
-    L3_LOG(0, "Node::get_in_neighbors() node=%016llx chunk_size=%zu", 
-           (unsigned long long)id_, chunk.size());
+    auto chunk = store->get_prefix_chunk(std::string(prefix), target_shard, current_start, limit);
     if (chunk.empty()) {
       break;
     }
-    for (const auto &key : chunk) {
-      L3_LOG(0, "Node::get_in_neighbors() node=%016llx key='%s' val_len=%zu", 
-             (unsigned long long)id_, key.c_str(), store->get(key).size());
+    for (const auto &[key, val] : chunk) {
       if (key.ends_with(":meta"))
-        continue;
-      if (store->get(key).size() == 0)
         continue;
       size_t start_brace = key.find_last_of('{');
       size_t end_brace = key.find_last_of('}');
       if (start_brace != std::string::npos && end_brace != std::string::npos && end_brace > start_brace) {
         std::string id_str = key.substr(start_brace + 1, end_brace - start_brace - 1);
         uint64_t nid = std::stoull(id_str, nullptr, 16);
-        L3_LOG(0, "Node::get_in_neighbors() node=%016llx found in-neighbor: %016llx", 
-               (unsigned long long)id_, (unsigned long long)nid);
         neighbors.push_back(nid);
       }
     }
     if (chunk.size() < limit) {
       break;
     }
-    current_start = chunk.back() + '\0';
+    current_start = chunk.back().first + '\0';
   }
   
   L3_LOG(0, "Node::get_in_neighbors() node=%016llx total in-neighbors=%zu", 
