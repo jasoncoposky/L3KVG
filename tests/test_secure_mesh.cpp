@@ -372,7 +372,8 @@ TEST(SecureMeshTest, PrincipalPropagation) {
         .execute();
     
     ASSERT_EQ(results.size(), 1);
-    EXPECT_EQ(results[0].fields["s.name"], "Secret");
+    std::string val = !results[0].projected_values.empty() ? results[0].projected_values[0] : results[0].fields["s.name"];
+    EXPECT_EQ(val, "Secret");
     std::cout << "[PASS] Principal ID propagated and authorized via Query" << std::endl;
 
     // 5. Test rejection: UID 666 (no perms)

@@ -503,15 +503,20 @@ static bool is_entity_type_match(std::string_view alias, std::string_view et, st
 }
 
 std::vector<ResultRow> Query::execute() {
-  std::vector<ResultRow> results; std::set<uint64_t> frontier_set;
+  std::vector<ResultRow> results;
   L3_LOG(0, "Query::execute() ENTER: starting_nodes=%zu, root_filters=%zu, steps=%zu", starting_nodes_.size(), root_filters_.nodes.size(), steps_.size());
+  std::vector<uint64_t> frontier;
   if (!starting_nodes_.empty()) {
-      for(auto id : starting_nodes_) frontier_set.insert(id);
+      frontier = starting_nodes_;
+      std::sort(frontier.begin(), frontier.end());
+      frontier.erase(std::unique(frontier.begin(), frontier.end()), frontier.end());
   } else {
       if (!initial_match_) return results;
       root_alias_ = initial_match_->alias;
       bool has_complex = has_or_or_like_filter(root_filters_);
       bool had_eq_filter = false;
+
+      std::set<uint64_t> frontier_set;
 
       if (auto* f = find_first_eq_filter(root_filters_, root_alias_, "id")) {
           had_eq_filter = true;
@@ -640,21 +645,37 @@ std::vector<ResultRow> Query::execute() {
             }
         }
       }
+      frontier.assign(frontier_set.begin(), frontier_set.end());
   }
 
-  L3_LOG(0, "Query::execute() root_alias=%s, frontier_set.size=%zu", root_alias_.c_str(), frontier_set.size());
-  if (frontier_set.empty()) return results;
+  if (initial_match_ && root_alias_.empty()) {
+      root_alias_ = initial_match_->alias;
+  }
 
-  std::vector<uint64_t> frontier(frontier_set.begin(), frontier_set.end());
-  struct Path { std::unordered_map<std::string, std::shared_ptr<Node>> alias_to_node; std::string last_alias; };
-  std::vector<Path> paths;
-  {
-      auto nodes = engine_->fetch_nodes(frontier, principal_id_);
-      std::mutex paths_mu;
-      paths.reserve(nodes.size());
+  L3_LOG(0, "Query::execute() root_alias=%s, frontier.size=%zu", root_alias_.c_str(), frontier.size());
+  if (frontier.empty()) return results;
+  bool has_agg = false;
+  for (const auto& p : projections_) {
+      if (p.agg != AggOp::None) {
+          has_agg = true;
+          break;
+      }
+  }
+  std::vector<std::string> invariant_proj_names(projections_.size());
+  for (size_t i = 0; i < projections_.size(); ++i) {
+      invariant_proj_names[i] = projections_[i].alias + "." + projections_[i].property;
+  }
+  bool needs_fields = (!sorts_.empty() || !groups_.empty() || has_agg);
+
+  auto nodes = engine_->fetch_nodes(frontier, principal_id_);
+  if (nodes.empty()) return results;
+
+  if (steps_.empty()) {
+      std::mutex results_mu;
+      results.reserve(nodes.size());
 
       engine_->get_thread_pool().parallel_for(0, nodes.size(), [&](size_t first, size_t last) {
-          std::vector<Path> local_paths;
+          std::vector<ResultRow> local_results;
           std::unordered_map<std::string, std::shared_ptr<Node>> available;
           for (size_t idx = first; idx < last; ++idx) {
               auto& node = nodes[idx];
@@ -674,216 +695,288 @@ std::vector<ResultRow> Query::execute() {
               if (!(perm & l3kv::Permission::READ) && !(perm & l3kv::Permission::ADMIN)) continue;
               available[root_alias_] = node;
               bool eval_res = evaluate_group(root_filters_, available, root_alias_, engine_);
-              if (eval_res) {
-                  Path p;
-                  p.alias_to_node[root_alias_] = node;
-                  p.last_alias = root_alias_;
-                  local_paths.push_back(std::move(p));
-              }
-          }
-          if (!local_paths.empty()) {
-              std::lock_guard<std::mutex> lock(paths_mu);
-              paths.insert(paths.end(), std::make_move_iterator(local_paths.begin()), std::make_move_iterator(local_paths.end()));
-          }
-      });
-  }
+              if (!eval_res) continue;
 
-  L3_LOG(0, "Query::execute() initial paths count=%zu", paths.size());
-  if (paths.empty()) return results;
+              ResultRow row;
+              row.nodes.push_back(node);
+              row.projected_names = invariant_proj_names;
+              row.projected_values.resize(projections_.size());
 
-  std::unordered_map<uint16_t, std::vector<std::pair<uint64_t, std::pair<std::string, std::vector<Step>>>>> suspended_branches;
-
-  for (size_t i = 0; i < steps_.size(); ++i) {
-    const auto& step = steps_[i];
-    std::vector<Path> next_paths;
-    std::mutex result_mu;
-    engine_->get_thread_pool().parallel_for(0, paths.size(), [&](size_t first, size_t last) {
-        std::vector<Path> local_next_paths;
-        std::unordered_map<uint16_t, std::vector<std::pair<uint64_t, std::pair<std::string, std::vector<Step>>>>> local_suspended;
-        for (size_t p_idx = first; p_idx < last; ++p_idx) {
-            const auto &path = paths[p_idx];
-            std::visit(overloaded{
-                [&](const OutStep& s) {
-                    std::string src = s.source_alias.empty() ? path.last_alias : s.source_alias;
-                    auto it_src = path.alias_to_node.find(src);
-                    if (it_src == path.alias_to_node.end()) {
-                        if(0) std::fprintf(stderr, "[Query] Step %zu: Source alias [%s] not found in path!\n", i, src.c_str());
-                        return;
-                    }
-                    auto node = it_src->second;
-                    auto neighbors = node->get_neighbors(s.label, s.min_weight, principal_id_);
-                    std::unordered_set<uint64_t> unique_neighbors(neighbors.begin(), neighbors.end());
-                    for (const auto& neighbor_id : unique_neighbors) {
-                        try {
-                            uint16_t cluster_id = FederationID::get_cluster(neighbor_id);
-                            if (!engine_->get_resolver().is_local_cluster(cluster_id)) {
-                                std::vector<Step> remaining(steps_.begin() + i + 1, steps_.end());
-                                local_suspended[cluster_id].push_back({neighbor_id, {s.target_alias, remaining}});
-                                continue;
-                            }
-                            auto neighbor_node = engine_->get_node(neighbor_id);
-                            if (!neighbor_node) continue;
-                            std::string et;
-                            try { et = neighbor_node->get_attribute_as_string("entity_type"); } catch (...) {}
-                            std::string actual_type;
-                            try { actual_type = neighbor_node->get_attribute_as_string("t"); } catch (...) {}
-                            bool has_v = neighbor_node->has_attribute("v");
-                            if (!is_entity_type_match(s.target_alias, et, actual_type, has_v)) continue;
-                            Path new_path = path; new_path.alias_to_node[s.target_alias] = neighbor_node; new_path.last_alias = s.target_alias;
-                            if (evaluate_group(root_filters_, new_path.alias_to_node, s.target_alias, engine_)) {
-                                local_next_paths.push_back(std::move(new_path));
-                            } else {
-                                if(0) std::fprintf(stderr, "  [Query] Neighbor %016llx filtered out\n", (unsigned long long)neighbor_id);
-                            }
-                        } catch (...) {}
-                    }
-                },
-                [&](const InStep& s) {
-                    std::string src = s.source_alias.empty() ? path.last_alias : s.source_alias;
-                    auto it_src = path.alias_to_node.find(src);
-                    if (it_src == path.alias_to_node.end()) {
-                        if(0) std::fprintf(stderr, "[Query] Step %zu: Source alias [%s] not found in path!\n", i, src.c_str());
-                        return;
-                    }
-                    auto node = it_src->second;
-                    auto neighbors = node->get_in_neighbors(s.label, principal_id_);
-                    std::unordered_set<uint64_t> unique_neighbors(neighbors.begin(), neighbors.end());
-                    for (const auto& neighbor_id : unique_neighbors) {
-                        try {
-                            uint16_t cluster_id = FederationID::get_cluster(neighbor_id);
-                            if (!engine_->get_resolver().is_local_cluster(cluster_id)) {
-                                std::vector<Step> remaining(steps_.begin() + i + 1, steps_.end());
-                                local_suspended[cluster_id].push_back({neighbor_id, {s.target_alias, remaining}});
-                                continue;
-                            }
-                            auto neighbor_node = engine_->get_node(neighbor_id);
-                            if (!neighbor_node) continue;
-                            std::string et;
-                            try { et = neighbor_node->get_attribute_as_string("entity_type"); } catch (...) {}
-                            std::string actual_type;
-                            try { actual_type = neighbor_node->get_attribute_as_string("t"); } catch (...) {}
-                            bool has_v = neighbor_node->has_attribute("v");
-                            if (!is_entity_type_match(s.target_alias, et, actual_type, has_v)) continue;
-                            Path new_path = path; new_path.alias_to_node[s.target_alias] = neighbor_node; new_path.last_alias = s.target_alias;
-                            if (evaluate_group(root_filters_, new_path.alias_to_node, s.target_alias, engine_)) {
-                                local_next_paths.push_back(std::move(new_path));
-                            } else {
-                                if(0) std::fprintf(stderr, "  [Query] Neighbor %016llx filtered out\n", (unsigned long long)neighbor_id);
-                            }
-                        } catch (...) {}
-                    }
-                }
-            }, step);
-        }
-        std::lock_guard<std::mutex> lock(result_mu);
-        next_paths.insert(next_paths.end(), std::make_move_iterator(local_next_paths.begin()), std::make_move_iterator(local_next_paths.end()));
-        for (auto& [cluster_id, branches] : local_suspended) {
-            auto& target = suspended_branches[cluster_id];
-            target.insert(target.end(), std::make_move_iterator(branches.begin()), std::make_move_iterator(branches.end()));
-        }
-    });
-    paths = std::move(next_paths);
-    if (paths.empty() && suspended_branches.empty()) break;
-  }
-
-  std::vector<std::future<std::vector<ResultRow>>> remote_futures;
-  for (auto& [cluster_id, branches] : suspended_branches) {
-      struct QueryGroup {
-          lite3cpp::Buffer buf;
-          std::vector<uint64_t> nodes;
-      };
-      std::unordered_map<std::string, QueryGroup> groups;
-      for (auto& b : branches) {
-          lite3cpp::Buffer sub_buf;
-          sub_buf.init_object();
-          sub_buf.set_str(0, "root_alias", b.second.first);
-          sub_buf.set_i64(0, "principal_id", static_cast<int64_t>(principal_id_));
-          size_t steps_ofs = sub_buf.set_arr(0, "steps");
-          for (const auto& step : b.second.second) {
-              std::visit(overloaded{
-                  [&](const OutStep& s) {
-                      size_t s_ofs = sub_buf.arr_append_obj(steps_ofs);
-                      sub_buf.set_str(s_ofs, "type", "out");
-                      sub_buf.set_str(s_ofs, "label", s.label);
-                      sub_buf.set_f64(s_ofs, "min_weight", s.min_weight);
-                      sub_buf.set_str(s_ofs, "target_alias", s.target_alias);
-                      if (!s.source_alias.empty()) {
-                          sub_buf.set_str(s_ofs, "source_alias", s.source_alias);
-                      }
-                  },
-                  [&](const InStep& s) {
-                      size_t s_ofs = sub_buf.arr_append_obj(steps_ofs);
-                      sub_buf.set_str(s_ofs, "type", "in");
-                      sub_buf.set_str(s_ofs, "label", s.label);
-                      sub_buf.set_str(s_ofs, "target_alias", s.target_alias);
-                      if (!s.source_alias.empty()) {
-                          sub_buf.set_str(s_ofs, "source_alias", s.source_alias);
+              for (size_t i = 0; i < projections_.size(); ++i) {
+                  if (projections_[i].alias == root_alias_ || projections_[i].alias.empty() || root_alias_.empty()) {
+                      if (node->has_attribute(projections_[i].property)) {
+                          try {
+                              std::string val = node->get_attribute_as_string(projections_[i].property);
+                              row.projected_values[i] = val;
+                              if (needs_fields) {
+                                  row.fields[invariant_proj_names[i]] = val;
+                                  row.fields["idx_" + std::to_string(i)] = val;
+                              }
+                          } catch (...) {
+                          }
                       }
                   }
-              }, step);
+              }
+              if (needs_fields) {
+                  for (const auto& s : sorts_) {
+                      if (s.alias == root_alias_ || s.alias.empty() || root_alias_.empty()) {
+                          std::string k = s.alias + "." + s.property;
+                          if (row.fields.find(k) == row.fields.end() && node->has_attribute(s.property)) {
+                              try { row.fields[k] = node->get_attribute_as_string(s.property); } catch (...) {}
+                          }
+                      }
+                  }
+                  for (const auto& g : groups_) {
+                      if (g.alias == root_alias_ || g.alias.empty() || root_alias_.empty()) {
+                          std::string k = g.alias + "." + g.property;
+                          if (row.fields.find(k) == row.fields.end() && node->has_attribute(g.property)) {
+                              try { row.fields[k] = node->get_attribute_as_string(g.property); } catch (...) {}
+                          }
+                      }
+                  }
+              }
+              local_results.push_back(std::move(row));
           }
-          size_t projs_ofs = sub_buf.set_arr(0, "projections");
-          for (const auto& p : projections_) {
-              size_t p_ofs = sub_buf.arr_append_obj(projs_ofs);
-              sub_buf.set_str(p_ofs, "alias", p.alias);
-              sub_buf.set_str(p_ofs, "property", p.property);
-              sub_buf.set_i64(p_ofs, "agg", static_cast<int64_t>(p.agg));
-              sub_buf.set_bool(p_ofs, "distinct", p.distinct);
+          if (!local_results.empty()) {
+              std::lock_guard<std::mutex> lock(results_mu);
+              results.insert(results.end(), std::make_move_iterator(local_results.begin()), std::make_move_iterator(local_results.end()));
           }
-          if (!root_filters_.nodes.empty()) {
-              size_t filters_ofs = sub_buf.set_arr(0, "filters");
-              serialize_filter_nodes(root_filters_, sub_buf, filters_ofs);
-          }
-          std::string query_bytes(reinterpret_cast<const char*>(sub_buf.data()), sub_buf.size());
-          auto it = groups.find(query_bytes);
-          if (it == groups.end()) {
-              groups.emplace(std::move(query_bytes), QueryGroup{std::move(sub_buf), {b.first}});
-          } else {
-              it->second.nodes.push_back(b.first);
-          }
-      }
-      for (auto& [_, qg] : groups) {
-          remote_futures.push_back(engine_->get_remote_client().resume_query_async(cluster_id, qg.nodes, qg.buf, principal_id_));
-      }
-  }
+      });
+  } else {
+      struct Path { std::unordered_map<std::string, std::shared_ptr<Node>> alias_to_node; std::string last_alias; };
+      std::vector<Path> paths;
+      {
+          std::mutex paths_mu;
+          paths.reserve(nodes.size());
 
-  for (const auto &path : paths) {
-    if (!steps_.empty()) {
+          engine_->get_thread_pool().parallel_for(0, nodes.size(), [&](size_t first, size_t last) {
+              std::vector<Path> local_paths;
+              std::unordered_map<std::string, std::shared_ptr<Node>> available;
+              for (size_t idx = first; idx < last; ++idx) {
+                  auto& node = nodes[idx];
+                  if (!node || !node->is_loaded()) continue;
+                  if (!root_alias_.empty()) {
+                      std::string et;
+                      try { et = node->get_attribute_as_string("entity_type"); } catch (...) {}
+                      std::string actual_type;
+                      try { actual_type = node->get_attribute_as_string("t"); } catch (...) {}
+                      bool has_v = node->has_attribute("v");
+                      if (!is_entity_type_match(root_alias_, et, actual_type, has_v)) {
+                          continue;
+                      }
+                  }
+                  std::string key = std::string(KeyBuilder::node_key(node->get_id()));
+                  auto perm = (principal_id_ == INTERNAL_UID || principal_id_ == 0) ? l3kv::Permission::ADMIN : engine_->get_store()->credentials().check_permission(principal_id_, key);
+                  if (!(perm & l3kv::Permission::READ) && !(perm & l3kv::Permission::ADMIN)) continue;
+                  available[root_alias_] = node;
+                  bool eval_res = evaluate_group(root_filters_, available, root_alias_, engine_);
+                  if (eval_res) {
+                      Path p;
+                      p.alias_to_node[root_alias_] = node;
+                      p.last_alias = root_alias_;
+                      local_paths.push_back(std::move(p));
+                  }
+              }
+              if (!local_paths.empty()) {
+                  std::lock_guard<std::mutex> lock(paths_mu);
+                  paths.insert(paths.end(), std::make_move_iterator(local_paths.begin()), std::make_move_iterator(local_paths.end()));
+              }
+          });
+      }
+
+      L3_LOG(0, "Query::execute() initial paths count=%zu", paths.size());
+      if (paths.empty()) return results;
+
+      std::unordered_map<uint16_t, std::vector<std::pair<uint64_t, std::pair<std::string, std::vector<Step>>>>> suspended_branches;
+
+      for (size_t i = 0; i < steps_.size(); ++i) {
+        const auto& step = steps_[i];
+        std::vector<Path> next_paths;
+        std::mutex result_mu;
+        engine_->get_thread_pool().parallel_for(0, paths.size(), [&](size_t first, size_t last) {
+            std::vector<Path> local_next_paths;
+            std::unordered_map<uint16_t, std::vector<std::pair<uint64_t, std::pair<std::string, std::vector<Step>>>>> local_suspended;
+            for (size_t p_idx = first; p_idx < last; ++p_idx) {
+                const auto &path = paths[p_idx];
+                std::visit(overloaded{
+                    [&](const OutStep& s) {
+                        std::string src = s.source_alias.empty() ? path.last_alias : s.source_alias;
+                        auto it_src = path.alias_to_node.find(src);
+                        if (it_src == path.alias_to_node.end()) {
+                            if(0) std::fprintf(stderr, "[Query] Step %zu: Source alias [%s] not found in path!\n", i, src.c_str());
+                            return;
+                        }
+                        auto node = it_src->second;
+                        auto neighbors = node->get_neighbors(s.label, s.min_weight, principal_id_);
+                        std::unordered_set<uint64_t> unique_neighbors(neighbors.begin(), neighbors.end());
+                        for (const auto& neighbor_id : unique_neighbors) {
+                            try {
+                                uint16_t cluster_id = FederationID::get_cluster(neighbor_id);
+                                if (!engine_->get_resolver().is_local_cluster(cluster_id)) {
+                                    std::vector<Step> remaining(steps_.begin() + i + 1, steps_.end());
+                                    local_suspended[cluster_id].push_back({neighbor_id, {s.target_alias, remaining}});
+                                    continue;
+                                }
+                                auto neighbor_node = engine_->get_node(neighbor_id);
+                                if (!neighbor_node) continue;
+                                std::string et;
+                                try { et = neighbor_node->get_attribute_as_string("entity_type"); } catch (...) {}
+                                std::string actual_type;
+                                try { actual_type = neighbor_node->get_attribute_as_string("t"); } catch (...) {}
+                                bool has_v = neighbor_node->has_attribute("v");
+                                if (!is_entity_type_match(s.target_alias, et, actual_type, has_v)) continue;
+                                Path new_path = path; new_path.alias_to_node[s.target_alias] = neighbor_node; new_path.last_alias = s.target_alias;
+                                if (evaluate_group(root_filters_, new_path.alias_to_node, s.target_alias, engine_)) {
+                                    local_next_paths.push_back(std::move(new_path));
+                                } else {
+                                    if(0) std::fprintf(stderr, "  [Query] Neighbor %016llx filtered out\n", (unsigned long long)neighbor_id);
+                                }
+                            } catch (...) {}
+                        }
+                    },
+                    [&](const InStep& s) {
+                        std::string src = s.source_alias.empty() ? path.last_alias : s.source_alias;
+                        auto it_src = path.alias_to_node.find(src);
+                        if (it_src == path.alias_to_node.end()) {
+                            if(0) std::fprintf(stderr, "[Query] Step %zu: Source alias [%s] not found in path!\n", i, src.c_str());
+                            return;
+                        }
+                        auto node = it_src->second;
+                        auto neighbors = node->get_in_neighbors(s.label, principal_id_);
+                        std::unordered_set<uint64_t> unique_neighbors(neighbors.begin(), neighbors.end());
+                        for (const auto& neighbor_id : unique_neighbors) {
+                            try {
+                                uint16_t cluster_id = FederationID::get_cluster(neighbor_id);
+                                if (!engine_->get_resolver().is_local_cluster(cluster_id)) {
+                                    std::vector<Step> remaining(steps_.begin() + i + 1, steps_.end());
+                                    local_suspended[cluster_id].push_back({neighbor_id, {s.target_alias, remaining}});
+                                    continue;
+                                }
+                                auto neighbor_node = engine_->get_node(neighbor_id);
+                                if (!neighbor_node) continue;
+                                std::string et;
+                                try { et = neighbor_node->get_attribute_as_string("entity_type"); } catch (...) {}
+                                std::string actual_type;
+                                try { actual_type = neighbor_node->get_attribute_as_string("t"); } catch (...) {}
+                                bool has_v = neighbor_node->has_attribute("v");
+                                if (!is_entity_type_match(s.target_alias, et, actual_type, has_v)) continue;
+                                Path new_path = path; new_path.alias_to_node[s.target_alias] = neighbor_node; new_path.last_alias = s.target_alias;
+                                if (evaluate_group(root_filters_, new_path.alias_to_node, s.target_alias, engine_)) {
+                                    local_next_paths.push_back(std::move(new_path));
+                                } else {
+                                    if(0) std::fprintf(stderr, "  [Query] Neighbor %016llx filtered out\n", (unsigned long long)neighbor_id);
+                                }
+                            } catch (...) {}
+                        }
+                    }
+                }, step);
+            }
+            std::lock_guard<std::mutex> lock(result_mu);
+            next_paths.insert(next_paths.end(), std::make_move_iterator(local_next_paths.begin()), std::make_move_iterator(local_next_paths.end()));
+            for (auto& [cluster_id, branches] : local_suspended) {
+                auto& target = suspended_branches[cluster_id];
+                target.insert(target.end(), std::make_move_iterator(branches.begin()), std::make_move_iterator(branches.end()));
+            }
+        });
+        paths = std::move(next_paths);
+        if (paths.empty() && suspended_branches.empty()) break;
+      }
+
+      std::vector<std::future<std::vector<ResultRow>>> remote_futures;
+      for (auto& [cluster_id, branches] : suspended_branches) {
+          struct QueryGroup {
+              lite3cpp::Buffer buf;
+              std::vector<uint64_t> nodes;
+          };
+          std::unordered_map<std::string, QueryGroup> groups;
+          for (auto& b : branches) {
+              lite3cpp::Buffer sub_buf;
+              sub_buf.init_object();
+              sub_buf.set_str(0, "root_alias", b.second.first);
+              sub_buf.set_i64(0, "principal_id", static_cast<int64_t>(principal_id_));
+              size_t steps_ofs = sub_buf.set_arr(0, "steps");
+              for (const auto& step : b.second.second) {
+                  std::visit(overloaded{
+                      [&](const OutStep& s) {
+                          size_t s_ofs = sub_buf.arr_append_obj(steps_ofs);
+                          sub_buf.set_str(s_ofs, "type", "out");
+                          sub_buf.set_str(s_ofs, "label", s.label);
+                          sub_buf.set_f64(s_ofs, "min_weight", s.min_weight);
+                          sub_buf.set_str(s_ofs, "target_alias", s.target_alias);
+                          if (!s.source_alias.empty()) {
+                              sub_buf.set_str(s_ofs, "source_alias", s.source_alias);
+                          }
+                      },
+                      [&](const InStep& s) {
+                          size_t s_ofs = sub_buf.arr_append_obj(steps_ofs);
+                          sub_buf.set_str(s_ofs, "type", "in");
+                          sub_buf.set_str(s_ofs, "label", s.label);
+                          sub_buf.set_str(s_ofs, "target_alias", s.target_alias);
+                          if (!s.source_alias.empty()) {
+                              sub_buf.set_str(s_ofs, "source_alias", s.source_alias);
+                          }
+                      }
+                  }, step);
+              }
+              size_t projs_ofs = sub_buf.set_arr(0, "projections");
+              for (const auto& p : projections_) {
+                  size_t p_ofs = sub_buf.arr_append_obj(projs_ofs);
+                  sub_buf.set_str(p_ofs, "alias", p.alias);
+                  sub_buf.set_str(p_ofs, "property", p.property);
+                  sub_buf.set_i64(p_ofs, "agg", static_cast<int64_t>(p.agg));
+                  sub_buf.set_bool(p_ofs, "distinct", p.distinct);
+              }
+              if (!root_filters_.nodes.empty()) {
+                  size_t filters_ofs = sub_buf.set_arr(0, "filters");
+                  serialize_filter_nodes(root_filters_, sub_buf, filters_ofs);
+              }
+              std::string query_bytes(reinterpret_cast<const char*>(sub_buf.data()), sub_buf.size());
+              auto it = groups.find(query_bytes);
+              if (it == groups.end()) {
+                  groups.emplace(std::move(query_bytes), QueryGroup{std::move(sub_buf), {b.first}});
+              } else {
+                  it->second.nodes.push_back(b.first);
+              }
+          }
+          for (auto& [_, qg] : groups) {
+              remote_futures.push_back(engine_->get_remote_client().resume_query_async(cluster_id, qg.nodes, qg.buf, principal_id_));
+          }
+      }
+
+      for (const auto &path : paths) {
         TriBool tb = evaluate_group_tribool(root_filters_, path.alias_to_node, "", engine_);
         if (is_federated_branch_ ? (tb == TriBool::False) : (tb != TriBool::True)) {
             continue;
         }
-    }
-    ResultRow row;
-    row.projected_values.resize(projections_.size());
-    row.projected_names.resize(projections_.size());
-    for (const auto& [alias, node] : path.alias_to_node) {
-        row.nodes.push_back(node);
-        for (size_t i = 0; i < projections_.size(); ++i) {
-            if (projections_[i].alias == alias) {
-                row.projected_names[i] = alias + "." + projections_[i].property;
-                if (node->has_attribute(projections_[i].property)) {
-                    try {
-                        std::string val = node->get_attribute_as_string(projections_[i].property);
-                        row.fields[alias + "." + projections_[i].property] = val;
-                        row.fields["idx_" + std::to_string(i)] = val;
-                        row.projected_values[i] = val;
-                    } catch (...) {
+        ResultRow row;
+        row.projected_values.resize(projections_.size());
+        row.projected_names.resize(projections_.size());
+        for (const auto& [alias, node] : path.alias_to_node) {
+            row.nodes.push_back(node);
+            for (size_t i = 0; i < projections_.size(); ++i) {
+                if (projections_[i].alias == alias) {
+                    row.projected_names[i] = alias + "." + projections_[i].property;
+                    if (node->has_attribute(projections_[i].property)) {
+                        try {
+                            std::string val = node->get_attribute_as_string(projections_[i].property);
+                            row.fields[alias + "." + projections_[i].property] = val;
+                            row.fields["idx_" + std::to_string(i)] = val;
+                            row.projected_values[i] = val;
+                        } catch (...) {
+                        }
                     }
                 }
             }
+            for (const auto& s : sorts_) if (s.alias == alias) { std::string k = s.alias + "." + s.property; if (row.fields.find(k) == row.fields.end()) { if (node->has_attribute(s.property)) row.fields[k] = node->get_attribute_as_string(s.property); } }
+            for (const auto& g : groups_) if (g.alias == alias) { std::string k = g.alias + "." + g.property; if (row.fields.find(k) == row.fields.end()) { if (node->has_attribute(g.property)) row.fields[k] = node->get_attribute_as_string(g.property); } }
         }
-        for (const auto& s : sorts_) if (s.alias == alias) { std::string k = s.alias + "." + s.property; if (row.fields.find(k) == row.fields.end()) { if (node->has_attribute(s.property)) row.fields[k] = node->get_attribute_as_string(s.property); } }
-        for (const auto& g : groups_) if (g.alias == alias) { std::string k = g.alias + "." + g.property; if (row.fields.find(k) == row.fields.end()) { if (node->has_attribute(g.property)) row.fields[k] = node->get_attribute_as_string(g.property); } }
-    }
-    results.push_back(std::move(row));
+        results.push_back(std::move(row));
+      }
+      for (auto& f : remote_futures) {
+          auto remote_res = f.get();
+          results.insert(results.end(), remote_res.begin(), remote_res.end());
+      }
   }
-  for (auto& f : remote_futures) {
-      auto remote_res = f.get();
-      results.insert(results.end(), remote_res.begin(), remote_res.end());
-  }
-
-  bool has_agg = false; for (const auto& p : projections_) if (p.agg != AggOp::None) { has_agg = true; break; }
   if (has_agg || !groups_.empty()) {
       std::vector<std::string> partition_order;
       std::unordered_map<std::string, std::vector<ResultRow>> partitions;
@@ -1096,6 +1189,8 @@ std::vector<ResultRow> Query::execute() {
 
 lite3cpp::Buffer Query::serialize_results(const std::vector<ResultRow>& rows) {
     lite3cpp::Buffer out_buf;
+    size_t num_proj = (!rows.empty() && !rows[0].projected_values.empty()) ? rows[0].projected_values.size() : (!rows.empty() ? rows[0].fields.size() : 0);
+    out_buf.ensure_capacity(rows.size() * (num_proj * 32 + 64) + 128);
     out_buf.init_array();
     bool wrote_cols = false;
     for (const auto& row : rows) {
