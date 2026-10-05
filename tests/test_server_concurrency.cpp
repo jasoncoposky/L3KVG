@@ -332,6 +332,35 @@ private:
             }
             return;
         }
+
+        if (opcode == "K") {
+            if (data_idx + 1 > recv_msgs.size()) {
+                sock.send(identity, zmq::send_flags::sndmore);
+                sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                sock.send(zmq::message_t("ERR", 3), zmq::send_flags::none);
+                return;
+            }
+            try {
+                std::string prefix = recv_msgs[data_idx].to_string(); data_idx++;
+                size_t limit = 100000;
+                auto entries = engine_->get_store()->get_prefix_entries_all_shards(prefix, "", limit);
+                lite3cpp::Buffer kbuf;
+                kbuf.init_array();
+                for (const auto& [k, v] : entries) {
+                    size_t e = kbuf.arr_append_obj(0);
+                    kbuf.set_str(e, "k", k);
+                    kbuf.set_str(e, "v", v);
+                }
+                sock.send(identity, zmq::send_flags::sndmore);
+                sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                sock.send(zmq::message_t(kbuf.data(), kbuf.size()), zmq::send_flags::none);
+            } catch (...) {
+                sock.send(identity, zmq::send_flags::sndmore);
+                sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                sock.send(zmq::message_t("ERR", 3), zmq::send_flags::none);
+            }
+            return;
+        }
     }
 
     uint16_t port_;
@@ -648,3 +677,66 @@ TEST(ServerConcurrencyTest, GracefulShutdownUnderLoad) {
     client_stop.store(true, std::memory_order_relaxed);
     for (auto& t : traffic_threads) t.join();
 }
+
+TEST(ServerConcurrencyTest, ParallelPrefixScans) {
+    uint16_t port = g_test_port.fetch_add(1);
+    std::string db = "test_conc_prefix_" + std::to_string(port);
+    ConcurrentServer server(port, db, 4);
+    server.start();
+
+    // Populate prefix entries and noise entries
+    const int num_entries = 20;
+    const std::string prefix = "idx:Collection:n:/zone/home/coll/";
+    for (int i = 0; i < num_entries; ++i) {
+        std::string k = prefix + "sub" + std::to_string(i);
+        std::string v = std::to_string(1000 + i);
+        server.engine()->get_store()->put(k, v);
+    }
+    // Noise entries that should not match prefix
+    server.engine()->get_store()->put("idx:Collection:n:/zone/home/other", "2000");
+    server.engine()->get_store()->put("idx:DataObject:n:/zone/home/coll/file.txt", "3000");
+
+    l3kvg::Settings client_settings;
+    client_settings.node_id = 2;
+    client_settings.fed_timeout_ms = 5000;
+    l3kvg::RemoteL3KVClient client(client_settings);
+    auto pool = std::make_shared<l3kvg::ThreadPool>(8);
+    client.set_thread_pool(pool);
+    client.add_peer(1, "tcp://127.0.0.1:" + std::to_string(port));
+
+    const int num_threads = 6;
+    const int iterations_per_thread = 15;
+    std::atomic<int> successful_scans{0};
+
+    std::vector<std::thread> threads;
+    threads.reserve(num_threads);
+
+    for (int t = 0; t < num_threads; ++t) {
+        threads.emplace_back([&client, prefix, num_entries, iterations_per_thread, &successful_scans]() {
+            for (int it = 0; it < iterations_per_thread; ++it) {
+                auto entries = client.get_prefix_entries_async(1, prefix).get();
+                if (entries.size() == static_cast<size_t>(num_entries)) {
+                    bool all_matched = true;
+                    for (const auto& [k, v] : entries) {
+                        if (!k.starts_with(prefix)) {
+                            all_matched = false;
+                            break;
+                        }
+                    }
+                    if (all_matched) {
+                        auto keys = client.get_prefix_keys_async(1, prefix).get();
+                        if (keys.size() == static_cast<size_t>(num_entries)) {
+                            successful_scans.fetch_add(1);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    for (auto& th : threads) th.join();
+    EXPECT_EQ(successful_scans.load(), num_threads * iterations_per_thread);
+
+    server.stop();
+}
+

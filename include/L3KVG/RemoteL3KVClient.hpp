@@ -93,6 +93,18 @@ public:
         uint32_t principal_id = l3kv::INTERNAL_UID
     );
 
+    virtual std::future<std::vector<std::pair<std::string, std::string>>> get_prefix_entries_async(
+        lite3::NodeID owner_id,
+        const std::string& prefix,
+        uint32_t principal_id = l3kv::INTERNAL_UID
+    );
+
+    virtual std::future<std::vector<std::string>> get_prefix_keys_async(
+        lite3::NodeID owner_id,
+        const std::string& prefix,
+        uint32_t principal_id = l3kv::INTERNAL_UID
+    );
+
     std::future<uint64_t> atomic_incr_async(
         lite3::NodeID owner_id,
         const std::string& key,

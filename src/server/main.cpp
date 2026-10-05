@@ -535,6 +535,33 @@ static void process_request(l3kvg::Engine* engine, const Config& cfg, zmq::socke
             sock.send(zmq::message_t("ERR", 3), zmq::send_flags::none);
         }
         return;
+    } else if (opcode == "K") {
+        if (data_idx + 1 > recv_msgs.size()) {
+            sock.send(identity, zmq::send_flags::sndmore);
+            sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+            sock.send(zmq::message_t("ERR", 3), zmq::send_flags::none);
+            return;
+        }
+        try {
+            std::string prefix = recv_msgs[data_idx].to_string(); data_idx++;
+            size_t limit = 100000;
+            auto entries = engine->get_store()->get_prefix_entries_all_shards(prefix, "", limit);
+            lite3cpp::Buffer kbuf;
+            kbuf.init_array();
+            for (const auto& [k, v] : entries) {
+                size_t e = kbuf.arr_append_obj(0);
+                kbuf.set_str(e, "k", k);
+                kbuf.set_str(e, "v", v);
+            }
+            sock.send(identity, zmq::send_flags::sndmore);
+            sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+            sock.send(zmq::message_t(kbuf.data(), kbuf.size()), zmq::send_flags::none);
+        } catch (const std::exception& e) {
+            sock.send(identity, zmq::send_flags::sndmore);
+            sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+            sock.send(zmq::message_t("ERR", 3), zmq::send_flags::none);
+        }
+        return;
     }
 }
 
