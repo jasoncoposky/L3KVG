@@ -11,7 +11,6 @@
 #include <mutex>
 #include <sstream>
 #include <regex>
-#include "json.hpp"
 #include "engine/store.hpp"
 
 #include <cstdio>
@@ -415,24 +414,73 @@ static const Query::Filter* find_first_eq_filter(const Query::FilterGroup& g, st
     return nullptr;
 }
 
-std::string Query::serialize_steps(const std::vector<Step>& steps) {
-    std::stringstream ss; ss << "[";
-    for (size_t i = 0; i < steps.size(); ++i) {
-        if (i > 0) ss << ",";
+static void serialize_filter_nodes(const Query::FilterGroup& group, lite3cpp::Buffer& buf, size_t arr_ofs, int depth = 0) {
+    if (depth > 32) return;
+    for (const auto& n : group.nodes) {
+        size_t item_ofs = buf.arr_append_obj(arr_ofs);
+        std::string prep = (n.prepended_op == Query::LogicalOp::Or) ? "or" : "and";
+        buf.set_str(item_ofs, "prepended_op", prep);
         std::visit(overloaded{
-            [&](const Query::OutStep& s) { 
-                ss << "{\"type\":\"out\",\"label\":\"" << s.label << "\",\"min_weight\":" << s.min_weight << ",\"target_alias\":\"" << s.target_alias << "\"";
-                if (!s.source_alias.empty()) ss << ",\"source_alias\":\"" << s.source_alias << "\"";
-                ss << "}";
+            [&](const Query::Filter& f) {
+                buf.set_str(item_ofs, "alias", f.alias);
+                buf.set_str(item_ofs, "key", f.key);
+                buf.set_i64(item_ofs, "op", static_cast<int64_t>(f.op));
+                buf.set_str(item_ofs, "value", f.value);
             },
-            [&](const Query::InStep& s) { 
-                ss << "{\"type\":\"in\",\"label\":\"" << s.label << "\",\"target_alias\":\"" << s.target_alias << "\"";
-                if (!s.source_alias.empty()) ss << ",\"source_alias\":\"" << s.source_alias << "\"";
-                ss << "}";
+            [&](const std::shared_ptr<Query::FilterGroup>& sub) {
+                buf.set_bool(item_ofs, "group", true);
+                if (sub) {
+                    size_t sub_arr_ofs = buf.set_arr(item_ofs, "filters");
+                    serialize_filter_nodes(*sub, buf, sub_arr_ofs, depth + 1);
+                }
             }
-        }, steps[i]);
+        }, n.node);
     }
-    ss << "]"; return ss.str();
+}
+
+static void parse_filter_nodes(const lite3cpp::Buffer& buf, size_t filters_arr_ofs, Query::FilterGroup& group, int depth = 0) {
+    if (depth > 32) return;
+    if (filters_arr_ofs + sizeof(lite3cpp::PackedNodeLayout) > buf.size()) return;
+    lite3cpp::NodeView fn(reinterpret_cast<const lite3cpp::PackedNodeLayout*>(buf.data() + filters_arr_ofs));
+    for (uint32_t i = 0; i < fn.size(); ++i) {
+        if (buf.arr_get_type(filters_arr_ofs, i) != lite3cpp::Type::Object) continue;
+        size_t item_ofs = buf.arr_get_obj(filters_arr_ofs, i);
+        if (buf.get_type(item_ofs, "group") != lite3cpp::Type::Invalid) {
+            std::string grp_prep = (buf.get_type(item_ofs, "prepended_op") == lite3cpp::Type::String) 
+                                   ? std::string(buf.get_str(item_ofs, "prepended_op")) : "and";
+            size_t sub_filters_ofs = 0;
+            bool has_sub = (buf.get_type(item_ofs, "filters") == lite3cpp::Type::Array);
+            if (has_sub) sub_filters_ofs = buf.get_arr(item_ofs, "filters");
+            auto cb = [&buf, has_sub, sub_filters_ofs, depth](Query::FilterGroup& sub) {
+                if (has_sub) {
+                    parse_filter_nodes(buf, sub_filters_ofs, sub, depth + 1);
+                }
+            };
+            if (grp_prep == "or") {
+                group.or_where_group(cb);
+            } else {
+                group.where_group(cb);
+            }
+        } else if (buf.get_type(item_ofs, "alias") == lite3cpp::Type::String &&
+                   buf.get_type(item_ofs, "key") == lite3cpp::Type::String &&
+                   (buf.get_type(item_ofs, "op") == lite3cpp::Type::Int64 || buf.get_type(item_ofs, "op") == lite3cpp::Type::Float64) &&
+                   buf.get_type(item_ofs, "value") == lite3cpp::Type::String) {
+            std::string alias = std::string(buf.get_str(item_ofs, "alias"));
+            std::string key = std::string(buf.get_str(item_ofs, "key"));
+            int op_val = (buf.get_type(item_ofs, "op") == lite3cpp::Type::Int64) 
+                         ? static_cast<int>(buf.get_i64(item_ofs, "op")) 
+                         : static_cast<int>(buf.get_f64(item_ofs, "op"));
+            auto op = static_cast<Query::Op>(op_val);
+            std::string val = std::string(buf.get_str(item_ofs, "value"));
+            std::string prep = (buf.get_type(item_ofs, "prepended_op") == lite3cpp::Type::String) 
+                               ? std::string(buf.get_str(item_ofs, "prepended_op")) : "and";
+            if (prep == "or") {
+                group.or_where(alias, key, op, val);
+            } else {
+                group.where(alias, key, op, val);
+            }
+        }
+    }
 }
 
 static bool is_entity_type_match(std::string_view alias, std::string_view et, std::string_view actual_type, bool has_v) {
@@ -780,7 +828,11 @@ std::vector<ResultRow> Query::execute() {
 
   std::vector<std::future<std::vector<ResultRow>>> remote_futures;
   for (auto& [cluster_id, branches] : suspended_branches) {
-      std::unordered_map<std::string, std::vector<uint64_t>> groups;
+      struct QueryGroup {
+          lite3cpp::Buffer buf;
+          std::vector<uint64_t> nodes;
+      };
+      std::unordered_map<std::string, QueryGroup> groups;
       for (auto& b : branches) {
           lite3cpp::Buffer sub_buf;
           sub_buf.init_object();
@@ -818,16 +870,26 @@ std::vector<ResultRow> Query::execute() {
               sub_buf.set_i64(p_ofs, "agg", static_cast<int64_t>(p.agg));
               sub_buf.set_bool(p_ofs, "distinct", p.distinct);
           }
-          std::string query_bytes = sub_buf.move_to_string();
-          groups[std::move(query_bytes)].push_back(b.first);
+          if (!root_filters_.nodes.empty()) {
+              size_t filters_ofs = sub_buf.set_arr(0, "filters");
+              serialize_filter_nodes(root_filters_, sub_buf, filters_ofs);
+          }
+          std::string query_bytes(reinterpret_cast<const char*>(sub_buf.data()), sub_buf.size());
+          auto it = groups.find(query_bytes);
+          if (it == groups.end()) {
+              groups.emplace(std::move(query_bytes), QueryGroup{std::move(sub_buf), {b.first}});
+          } else {
+              it->second.nodes.push_back(b.first);
+          }
       }
-      for (auto& [query_bytes, nodes] : groups) {
-          remote_futures.push_back(engine_->get_remote_client().resume_query_async(cluster_id, nodes, query_bytes, principal_id_));
+      for (auto& [_, qg] : groups) {
+          remote_futures.push_back(engine_->get_remote_client().resume_query_async(cluster_id, qg.nodes, qg.buf, principal_id_));
       }
   }
 
   for (const auto &path : paths) {
-    if (evaluate_group_tribool(root_filters_, path.alias_to_node, "", engine_) != TriBool::True) {
+    TriBool tb = evaluate_group_tribool(root_filters_, path.alias_to_node, "", engine_);
+    if (is_federated_branch_ ? (tb == TriBool::False) : (tb != TriBool::True)) {
         continue;
     }
     ResultRow row;
@@ -1070,49 +1132,6 @@ lite3cpp::Buffer Query::serialize_results(const std::vector<ResultRow>& rows) {
     return out_buf;
 }
 
-static void parse_filter_nodes(const lite3cpp::Buffer& buf, size_t filters_arr_ofs, Query::FilterGroup& group) {
-    if (filters_arr_ofs + sizeof(lite3cpp::PackedNodeLayout) > buf.size()) return;
-    lite3cpp::NodeView fn(reinterpret_cast<const lite3cpp::PackedNodeLayout*>(buf.data() + filters_arr_ofs));
-    for (uint32_t i = 0; i < fn.size(); ++i) {
-        if (buf.arr_get_type(filters_arr_ofs, i) != lite3cpp::Type::Object) continue;
-        size_t item_ofs = buf.arr_get_obj(filters_arr_ofs, i);
-        if (buf.get_type(item_ofs, "group") != lite3cpp::Type::Invalid) {
-            std::string grp_prep = (buf.get_type(item_ofs, "prepended_op") == lite3cpp::Type::String) 
-                                   ? std::string(buf.get_str(item_ofs, "prepended_op")) : "and";
-            size_t sub_filters_ofs = 0;
-            bool has_sub = (buf.get_type(item_ofs, "filters") == lite3cpp::Type::Array);
-            if (has_sub) sub_filters_ofs = buf.get_arr(item_ofs, "filters");
-            auto cb = [&buf, has_sub, sub_filters_ofs](Query::FilterGroup& sub) {
-                if (has_sub) {
-                    parse_filter_nodes(buf, sub_filters_ofs, sub);
-                }
-            };
-            if (grp_prep == "or") {
-                group.or_where_group(cb);
-            } else {
-                group.where_group(cb);
-            }
-        } else if (buf.get_type(item_ofs, "alias") == lite3cpp::Type::String &&
-                   buf.get_type(item_ofs, "key") == lite3cpp::Type::String &&
-                   (buf.get_type(item_ofs, "op") == lite3cpp::Type::Int64 || buf.get_type(item_ofs, "op") == lite3cpp::Type::Float64) &&
-                   buf.get_type(item_ofs, "value") == lite3cpp::Type::String) {
-            std::string alias = std::string(buf.get_str(item_ofs, "alias"));
-            std::string key = std::string(buf.get_str(item_ofs, "key"));
-            int op_val = (buf.get_type(item_ofs, "op") == lite3cpp::Type::Int64) 
-                         ? static_cast<int>(buf.get_i64(item_ofs, "op")) 
-                         : static_cast<int>(buf.get_f64(item_ofs, "op"));
-            auto op = static_cast<Query::Op>(op_val);
-            std::string val = std::string(buf.get_str(item_ofs, "value"));
-            std::string prep = (buf.get_type(item_ofs, "prepended_op") == lite3cpp::Type::String) 
-                               ? std::string(buf.get_str(item_ofs, "prepended_op")) : "and";
-            if (prep == "or") {
-                group.or_where(alias, key, op, val);
-            } else {
-                group.where(alias, key, op, val);
-            }
-        }
-    }
-}
 
 Query &Query::resume(const std::vector<uint64_t>& starting_nodes, const lite3cpp::Buffer& query_buf) {
     starting_nodes_ = starting_nodes;

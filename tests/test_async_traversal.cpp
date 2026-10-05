@@ -8,9 +8,6 @@
 #include <string>
 #include <zmq.hpp>
 #include <zmq_addon.hpp>
-#include <nlohmann/json.hpp>
-
-using json = nlohmann::json;
 
 void run_zmq_mock_node_server(uint16_t port, std::atomic<bool>& stop_signal) {
     zmq::context_t ctx(1);
@@ -33,8 +30,7 @@ void run_zmq_mock_node_server(uint16_t port, std::atomic<bool>& stop_signal) {
 
         if (opcode == "G") {
             // Respond with Remote Bob
-            json res = {{"name", "Remote Bob"}, {"bloom", 0}};
-            std::string resp_json = res.dump();
+            std::string resp_json = "{\"name\":\"Remote Bob\",\"bloom\":0}";
             
             sock.send(identity, zmq::send_flags::sndmore);
             sock.send(zmq::message_t(), zmq::send_flags::sndmore);

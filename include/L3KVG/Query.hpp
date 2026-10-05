@@ -177,8 +177,6 @@ private:
   std::optional<size_t> limit_;
   std::optional<size_t> offset_;
   std::string current_source_alias_;
-
-  static std::string serialize_steps(const std::vector<Step>& steps);
 };
 
 } // namespace l3kvg

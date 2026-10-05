@@ -17,7 +17,6 @@
 #include <zmq_addon.hpp>
 #include "httplib.h"
 #include "buffer.hpp"
-#include "json.hpp"
 #include "L3KVG/Query.hpp"
 
 struct Config {
@@ -173,6 +172,12 @@ int main(int argc, char *argv[]) {
               }
 
               if (opcode == "A") { // Auth
+                  if (data_idx + 2 > recv_msgs.size()) {
+                      sock.send(identity, zmq::send_flags::sndmore);
+                      sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                      sock.send(zmq::message_t("ERR", 3), zmq::send_flags::none);
+                      continue;
+                  }
                   std::string node_id_str = recv_msgs[data_idx].to_string(); data_idx++;
                   std::string secret = recv_msgs[data_idx].to_string(); data_idx++;
                   
@@ -186,7 +191,12 @@ int main(int argc, char *argv[]) {
               }
 
               if (opcode == "+") { // Atomic Increment
-                  if (data_idx >= recv_msgs.size()) continue;
+                  if (data_idx + 1 > recv_msgs.size()) {
+                      sock.send(identity, zmq::send_flags::sndmore);
+                      sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                      sock.send(zmq::message_t("ERR", 3), zmq::send_flags::none);
+                      continue;
+                  }
                   std::string key = recv_msgs[data_idx].to_string(); data_idx++;
                   int64_t delta = 1;
                   if (data_idx < recv_msgs.size()) {
@@ -217,29 +227,48 @@ int main(int argc, char *argv[]) {
               }
 
               if (opcode == "R") {
+                  if (data_idx + 2 > recv_msgs.size()) {
+                      lite3cpp::Buffer empty_buf;
+                      empty_buf.init_array();
+                      sock.send(identity, zmq::send_flags::sndmore);
+                      sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                      sock.send(zmq::message_t(empty_buf.data(), empty_buf.size()), zmq::send_flags::none);
+                      continue;
+                  }
                   try {
                       const auto& nodes_msg = recv_msgs[data_idx];
                       data_idx++;
                       std::vector<uint64_t> nodes;
-                      if (nodes_msg.size() % sizeof(uint64_t) == 0 &&
-                          (nodes_msg.size() == 0 || (static_cast<const char*>(nodes_msg.data())[0] != '[' && static_cast<const char*>(nodes_msg.data())[0] != '{'))) {
-                          const uint64_t* raw = reinterpret_cast<const uint64_t*>(nodes_msg.data());
-                          nodes.assign(raw, raw + (nodes_msg.size() / sizeof(uint64_t)));
-                      } else {
-                          std::string raw_json = nodes_msg.to_string();
-                          lite3cpp::Buffer buf = lite3cpp::lite3_json::from_json_string(raw_json.empty() ? "[]" : raw_json);
-                          if (buf.size() >= sizeof(lite3cpp::PackedNodeLayout)) {
-                              lite3cpp::NodeView nv(reinterpret_cast<const lite3cpp::PackedNodeLayout*>(buf.data()));
-                              if (nv.type() == lite3cpp::Type::Array) {
-                                  for (uint32_t i = 0; i < nv.size(); ++i) {
-                                      auto t = buf.arr_get_type(0, i);
-                                      if (t == lite3cpp::Type::Int64) {
-                                          nodes.push_back(static_cast<uint64_t>(buf.arr_get_i64(0, i)));
-                                      } else if (t == lite3cpp::Type::String) {
-                                          nodes.push_back(std::stoull(std::string(buf.arr_get_str(0, i)), nullptr, 16));
+                      bool parsed_as_json = false;
+                      std::string_view sv(static_cast<const char*>(nodes_msg.data()), nodes_msg.size());
+                      size_t first = sv.find_first_not_of(" \t\r\n");
+                      size_t last = sv.find_last_not_of(" \t\r\n");
+                      if (first != std::string_view::npos && last != std::string_view::npos && last >= first + 1 && sv[first] == '[' && sv[last] == ']') {
+                          try {
+                              lite3cpp::Buffer buf = lite3cpp::lite3_json::from_json_string(std::string(sv.substr(first, last - first + 1)));
+                              if (buf.size() >= sizeof(lite3cpp::PackedNodeLayout)) {
+                                  lite3cpp::NodeView nv(reinterpret_cast<const lite3cpp::PackedNodeLayout*>(buf.data()));
+                                  if (nv.type() == lite3cpp::Type::Array) {
+                                      parsed_as_json = true;
+                                      for (uint32_t i = 0; i < nv.size(); ++i) {
+                                          auto t = buf.arr_get_type(0, i);
+                                          if (t == lite3cpp::Type::Int64) {
+                                              nodes.push_back(static_cast<uint64_t>(buf.arr_get_i64(0, i)));
+                                          } else if (t == lite3cpp::Type::String) {
+                                              nodes.push_back(std::stoull(std::string(buf.arr_get_str(0, i)), nullptr, 16));
+                                          }
                                       }
                                   }
                               }
+                          } catch (...) {
+                              parsed_as_json = false;
+                          }
+                      }
+                      if (!parsed_as_json && nodes_msg.size() % sizeof(uint64_t) == 0) {
+                          size_t count = nodes_msg.size() / sizeof(uint64_t);
+                          nodes.resize(count);
+                          if (count > 0) {
+                              std::memcpy(nodes.data(), nodes_msg.data(), count * sizeof(uint64_t));
                           }
                       }
 
@@ -280,6 +309,12 @@ int main(int argc, char *argv[]) {
                       sock.send(zmq::message_t(empty_buf.data(), empty_buf.size()), zmq::send_flags::none);
                   }
               } else if (opcode == "P") {
+                  if (data_idx + 2 > recv_msgs.size()) {
+                      sock.send(identity, zmq::send_flags::sndmore);
+                      sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                      sock.send(zmq::message_t("ERR", 3), zmq::send_flags::none);
+                      continue;
+                  }
                   try {
                       std::string key = recv_msgs[data_idx].to_string(); data_idx++;
                       std::string payload = recv_msgs[data_idx].to_string();
@@ -339,6 +374,12 @@ int main(int argc, char *argv[]) {
                       sock.send(zmq::message_t("", 0), zmq::send_flags::none);
                   }
               } else if (opcode == "G") {
+                  if (data_idx + 1 > recv_msgs.size()) {
+                      sock.send(identity, zmq::send_flags::sndmore);
+                      sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                      sock.send(zmq::message_t("", 0), zmq::send_flags::none);
+                      continue;
+                  }
                   try {
                       std::string key = recv_msgs[data_idx].to_string();
                       auto buf = engine->get_store()->get(key);
@@ -352,6 +393,12 @@ int main(int argc, char *argv[]) {
                       sock.send(zmq::message_t("", 0), zmq::send_flags::none);
                   }
               } else if (opcode == "D") {
+                  if (data_idx + 1 > recv_msgs.size()) {
+                      sock.send(identity, zmq::send_flags::sndmore);
+                      sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                      sock.send(zmq::message_t("ERR", 3), zmq::send_flags::none);
+                      continue;
+                  }
                   try {
                       std::string key = recv_msgs[data_idx].to_string();
                       if (key.starts_with("n:{")) {
@@ -383,24 +430,24 @@ int main(int argc, char *argv[]) {
                       sock.send(zmq::message_t("ERR", 3), zmq::send_flags::none);
                   }
               } else if (opcode == "B") {
+                  if (data_idx + 1 > recv_msgs.size()) {
+                      sock.send(identity, zmq::send_flags::sndmore);
+                      sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                      sock.send(zmq::message_t("ERR", 3), zmq::send_flags::none);
+                      continue;
+                  }
                   try {
-                      if (data_idx < recv_msgs.size()) {
-                          const auto& msg = recv_msgs[data_idx];
-                          lite3cpp::Buffer batch_buf(std::vector<uint8_t>(
-                              static_cast<const uint8_t*>(msg.data()),
-                              static_cast<const uint8_t*>(msg.data()) + msg.size()
-                          ));
-                          bool ok = engine->apply_batch(batch_buf, principal_id);
-                          sock.send(identity, zmq::send_flags::sndmore);
-                          sock.send(zmq::message_t(), zmq::send_flags::sndmore);
-                          if (ok) {
-                              sock.send(zmq::message_t("OK", 2), zmq::send_flags::none);
-                          } else {
-                              sock.send(zmq::message_t("ERR", 3), zmq::send_flags::none);
-                          }
+                      const auto& msg = recv_msgs[data_idx];
+                      lite3cpp::Buffer batch_buf(std::vector<uint8_t>(
+                          static_cast<const uint8_t*>(msg.data()),
+                          static_cast<const uint8_t*>(msg.data()) + msg.size()
+                      ));
+                      bool ok = engine->apply_batch(batch_buf, principal_id);
+                      sock.send(identity, zmq::send_flags::sndmore);
+                      sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                      if (ok) {
+                          sock.send(zmq::message_t("OK", 2), zmq::send_flags::none);
                       } else {
-                          sock.send(identity, zmq::send_flags::sndmore);
-                          sock.send(zmq::message_t(), zmq::send_flags::sndmore);
                           sock.send(zmq::message_t("ERR", 3), zmq::send_flags::none);
                       }
                   } catch (const std::exception& e) {
@@ -409,7 +456,35 @@ int main(int argc, char *argv[]) {
                       sock.send(zmq::message_t(), zmq::send_flags::sndmore);
                       sock.send(zmq::message_t("ERR", 3), zmq::send_flags::none);
                   }
+              } else if (opcode == "E") {
+                  if (data_idx + 4 > recv_msgs.size()) {
+                      sock.send(identity, zmq::send_flags::sndmore);
+                      sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                      sock.send(zmq::message_t("ERR", 3), zmq::send_flags::none);
+                      continue;
+                  }
+                  try {
+                      uint64_t src = std::stoull(recv_msgs[data_idx].to_string(), nullptr, 16); data_idx++;
+                      std::string label = recv_msgs[data_idx].to_string(); data_idx++;
+                      double weight = std::stod(recv_msgs[data_idx].to_string()); data_idx++;
+                      uint64_t dst = std::stoull(recv_msgs[data_idx].to_string(), nullptr, 16);
+                      engine->add_edge(src, label, weight, dst);
+                      sock.send(identity, zmq::send_flags::sndmore);
+                      sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                      sock.send(zmq::message_t("OK", 2), zmq::send_flags::none);
+                  } catch (const std::exception& e) {
+                      if (1) std::fprintf(stderr, "L3_SERVER: Error E: %s\n", e.what());
+                      sock.send(identity, zmq::send_flags::sndmore);
+                      sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                      sock.send(zmq::message_t("ERR", 3), zmq::send_flags::none);
+                  }
               } else if (opcode == "N") {
+                  if (data_idx + 3 > recv_msgs.size()) {
+                      sock.send(identity, zmq::send_flags::sndmore);
+                      sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                      sock.send(zmq::message_t("ERR", 3), zmq::send_flags::none);
+                      continue;
+                  }
                   try {
                       std::string id_str = recv_msgs[data_idx].to_string(); data_idx++;
                       std::string label = recv_msgs[data_idx].to_string(); data_idx++;
@@ -435,9 +510,20 @@ int main(int argc, char *argv[]) {
                       if(1) std::fprintf(stderr, "L3_SERVER: Error N: %s\n", e.what()); //std::fflush(stderr);
                       sock.send(identity, zmq::send_flags::sndmore);
                       sock.send(zmq::message_t(), zmq::send_flags::sndmore);
-                      sock.send(zmq::message_t(), zmq::send_flags::none);
+                      sock.send(zmq::message_t("ERR", 3), zmq::send_flags::none);
+                  } catch (...) {
+                      if(1) std::fprintf(stderr, "L3_SERVER: Unknown Error N\n");
+                      sock.send(identity, zmq::send_flags::sndmore);
+                      sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                      sock.send(zmq::message_t("ERR", 3), zmq::send_flags::none);
                   }
               } else if (opcode == "I") {
+                  if (data_idx + 2 > recv_msgs.size()) {
+                      sock.send(identity, zmq::send_flags::sndmore);
+                      sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                      sock.send(zmq::message_t("ERR", 3), zmq::send_flags::none);
+                      continue;
+                  }
                   try {
                       std::string id_str = recv_msgs[data_idx].to_string(); data_idx++;
                       std::string label = recv_msgs[data_idx].to_string();
@@ -461,7 +547,12 @@ int main(int argc, char *argv[]) {
                       if(1) std::fprintf(stderr, "L3_SERVER: Error I: %s\n", e.what()); //std::fflush(stderr);
                       sock.send(identity, zmq::send_flags::sndmore);
                       sock.send(zmq::message_t(), zmq::send_flags::sndmore);
-                      sock.send(zmq::message_t(), zmq::send_flags::none);
+                      sock.send(zmq::message_t("ERR", 3), zmq::send_flags::none);
+                  } catch (...) {
+                      if(1) std::fprintf(stderr, "L3_SERVER: Unknown Error I\n");
+                      sock.send(identity, zmq::send_flags::sndmore);
+                      sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                      sock.send(zmq::message_t("ERR", 3), zmq::send_flags::none);
                   }
               }
           }

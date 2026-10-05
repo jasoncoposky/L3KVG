@@ -16,7 +16,6 @@
 #include <zmq.hpp>
 #include <zmq_addon.hpp>
 #include "buffer.hpp"
-#include "json.hpp"
 
 struct MockServerStats {
     std::atomic<int> r_requests{0};
@@ -79,25 +78,36 @@ void run_mock_cluster_flexible(uint16_t port, uint16_t cluster_id, const std::st
                 stats.r_requests++;
                 const auto& nodes_msg = recv_msgs[4];
                 std::vector<uint64_t> nodes;
-                if (nodes_msg.size() % sizeof(uint64_t) == 0 &&
-                    (nodes_msg.size() == 0 || (static_cast<const char*>(nodes_msg.data())[0] != '[' && static_cast<const char*>(nodes_msg.data())[0] != '{'))) {
-                    const uint64_t* raw = reinterpret_cast<const uint64_t*>(nodes_msg.data());
-                    nodes.assign(raw, raw + (nodes_msg.size() / sizeof(uint64_t)));
-                } else {
-                    std::string raw_json = nodes_msg.to_string();
-                    lite3cpp::Buffer buf = lite3cpp::lite3_json::from_json_string(raw_json.empty() ? "[]" : raw_json);
-                    if (buf.size() >= sizeof(lite3cpp::PackedNodeLayout)) {
-                        lite3cpp::NodeView nv(reinterpret_cast<const lite3cpp::PackedNodeLayout*>(buf.data()));
-                        if (nv.type() == lite3cpp::Type::Array) {
-                            for (uint32_t i = 0; i < nv.size(); ++i) {
-                                auto t = buf.arr_get_type(0, i);
-                                if (t == lite3cpp::Type::Int64) {
-                                    nodes.push_back(static_cast<uint64_t>(buf.arr_get_i64(0, i)));
-                                } else if (t == lite3cpp::Type::String) {
-                                    nodes.push_back(std::stoull(std::string(buf.arr_get_str(0, i)), nullptr, 16));
+                bool parsed_as_json = false;
+                std::string_view sv(static_cast<const char*>(nodes_msg.data()), nodes_msg.size());
+                size_t first = sv.find_first_not_of(" \t\r\n");
+                size_t last = sv.find_last_not_of(" \t\r\n");
+                if (first != std::string_view::npos && last != std::string_view::npos && last >= first + 1 && sv[first] == '[' && sv[last] == ']') {
+                    try {
+                        lite3cpp::Buffer buf = lite3cpp::lite3_json::from_json_string(std::string(sv.substr(first, last - first + 1)));
+                        if (buf.size() >= sizeof(lite3cpp::PackedNodeLayout)) {
+                            lite3cpp::NodeView nv(reinterpret_cast<const lite3cpp::PackedNodeLayout*>(buf.data()));
+                            if (nv.type() == lite3cpp::Type::Array) {
+                                parsed_as_json = true;
+                                for (uint32_t i = 0; i < nv.size(); ++i) {
+                                    auto t = buf.arr_get_type(0, i);
+                                    if (t == lite3cpp::Type::Int64) {
+                                        nodes.push_back(static_cast<uint64_t>(buf.arr_get_i64(0, i)));
+                                    } else if (t == lite3cpp::Type::String) {
+                                        nodes.push_back(std::stoull(std::string(buf.arr_get_str(0, i)), nullptr, 16));
+                                    }
                                 }
                             }
                         }
+                    } catch (...) {
+                        parsed_as_json = false;
+                    }
+                }
+                if (!parsed_as_json && nodes_msg.size() % sizeof(uint64_t) == 0) {
+                    size_t count = nodes_msg.size() / sizeof(uint64_t);
+                    nodes.resize(count);
+                    if (count > 0) {
+                        std::memcpy(nodes.data(), nodes_msg.data(), count * sizeof(uint64_t));
                     }
                 }
 
