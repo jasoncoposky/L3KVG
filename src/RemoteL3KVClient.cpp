@@ -553,7 +553,7 @@ std::future<std::vector<ResultRow>> RemoteL3KVClient::resume_query_async(
                 lite3cpp::Buffer resp_buf;
                 const uint8_t* ptr = static_cast<const uint8_t*>(resp_msg.data());
                 if (resp_msg.size() >= sizeof(lite3cpp::PackedNodeLayout) && (ptr[0] == 0x06 || ptr[0] == 0x07)) {
-                    resp_buf = lite3cpp::Buffer(std::vector<uint8_t>(ptr, ptr + resp_msg.size()));
+                    resp_buf = lite3cpp::Buffer(ptr, resp_msg.size());
                 } else {
                     std::string raw_json = resp_msg.to_string();
                     resp_buf = lite3cpp::lite3_json::from_json_string(raw_json.empty() ? "[]" : raw_json);
@@ -612,7 +612,7 @@ std::future<std::vector<ResultRow>> RemoteL3KVClient::resume_query_async(
     if (query_payload.size() >= sizeof(lite3cpp::PackedNodeLayout) &&
         (static_cast<uint8_t>(query_payload[0]) == 0x06 || static_cast<uint8_t>(query_payload[0]) == 0x07)) {
         const uint8_t* ptr = reinterpret_cast<const uint8_t*>(query_payload.data());
-        buf = lite3cpp::Buffer(std::vector<uint8_t>(ptr, ptr + query_payload.size()));
+        buf = lite3cpp::Buffer(ptr, query_payload.size());
     } else {
         buf = lite3cpp::lite3_json::from_json_string(query_payload.empty() ? "{}" : query_payload);
     }
@@ -973,7 +973,7 @@ std::future<std::unordered_map<uint64_t, std::string>> RemoteL3KVClient::get_nod
                 if(0) std::fprintf(stderr, "  [ZMQ] M SUCCESS. took %lld ms. size=%zu\n", (long long)duration, recv_msgs[1].size()); //std::fflush(stderr);
                 report_success(owner_id);
                 auto& body = recv_msgs[1];
-                lite3cpp::Buffer buf(std::vector<uint8_t>((uint8_t*)body.data(), (uint8_t*)body.data() + body.size()));
+                lite3cpp::Buffer buf(static_cast<const uint8_t*>(body.data()), body.size());
                 
                 size_t root = 0;
                 for (auto it = buf.begin(root); it != buf.end(root); ++it) {

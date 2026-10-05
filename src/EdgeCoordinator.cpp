@@ -126,7 +126,7 @@ std::future<void> EdgeCoordinator::atomic_put_edge(uint64_t src_id, const std::s
         const uint8_t* ptr = reinterpret_cast<const uint8_t*>(payload.data());
         if (payload.size() >= sizeof(lite3cpp::PackedNodeLayout) && (ptr[0] == 0x06 || ptr[0] == 0x07)) {
             try {
-                lite3cpp::Buffer props_buf(std::vector<uint8_t>(ptr, ptr + payload.size()));
+                lite3cpp::Buffer props_buf(ptr, payload.size());
                 size_t props_ofs = buf.set_obj(0, "props");
                 copy_properties(props_buf, 0, buf, props_ofs);
             } catch (...) {
@@ -144,7 +144,7 @@ std::future<void> EdgeCoordinator::atomic_put_edge(uint64_t src_id, const std::s
             buf.set_str(0, "props", payload);
         }
     }
-    std::vector<uint8_t> final_payload_data(buf.data(), buf.data() + buf.size());
+    std::string binary_str(reinterpret_cast<const char*>(buf.data()), buf.size());
 
     lite3::NodeID src_owner = resolver_.get_node_owner(src_id);
     lite3::NodeID dst_owner = resolver_.get_node_owner(dst_id);
@@ -162,7 +162,6 @@ std::future<void> EdgeCoordinator::atomic_put_edge(uint64_t src_id, const std::s
         if (owner == local_id) {
             size_t shard_idx = store_->get_routing_shard(key);
             // Engine::put takes a string, we'll cast the data
-            std::string binary_str(reinterpret_cast<const char*>(final_payload_data.data()), final_payload_data.size());
             
             if (s_l3_debug) {
                 std::fprintf(stderr, "[EdgeCoordinator] Local Write: key=%s shard=%zu data_len=%zu\n", key.c_str(), shard_idx, binary_str.size());
@@ -189,7 +188,7 @@ std::future<void> EdgeCoordinator::atomic_put_edge(uint64_t src_id, const std::s
             auto& shard = shards_[shard_idx];
             {
                 std::lock_guard<std::mutex> lock(shard.mu);
-                shard.buffer.push_back({key, final_payload_data});
+                shard.buffer.push_back({key, binary_str});
                 shard.promises.push_back(prom);
             }
             
@@ -311,7 +310,7 @@ void EdgeCoordinator::flush_shard(size_t shard_idx) {
             }
             lite3::NodeID owner = resolver_.get_node_owner(node_id);
 
-            node_batches[owner].put_raw(entry.key, std::string_view(reinterpret_cast<const char*>(entry.val.data()), entry.val.size()));
+            node_batches[owner].put_raw(entry.key, entry.val);
             node_promises[owner].push_back(promises[i]);
         }
 

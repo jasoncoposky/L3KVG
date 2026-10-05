@@ -1248,7 +1248,7 @@ Query &Query::resume(const std::vector<uint64_t>& starting_nodes, std::string_vi
     if (query_payload.size() >= sizeof(lite3cpp::PackedNodeLayout) && 
         (static_cast<uint8_t>(query_payload[0]) == 0x06 || static_cast<uint8_t>(query_payload[0]) == 0x07)) {
         const uint8_t* ptr = reinterpret_cast<const uint8_t*>(query_payload.data());
-        lite3cpp::Buffer buf(std::vector<uint8_t>(ptr, ptr + query_payload.size()));
+        lite3cpp::Buffer buf(ptr, query_payload.size());
         return resume(starting_nodes, buf);
     } else {
         lite3cpp::Buffer buf = lite3cpp::lite3_json::from_json_string(query_payload.empty() ? "{}" : std::string(query_payload));

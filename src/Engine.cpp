@@ -207,7 +207,7 @@ void Engine::put_node(uint64_t id, std::string payload) {
 
   if (payload.size() >= sizeof(lite3cpp::PackedNodeLayout) && (ptr[0] == 0x06 || ptr[0] == 0x07)) {
       try {
-          lite3cpp::Buffer buf(std::vector<uint8_t>(ptr, ptr + payload.size()));
+          lite3cpp::Buffer buf(ptr, payload.size());
           ts.write_to_buffer(buf, 0, "_hlc");
           binary_payload = std::string(reinterpret_cast<const char*>(buf.data()), buf.size());
       } catch (...) {
@@ -275,7 +275,7 @@ void Engine::replicate_key(const std::string& key, std::string payload, uint16_t
             const uint8_t* in_ptr = reinterpret_cast<const uint8_t*>(payload.data());
             if (payload.size() >= sizeof(lite3cpp::PackedNodeLayout) && (in_ptr[0] == 0x06 || in_ptr[0] == 0x07)) {
                 try {
-                    in_buf = lite3cpp::Buffer(std::vector<uint8_t>(in_ptr, in_ptr + payload.size()));
+                    in_buf = lite3cpp::Buffer(in_ptr, payload.size());
                     is_binary = true;
                     binary_payload = payload;
                 } catch (...) {}

@@ -58,11 +58,10 @@ void Node::ensure_loaded() {
                   if (raw_data.starts_with("{")) {
                       payload_ = lite3cpp::lite3_json::from_json_string(raw_data);
                   } else {
-                      std::vector<uint8_t> vec(raw_data.begin(), raw_data.end());
-                      payload_ = lite3cpp::Buffer(std::move(vec));
+                      payload_ = lite3cpp::Buffer(raw_data);
                   }
               } catch (const std::exception& e) {
-                  payload_ = lite3cpp::Buffer(std::vector<uint8_t>(raw_data.begin(), raw_data.end()));
+                  payload_ = lite3cpp::Buffer(raw_data);
               }
               
               if (payload_ && payload_->get_type(0, "bloom") == lite3cpp::Type::Int64) {
@@ -338,11 +337,10 @@ void Node::hydrate(const std::string &data) {
                 payload_ = lite3cpp::lite3_json::from_json_string(data);
             } else {
                 // It's binary BSON, reconstruct Buffer directly
-                std::vector<uint8_t> vec(data.begin(), data.end());
-                payload_ = lite3cpp::Buffer(std::move(vec));
+                payload_ = lite3cpp::Buffer(data);
             }
         } catch (const std::exception& e) {
-            payload_ = lite3cpp::Buffer(std::vector<uint8_t>(data.begin(), data.end()));
+            payload_ = lite3cpp::Buffer(data);
         }
       }
       loaded_.store(true, std::memory_order_release);

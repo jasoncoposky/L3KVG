@@ -35,7 +35,7 @@ public:
 private:
     struct BatchEntry {
         std::string key;
-        std::vector<uint8_t> val;
+        std::string val;
     };
 
     struct BatchShard {
