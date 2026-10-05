@@ -78,7 +78,7 @@ std::shared_ptr<Node> Engine::get_node(uint64_t id) {
     return it->second.node;
   }
 
-  if (shard.map.size() >= settings_.node_cache_size_per_shard) {
+  if (shard.map.size() >= settings_.node_cache_size_per_shard && !shard.lru.empty()) {
       uint64_t victim = shard.lru.back();
       shard.map.erase(victim);
       shard.lru.pop_back();

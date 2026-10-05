@@ -102,7 +102,7 @@ public:
 
 private:
   struct CacheShard {
-    std::mutex mutex;
+    mutable std::mutex mutex;
     using LruList = std::list<uint64_t>;
     struct CacheEntry {
       std::shared_ptr<Node> node;
