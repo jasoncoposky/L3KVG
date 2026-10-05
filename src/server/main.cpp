@@ -295,18 +295,14 @@ int main(int argc, char *argv[]) {
                       sock.send(zmq::message_t(resp_buf.data(), resp_buf.size()), zmq::send_flags::none);
                   } catch (const std::exception& e) {
                       if(1) std::fprintf(stderr, "L3_SERVER: Error R (std::exception): %s\n", e.what()); //std::fflush(stderr);
-                      lite3cpp::Buffer empty_buf;
-                      empty_buf.init_array();
                       sock.send(identity, zmq::send_flags::sndmore);
                       sock.send(zmq::message_t(), zmq::send_flags::sndmore);
-                      sock.send(zmq::message_t(empty_buf.data(), empty_buf.size()), zmq::send_flags::none);
+                      sock.send(zmq::message_t("ERR", 3), zmq::send_flags::none);
                   } catch (...) {
                       if(1) std::fprintf(stderr, "L3_SERVER: Error R (unknown exception)\n"); //std::fflush(stderr);
-                      lite3cpp::Buffer empty_buf;
-                      empty_buf.init_array();
                       sock.send(identity, zmq::send_flags::sndmore);
                       sock.send(zmq::message_t(), zmq::send_flags::sndmore);
-                      sock.send(zmq::message_t(empty_buf.data(), empty_buf.size()), zmq::send_flags::none);
+                      sock.send(zmq::message_t("ERR", 3), zmq::send_flags::none);
                   }
               } else if (opcode == "P") {
                   if (data_idx + 2 > recv_msgs.size()) {

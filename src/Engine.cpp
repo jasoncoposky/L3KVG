@@ -4,7 +4,6 @@
 #include "L3KVG/KeyBuilder.hpp"
 #include "L3KVG/MutationBatch.hpp"
 #include "engine/store.hpp"
-#include "json.hpp"
 #include <iomanip>
 #include <sstream>
 #include <iostream>

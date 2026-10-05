@@ -544,8 +544,12 @@ std::future<std::vector<ResultRow>> RemoteL3KVClient::resume_query_async(
             }
             
             if (res && recv_msgs.size() >= 2) {
-                report_success(cluster_id);
                 const auto& resp_msg = recv_msgs[1];
+                if (resp_msg.size() == 3 && std::memcmp(resp_msg.data(), "ERR", 3) == 0) {
+                    report_failure(cluster_id);
+                    return {};
+                }
+                report_success(cluster_id);
                 lite3cpp::Buffer resp_buf;
                 const uint8_t* ptr = static_cast<const uint8_t*>(resp_msg.data());
                 if (resp_msg.size() >= sizeof(lite3cpp::PackedNodeLayout) && (ptr[0] == 0x06 || ptr[0] == 0x07)) {
