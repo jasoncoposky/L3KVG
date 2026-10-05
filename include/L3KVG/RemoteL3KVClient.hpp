@@ -63,7 +63,14 @@ public:
     virtual std::future<std::vector<ResultRow>> resume_query_async(
         uint16_t cluster_id,
         const std::vector<uint64_t>& starting_nodes,
-        const std::string& query_json,
+        const lite3cpp::Buffer& query_buf,
+        uint32_t principal_id = l3kv::INTERNAL_UID
+    );
+
+    virtual std::future<std::vector<ResultRow>> resume_query_async(
+        uint16_t cluster_id,
+        const std::vector<uint64_t>& starting_nodes,
+        const std::string& query_payload,
         uint32_t principal_id = l3kv::INTERNAL_UID
     );
 

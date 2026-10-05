@@ -2,6 +2,7 @@
 
 #include "L3KVG/Engine.hpp"
 #include "L3KVG/QueryResult.hpp"
+#include "buffer.hpp"
 #include <optional>
 #include <string>
 #include <string_view>
@@ -111,7 +112,9 @@ public:
   std::vector<ResultRow> execute();
 
   // Federation Support
-  Query &resume(const std::vector<uint64_t>& starting_nodes, std::string_view query_json);
+  static lite3cpp::Buffer serialize_results(const std::vector<ResultRow>& rows);
+  Query &resume(const std::vector<uint64_t>& starting_nodes, const lite3cpp::Buffer& query_buf);
+  Query &resume(const std::vector<uint64_t>& starting_nodes, std::string_view query_payload);
 
   Query &set_principal_id(uint32_t uid) { principal_id_ = uid; return *this; }
 

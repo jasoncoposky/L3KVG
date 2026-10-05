@@ -31,6 +31,15 @@ public:
         return p.get_future();
     }
 
+    std::future<std::vector<ResultRow>> resume_query_async(
+        uint16_t cluster_id,
+        const std::vector<uint64_t>& starting_nodes,
+        const lite3cpp::Buffer& query_buf,
+        uint32_t principal_id = l3kv::INTERNAL_UID) override {
+        std::string payload(reinterpret_cast<const char*>(query_buf.data()), query_buf.size());
+        return resume_query_async(cluster_id, starting_nodes, payload, principal_id);
+    }
+
     std::future<bool> execute_batch_async(
         lite3::NodeID owner_id,
         const MutationBatch& batch,

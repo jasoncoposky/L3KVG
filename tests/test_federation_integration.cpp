@@ -1,4 +1,5 @@
 #include "L3KVG/Engine.hpp"
+#include "L3KVG/Node.hpp"
 #include "engine/store.hpp"
 #include "L3KVG/Query.hpp"
 #include "L3KVG/FederationID.hpp"
@@ -11,26 +12,28 @@
 #include <thread>
 #include <zmq.hpp>
 #include <zmq_addon.hpp>
-#include <nlohmann/json.hpp>
+#include "buffer.hpp"
+#include "json.hpp"
 
-using json = nlohmann::json;
-
-void run_mock_server(uint16_t port, uint16_t cluster_id, const std::string& db_path) {
+void run_mock_server(uint16_t port, uint16_t cluster_id, const std::string& db_path, std::atomic<bool>& stop_signal) {
     std::filesystem::remove_all(db_path);
     auto engine = std::make_unique<l3kvg::Engine>(db_path, 1);
     engine->get_resolver().register_local_cluster("remote", cluster_id);
     
     // Put remote node B
     uint64_t node_b_id = engine->get_resolver().parse_uuid("node_b");
-    engine->put_node(node_b_id, R"json({"id":"node_b","name":"Node B (Remote)"})json");
+    lite3cpp::Buffer b_buf;
+    b_buf.init_object();
+    b_buf.set_str(0, "id", "node_b");
+    b_buf.set_str(0, "name", "Node B (Remote)");
+    engine->put_node(node_b_id, std::string(reinterpret_cast<const char*>(b_buf.data()), b_buf.size()));
 
     zmq::context_t ctx(1);
     zmq::socket_t sock(ctx, ZMQ_ROUTER);
     std::string zmq_endpoint = "tcp://127.0.0.1:" + std::to_string(port);
     sock.bind(zmq_endpoint);
 
-    bool running = true;
-    while (running) {
+    while (!stop_signal) {
         std::vector<zmq::message_t> recv_msgs;
         auto result = zmq::recv_multipart(sock, std::back_inserter(recv_msgs), zmq::recv_flags::dontwait);
         if (!result) {
@@ -47,28 +50,97 @@ void run_mock_server(uint16_t port, uint16_t cluster_id, const std::string& db_p
 
         if (opcode == "R") {
             try {
-                std::vector<uint64_t> nodes = json::parse(recv_msgs[4].to_string());
-                std::string query_json = recv_msgs[5].to_string();
-
-                auto results = engine->query().resume(nodes, query_json).execute();
-
-                json j_res = json::array();
-                for (const auto& row : results) {
-                    json jr = json::object();
-                    for (const auto& [k, v] : row.fields) jr[k] = v;
-                    j_res.push_back(jr);
+                const auto& nodes_msg = recv_msgs[4];
+                std::vector<uint64_t> nodes;
+                if (nodes_msg.size() % sizeof(uint64_t) == 0 &&
+                    (nodes_msg.size() == 0 || (static_cast<const char*>(nodes_msg.data())[0] != '[' && static_cast<const char*>(nodes_msg.data())[0] != '{'))) {
+                    const uint64_t* raw = reinterpret_cast<const uint64_t*>(nodes_msg.data());
+                    nodes.assign(raw, raw + (nodes_msg.size() / sizeof(uint64_t)));
+                } else {
+                    std::string raw_json = nodes_msg.to_string();
+                    lite3cpp::Buffer buf = lite3cpp::lite3_json::from_json_string(raw_json.empty() ? "[]" : raw_json);
+                    if (buf.size() >= sizeof(lite3cpp::PackedNodeLayout)) {
+                        lite3cpp::NodeView nv(reinterpret_cast<const lite3cpp::PackedNodeLayout*>(buf.data()));
+                        if (nv.type() == lite3cpp::Type::Array) {
+                            for (uint32_t i = 0; i < nv.size(); ++i) {
+                                auto t = buf.arr_get_type(0, i);
+                                if (t == lite3cpp::Type::Int64) {
+                                    nodes.push_back(static_cast<uint64_t>(buf.arr_get_i64(0, i)));
+                                } else if (t == lite3cpp::Type::String) {
+                                    nodes.push_back(std::stoull(std::string(buf.arr_get_str(0, i)), nullptr, 16));
+                                }
+                            }
+                        }
+                    }
                 }
 
-                std::string resp_json = j_res.dump();
+                const auto& qmsg = recv_msgs[5];
+                lite3cpp::Buffer qbuf;
+                const uint8_t* qptr = static_cast<const uint8_t*>(qmsg.data());
+                if (qmsg.size() >= sizeof(lite3cpp::PackedNodeLayout) && (qptr[0] == 0x06 || qptr[0] == 0x07)) {
+                    qbuf = lite3cpp::Buffer(std::vector<uint8_t>(qptr, qptr + qmsg.size()));
+                } else {
+                    std::string qstr = qmsg.to_string();
+                    qbuf = lite3cpp::lite3_json::from_json_string(qstr.empty() ? "{}" : qstr);
+                }
+
+                auto results = engine->query().resume(nodes, qbuf).execute();
+
+                lite3cpp::Buffer resp_buf = l3kvg::Query::serialize_results(results);
                 sock.send(identity, zmq::send_flags::sndmore);
                 sock.send(zmq::message_t(), zmq::send_flags::sndmore);
-                sock.send(zmq::message_t(resp_json.data(), resp_json.size()), zmq::send_flags::none);
-                running = false;
+                sock.send(zmq::message_t(resp_buf.data(), resp_buf.size()), zmq::send_flags::none);
+            } catch (...) {
+                lite3cpp::Buffer empty_buf;
+                empty_buf.init_array();
+                sock.send(identity, zmq::send_flags::sndmore);
+                sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                sock.send(zmq::message_t(empty_buf.data(), empty_buf.size()), zmq::send_flags::none);
+            }
+        } else if (opcode == "N") {
+            try {
+                std::string id_str = recv_msgs[4].to_string();
+                std::string label = recv_msgs[5].to_string();
+                double min_weight = (recv_msgs.size() >= 7) ? std::stod(recv_msgs[6].to_string()) : 0.0;
+                uint64_t target_node_id = std::stoull(id_str, nullptr, 16);
+                auto node = engine->get_node(target_node_id);
+                std::vector<uint64_t> neighs;
+                if (node) neighs = node->get_neighbors(label, min_weight);
+                sock.send(identity, zmq::send_flags::sndmore);
+                sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                sock.send(zmq::message_t(neighs.data(), neighs.size() * sizeof(uint64_t)), zmq::send_flags::none);
             } catch (...) {
                 sock.send(identity, zmq::send_flags::sndmore);
                 sock.send(zmq::message_t(), zmq::send_flags::sndmore);
-                sock.send(zmq::message_t("[]", 2), zmq::send_flags::none);
-                running = false;
+                sock.send(zmq::message_t(), zmq::send_flags::none);
+            }
+        } else if (opcode == "I") {
+            try {
+                std::string id_str = recv_msgs[4].to_string();
+                std::string label = recv_msgs[5].to_string();
+                uint64_t target_node_id = std::stoull(id_str, nullptr, 16);
+                auto node = engine->get_node(target_node_id);
+                std::vector<uint64_t> neighs;
+                if (node) neighs = node->get_in_neighbors(label);
+                sock.send(identity, zmq::send_flags::sndmore);
+                sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                sock.send(zmq::message_t(neighs.data(), neighs.size() * sizeof(uint64_t)), zmq::send_flags::none);
+            } catch (...) {
+                sock.send(identity, zmq::send_flags::sndmore);
+                sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                sock.send(zmq::message_t(), zmq::send_flags::none);
+            }
+        } else if (opcode == "G") {
+            try {
+                std::string key = recv_msgs[4].to_string();
+                auto val = engine->get_store()->get(key);
+                sock.send(identity, zmq::send_flags::sndmore);
+                sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                sock.send(zmq::message_t(val.data(), val.size()), zmq::send_flags::none);
+            } catch (...) {
+                sock.send(identity, zmq::send_flags::sndmore);
+                sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                sock.send(zmq::message_t(), zmq::send_flags::none);
             }
         } else if (opcode == "H") {
             sock.send(identity, zmq::send_flags::sndmore);
@@ -88,6 +160,10 @@ void run_mock_server(uint16_t port, uint16_t cluster_id, const std::string& db_p
             sock.send(identity, zmq::send_flags::sndmore);
             sock.send(zmq::message_t(), zmq::send_flags::sndmore);
             sock.send(zmq::message_t("OK", 2), zmq::send_flags::none);
+        } else {
+            sock.send(identity, zmq::send_flags::sndmore);
+            sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+            sock.send(zmq::message_t("ERR", 3), zmq::send_flags::none);
         }
     }
 }
@@ -97,7 +173,8 @@ TEST(FederationIntegrationTest, ClientPing) {
     uint16_t remote_cluster_id = 101;
     std::string remote_db = "test_remote_db_ping";
     
-    std::thread remote_thread(run_mock_server, remote_port, remote_cluster_id, remote_db);
+    std::atomic<bool> stop_signal{false};
+    std::thread remote_thread(run_mock_server, remote_port, remote_cluster_id, remote_db, std::ref(stop_signal));
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
     l3kvg::Settings settings;
@@ -110,10 +187,7 @@ TEST(FederationIntegrationTest, ClientPing) {
     auto future = client.ping_peer(remote_cluster_id);
     EXPECT_TRUE(future.get());
 
-    // Clean up mock server (it will exit on next query, but for ping we might need another way or just let it time out/detach)
-    // For this test, let's trigger the "R" opcode to let it join cleanly.
-    (void)client.resume_query_async(remote_cluster_id, {1}, "{}").get();
-    
+    stop_signal = true;
     remote_thread.join();
     std::filesystem::remove_all(remote_db);
 }
@@ -124,7 +198,8 @@ TEST(FederationIntegrationTest, EndToEndZmqQuery) {
     std::string remote_db = "test_remote_db";
     std::string local_db = "test_local_db";
 
-    std::thread remote_thread(run_mock_server, remote_port, remote_cluster_id, remote_db);
+    std::atomic<bool> stop_signal{false};
+    std::thread remote_thread(run_mock_server, remote_port, remote_cluster_id, remote_db, std::ref(stop_signal));
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
     std::filesystem::remove_all(local_db);
@@ -136,7 +211,11 @@ TEST(FederationIntegrationTest, EndToEndZmqQuery) {
     engine->get_remote_client().add_peer(remote_cluster_id, "tcp://127.0.0.1:" + std::to_string(remote_port));
 
     uint64_t node_a_id = engine->get_resolver().parse_uuid("node_a");
-    engine->put_node(node_a_id, R"json({"id":"node_a","name":"Node A"})json");
+    lite3cpp::Buffer a_buf;
+    a_buf.init_object();
+    a_buf.set_str(0, "id", "node_a");
+    a_buf.set_str(0, "name", "Node A");
+    engine->put_node(node_a_id, std::string(reinterpret_cast<const char*>(a_buf.data()), a_buf.size()));
 
     uint64_t node_b_id = engine->get_resolver().parse_uuid("remote:node_b");
     engine->add_edge(node_a_id, "link", 1.0, node_b_id);
@@ -153,6 +232,7 @@ TEST(FederationIntegrationTest, EndToEndZmqQuery) {
     ASSERT_EQ(results.size(), 1);
     EXPECT_EQ(results[0].fields.at("b.name"), "Node B (Remote)");
 
+    stop_signal = true;
     remote_thread.join();
     std::filesystem::remove_all(local_db);
     std::filesystem::remove_all(remote_db);

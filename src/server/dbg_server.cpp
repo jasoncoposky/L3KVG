@@ -10,15 +10,14 @@
 #include <string>
 #include <vector>
 #include <mutex>
-#include <nlohmann/json.hpp>
 #include "httplib.h"
 #include "L3KVG/RemoteL3KVClient.hpp"
 #include "L3KVG/Engine.hpp"
 #include "L3KVG/Cypher.hpp"
 #include "lite3/ring.hpp"
 #include "observability.hpp"
-
-using json = nlohmann::json;
+#include "buffer.hpp"
+#include "json.hpp"
 
 class FileLogger : public lite3cpp::ILogger {
 public:
@@ -56,17 +55,32 @@ Config load_config(const std::string &path) {
   std::ifstream f(path);
   if (f.is_open()) {
     try {
-      json j;
-      f >> j;
-      cfg.address = j.value("address", cfg.address);
-      cfg.port = j.value("port", cfg.port);
-      cfg.node_id = j.value("node_id", cfg.node_id);
-      cfg.db_path = j.value("db_path", cfg.db_path);
-      if (j.contains("peers")) {
-        for (auto &p : j["peers"]) {
-          cfg.peers.push_back({p.value("id", 0u), p.value("host", "127.0.0.1"),
-                               p.value("port", 8080)});
-        }
+      std::string str((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+      lite3cpp::Buffer buf = lite3cpp::lite3_json::from_json_string(str);
+      if (buf.get_type(0, "address") == lite3cpp::Type::String) {
+          cfg.address = std::string(buf.get_str(0, "address"));
+      }
+      if (buf.get_type(0, "port") == lite3cpp::Type::Int64) {
+          cfg.port = static_cast<int>(buf.get_i64(0, "port"));
+      }
+      if (buf.get_type(0, "node_id") == lite3cpp::Type::Int64) {
+          cfg.node_id = static_cast<uint32_t>(buf.get_i64(0, "node_id"));
+      }
+      if (buf.get_type(0, "db_path") == lite3cpp::Type::String) {
+          cfg.db_path = std::string(buf.get_str(0, "db_path"));
+      }
+      if (buf.get_type(0, "peers") == lite3cpp::Type::Array) {
+          size_t peers_arr_ofs = buf.get_arr(0, "peers");
+          lite3cpp::NodeView pn(reinterpret_cast<const lite3cpp::PackedNodeLayout*>(buf.data() + peers_arr_ofs));
+          for (uint32_t i = 0; i < pn.size(); ++i) {
+              if (buf.arr_get_type(peers_arr_ofs, i) != lite3cpp::Type::Object) continue;
+              size_t po = buf.arr_get_obj(peers_arr_ofs, i);
+              PeerConfig pc;
+              pc.id = (buf.get_type(po, "id") == lite3cpp::Type::Int64) ? static_cast<uint32_t>(buf.get_i64(po, "id")) : 0u;
+              pc.host = (buf.get_type(po, "host") == lite3cpp::Type::String) ? std::string(buf.get_str(po, "host")) : "127.0.0.1";
+              pc.port = (buf.get_type(po, "port") == lite3cpp::Type::Int64) ? static_cast<int>(buf.get_i64(po, "port")) : 8080;
+              cfg.peers.push_back(std::move(pc));
+          }
       }
     } catch (...) {
       std::cerr << "Failed to parse config, using defaults.\n";

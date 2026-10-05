@@ -1,4 +1,5 @@
 #include "L3KVG/Engine.hpp"
+#include "L3KVG/Node.hpp"
 #include "L3KVG/Query.hpp"
 #include "L3KVG/FederationID.hpp"
 #include "L3KVG/QueryResult.hpp"
@@ -14,9 +15,8 @@
 #include <set>
 #include <zmq.hpp>
 #include <zmq_addon.hpp>
-#include <nlohmann/json.hpp>
-
-using json = nlohmann::json;
+#include "buffer.hpp"
+#include "json.hpp"
 
 struct MockServerStats {
     std::atomic<int> r_requests{0};
@@ -45,13 +45,12 @@ void run_mock_cluster_flexible(uint16_t port, uint16_t cluster_id, const std::st
             for (int i = 1; i <= 10; ++i) {
                 std::string id_str = "node_b" + std::to_string(i);
                 uint64_t node_b_id = engine->get_resolver().parse_uuid(id_str);
-                json node_data = {
-                    {"id", id_str},
-                    {"name", "Name" + std::to_string(i)},
-                    {"age", 20 + i},
-                    {"status", "active"}
-                };
-                lite3cpp::Buffer buf = lite3cpp::lite3_json::from_json_string(node_data.dump());
+                lite3cpp::Buffer buf;
+                buf.init_object();
+                buf.set_str(0, "id", id_str);
+                buf.set_str(0, "name", "Name" + std::to_string(i));
+                buf.set_i64(0, "age", 20 + i);
+                buf.set_str(0, "status", "active");
                 engine->put_node(node_b_id, std::string(reinterpret_cast<const char*>(buf.data()), buf.size()));
             }
         }
@@ -78,22 +77,79 @@ void run_mock_cluster_flexible(uint16_t port, uint16_t cluster_id, const std::st
             if (opcode == "R") {
                 if (recv_msgs.size() < 6) continue;
                 stats.r_requests++;
-                std::vector<uint64_t> nodes = json::parse(recv_msgs[4].to_string());
-                std::string query_json = recv_msgs[5].to_string();
-
-                auto results = engine->query().resume(nodes, query_json).execute();
-
-                json j_res = json::array();
-                for (const auto& row : results) {
-                    json jr = json::object();
-                    for (const auto& [k, v] : row.fields) jr[k] = v;
-                    j_res.push_back(jr);
+                const auto& nodes_msg = recv_msgs[4];
+                std::vector<uint64_t> nodes;
+                if (nodes_msg.size() % sizeof(uint64_t) == 0 &&
+                    (nodes_msg.size() == 0 || (static_cast<const char*>(nodes_msg.data())[0] != '[' && static_cast<const char*>(nodes_msg.data())[0] != '{'))) {
+                    const uint64_t* raw = reinterpret_cast<const uint64_t*>(nodes_msg.data());
+                    nodes.assign(raw, raw + (nodes_msg.size() / sizeof(uint64_t)));
+                } else {
+                    std::string raw_json = nodes_msg.to_string();
+                    lite3cpp::Buffer buf = lite3cpp::lite3_json::from_json_string(raw_json.empty() ? "[]" : raw_json);
+                    if (buf.size() >= sizeof(lite3cpp::PackedNodeLayout)) {
+                        lite3cpp::NodeView nv(reinterpret_cast<const lite3cpp::PackedNodeLayout*>(buf.data()));
+                        if (nv.type() == lite3cpp::Type::Array) {
+                            for (uint32_t i = 0; i < nv.size(); ++i) {
+                                auto t = buf.arr_get_type(0, i);
+                                if (t == lite3cpp::Type::Int64) {
+                                    nodes.push_back(static_cast<uint64_t>(buf.arr_get_i64(0, i)));
+                                } else if (t == lite3cpp::Type::String) {
+                                    nodes.push_back(std::stoull(std::string(buf.arr_get_str(0, i)), nullptr, 16));
+                                }
+                            }
+                        }
+                    }
                 }
 
-                std::string resp_json = j_res.dump();
+                const auto& qmsg = recv_msgs[5];
+                lite3cpp::Buffer qbuf;
+                const uint8_t* qptr = static_cast<const uint8_t*>(qmsg.data());
+                if (qmsg.size() >= sizeof(lite3cpp::PackedNodeLayout) && (qptr[0] == 0x06 || qptr[0] == 0x07)) {
+                    qbuf = lite3cpp::Buffer(std::vector<uint8_t>(qptr, qptr + qmsg.size()));
+                } else {
+                    std::string qstr = qmsg.to_string();
+                    qbuf = lite3cpp::lite3_json::from_json_string(qstr.empty() ? "{}" : qstr);
+                }
+
+                auto results = engine->query().resume(nodes, qbuf).execute();
+
+                lite3cpp::Buffer resp_buf = l3kvg::Query::serialize_results(results);
                 sock.send(identity, zmq::send_flags::sndmore);
                 sock.send(zmq::message_t(), zmq::send_flags::sndmore);
-                sock.send(zmq::message_t(resp_json.data(), resp_json.size()), zmq::send_flags::none);
+                sock.send(zmq::message_t(resp_buf.data(), resp_buf.size()), zmq::send_flags::none);
+            } else if (opcode == "N") {
+                try {
+                    std::string id_str = recv_msgs[4].to_string();
+                    std::string label = recv_msgs[5].to_string();
+                    double min_weight = (recv_msgs.size() >= 7) ? std::stod(recv_msgs[6].to_string()) : 0.0;
+                    uint64_t target_node_id = std::stoull(id_str, nullptr, 16);
+                    auto node = engine->get_node(target_node_id);
+                    std::vector<uint64_t> neighs;
+                    if (node) neighs = node->get_neighbors(label, min_weight);
+                    sock.send(identity, zmq::send_flags::sndmore);
+                    sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                    sock.send(zmq::message_t(neighs.data(), neighs.size() * sizeof(uint64_t)), zmq::send_flags::none);
+                } catch (...) {
+                    sock.send(identity, zmq::send_flags::sndmore);
+                    sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                    sock.send(zmq::message_t(), zmq::send_flags::none);
+                }
+            } else if (opcode == "I") {
+                try {
+                    std::string id_str = recv_msgs[4].to_string();
+                    std::string label = recv_msgs[5].to_string();
+                    uint64_t target_node_id = std::stoull(id_str, nullptr, 16);
+                    auto node = engine->get_node(target_node_id);
+                    std::vector<uint64_t> neighs;
+                    if (node) neighs = node->get_in_neighbors(label);
+                    sock.send(identity, zmq::send_flags::sndmore);
+                    sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                    sock.send(zmq::message_t(neighs.data(), neighs.size() * sizeof(uint64_t)), zmq::send_flags::none);
+                } catch (...) {
+                    sock.send(identity, zmq::send_flags::sndmore);
+                    sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                    sock.send(zmq::message_t(), zmq::send_flags::none);
+                }
             } else if (opcode == "S") {
                 if (recv_msgs.size() < 7) continue;
                 std::string key = recv_msgs[4].to_string();
@@ -170,7 +226,10 @@ TEST(FederationComplexTest, MultiNodeBatching) {
     engine->get_remote_client().add_peer(remote_cluster_id, "tcp://127.0.0.1:" + std::to_string(remote_port));
 
     uint64_t node_a_id = engine->get_resolver().parse_uuid("node_a");
-    engine->put_node(node_a_id, R"json({"id":"node_a"})json");
+    lite3cpp::Buffer a_buf;
+    a_buf.init_object();
+    a_buf.set_str(0, "id", "node_a");
+    engine->put_node(node_a_id, std::string(reinterpret_cast<const char*>(a_buf.data()), a_buf.size()));
 
     for (int i = 1; i <= 10; ++i) {
         std::string remote_id = "remote:node_b" + std::to_string(i);
@@ -219,7 +278,10 @@ TEST(FederationComplexTest, MultiProjectionConsistency) {
     engine->get_remote_client().add_peer(remote_cluster_id, "tcp://127.0.0.1:" + std::to_string(remote_port));
 
     uint64_t node_a_id = engine->get_resolver().parse_uuid("node_a");
-    engine->put_node(node_a_id, R"json({"id":"node_a"})json");
+    lite3cpp::Buffer a_buf;
+    a_buf.init_object();
+    a_buf.set_str(0, "id", "node_a");
+    engine->put_node(node_a_id, std::string(reinterpret_cast<const char*>(a_buf.data()), a_buf.size()));
 
     uint64_t node_b_id = engine->get_resolver().parse_uuid("remote:node_b1");
     engine->add_edge(node_a_id, "link", 1.0, node_b_id);
@@ -279,7 +341,10 @@ TEST(FederationComplexTest, RecursiveMultiHop) {
     engine1->get_remote_client().add_peer(id3, "tcp://127.0.0.1:" + std::to_string(port3));
 
     uint64_t id_a = engine1->get_resolver().parse_uuid("node_a");
-    engine1->put_node(id_a, R"json({"id":"node_a"})json");
+    lite3cpp::Buffer a_buf;
+    a_buf.init_object();
+    a_buf.set_str(0, "id", "node_a");
+    engine1->put_node(id_a, std::string(reinterpret_cast<const char*>(a_buf.data()), a_buf.size()));
 
     uint64_t id_b = engine1->get_resolver().parse_uuid("cluster2:node_b");
     uint64_t id_c = engine1->get_resolver().parse_uuid("cluster3:node_c");
@@ -304,12 +369,15 @@ TEST(FederationComplexTest, RecursiveMultiHop) {
     };
 
     try {
-        json node_c_data = {{"id", "node_c"}, {"val", "Success"}};
-        lite3cpp::Buffer buf_c = lite3cpp::lite3_json::from_json_string(node_c_data.dump());
+        lite3cpp::Buffer buf_c;
+        buf_c.init_object();
+        buf_c.set_str(0, "id", "node_c");
+        buf_c.set_str(0, "val", "Success");
         send_cmd(port3, "P", {key_c, std::string(reinterpret_cast<const char*>(buf_c.data()), buf_c.size())});
 
-        json node_b_data = {{"id", "node_b"}};
-        lite3cpp::Buffer buf_b = lite3cpp::lite3_json::from_json_string(node_b_data.dump());
+        lite3cpp::Buffer buf_b;
+        buf_b.init_object();
+        buf_b.set_str(0, "id", "node_b");
         send_cmd(port2, "P", {key_b, std::string(reinterpret_cast<const char*>(buf_b.data()), buf_b.size())});
         
         char b_id_buf[17], c_id_buf[17];

@@ -10,15 +10,15 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
-#include <nlohmann/json.hpp>
 #include <string>
 #include <thread>
 #include <vector>
 #include <zmq.hpp>
 #include <zmq_addon.hpp>
 #include "httplib.h"
-
-using json = nlohmann::json;
+#include "buffer.hpp"
+#include "json.hpp"
+#include "L3KVG/Query.hpp"
 
 struct Config {
     std::string db_path;
@@ -41,24 +41,43 @@ Config load_config(const std::string &path) {
     if (!f.is_open()) {
         throw std::runtime_error("Could not open config file: " + path);
     }
-    json j = json::parse(f);
+    std::string str((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    lite3cpp::Buffer buf = lite3cpp::lite3_json::from_json_string(str);
     Config cfg;
-    cfg.db_path = j.at("db_path").get<std::string>();
-    cfg.node_id = j.at("node_id").get<uint16_t>();
-    cfg.zmq_port = j.value("zmq_port", 5556);
-    cfg.http_port = j.value("http_port", 8080);
-    cfg.auth_secret = j.value("auth_secret", "");
-    cfg.local_cluster_name = j.value("local_cluster_name", "");
-    cfg.local_cluster_id = j.value("local_cluster_id", 0);
-    if (j.contains("federations")) {
-        for (const auto &fj : j["federations"]) {
+    if (buf.get_type(0, "db_path") == lite3cpp::Type::String) {
+        cfg.db_path = std::string(buf.get_str(0, "db_path"));
+    }
+    if (buf.get_type(0, "node_id") == lite3cpp::Type::Int64) {
+        cfg.node_id = static_cast<uint16_t>(buf.get_i64(0, "node_id"));
+    }
+    cfg.zmq_port = (buf.get_type(0, "zmq_port") == lite3cpp::Type::Int64) ? static_cast<uint32_t>(buf.get_i64(0, "zmq_port")) : 5556;
+    cfg.http_port = (buf.get_type(0, "http_port") == lite3cpp::Type::Int64) ? static_cast<uint32_t>(buf.get_i64(0, "http_port")) : 8080;
+    cfg.auth_secret = (buf.get_type(0, "auth_secret") == lite3cpp::Type::String) ? std::string(buf.get_str(0, "auth_secret")) : "";
+    cfg.local_cluster_name = (buf.get_type(0, "local_cluster_name") == lite3cpp::Type::String) ? std::string(buf.get_str(0, "local_cluster_name")) : "";
+    cfg.local_cluster_id = (buf.get_type(0, "local_cluster_id") == lite3cpp::Type::Int64) ? static_cast<uint16_t>(buf.get_i64(0, "local_cluster_id")) : 0;
+    if (buf.get_type(0, "federations") == lite3cpp::Type::Array) {
+        size_t fed_arr_ofs = buf.get_arr(0, "federations");
+        lite3cpp::NodeView fn(reinterpret_cast<const lite3cpp::PackedNodeLayout*>(buf.data() + fed_arr_ofs));
+        for (uint32_t i = 0; i < fn.size(); ++i) {
+            if (buf.arr_get_type(fed_arr_ofs, i) != lite3cpp::Type::Object) continue;
+            size_t fo = buf.arr_get_obj(fed_arr_ofs, i);
             Config::Federation fed;
-            fed.name = fj.at("name").get<std::string>();
-            fed.id = fj.at("id").get<uint16_t>();
-            for (const auto &ep : fj.at("endpoints")) {
-                fed.endpoints.push_back(ep.get<std::string>());
+            if (buf.get_type(fo, "name") == lite3cpp::Type::String) {
+                fed.name = std::string(buf.get_str(fo, "name"));
             }
-            cfg.federations.push_back(fed);
+            if (buf.get_type(fo, "id") == lite3cpp::Type::Int64) {
+                fed.id = static_cast<uint16_t>(buf.get_i64(fo, "id"));
+            }
+            if (buf.get_type(fo, "endpoints") == lite3cpp::Type::Array) {
+                size_t ep_arr_ofs = buf.get_arr(fo, "endpoints");
+                lite3cpp::NodeView epn(reinterpret_cast<const lite3cpp::PackedNodeLayout*>(buf.data() + ep_arr_ofs));
+                for (uint32_t j = 0; j < epn.size(); ++j) {
+                    if (buf.arr_get_type(ep_arr_ofs, j) == lite3cpp::Type::String) {
+                        fed.endpoints.push_back(std::string(buf.arr_get_str(ep_arr_ofs, j)));
+                    }
+                }
+            }
+            cfg.federations.push_back(std::move(fed));
         }
     }
     return cfg;
@@ -199,37 +218,66 @@ int main(int argc, char *argv[]) {
 
               if (opcode == "R") {
                   try {
-                      std::vector<uint64_t> nodes = json::parse(recv_msgs[data_idx].to_string());
+                      const auto& nodes_msg = recv_msgs[data_idx];
                       data_idx++;
-                      std::string query_json = recv_msgs[data_idx].to_string();
+                      std::vector<uint64_t> nodes;
+                      if (nodes_msg.size() % sizeof(uint64_t) == 0 &&
+                          (nodes_msg.size() == 0 || (static_cast<const char*>(nodes_msg.data())[0] != '[' && static_cast<const char*>(nodes_msg.data())[0] != '{'))) {
+                          const uint64_t* raw = reinterpret_cast<const uint64_t*>(nodes_msg.data());
+                          nodes.assign(raw, raw + (nodes_msg.size() / sizeof(uint64_t)));
+                      } else {
+                          std::string raw_json = nodes_msg.to_string();
+                          lite3cpp::Buffer buf = lite3cpp::lite3_json::from_json_string(raw_json.empty() ? "[]" : raw_json);
+                          if (buf.size() >= sizeof(lite3cpp::PackedNodeLayout)) {
+                              lite3cpp::NodeView nv(reinterpret_cast<const lite3cpp::PackedNodeLayout*>(buf.data()));
+                              if (nv.type() == lite3cpp::Type::Array) {
+                                  for (uint32_t i = 0; i < nv.size(); ++i) {
+                                      auto t = buf.arr_get_type(0, i);
+                                      if (t == lite3cpp::Type::Int64) {
+                                          nodes.push_back(static_cast<uint64_t>(buf.arr_get_i64(0, i)));
+                                      } else if (t == lite3cpp::Type::String) {
+                                          nodes.push_back(std::stoull(std::string(buf.arr_get_str(0, i)), nullptr, 16));
+                                      }
+                                  }
+                              }
+                          }
+                      }
+
+                      const auto& qmsg = recv_msgs[data_idx];
+                      lite3cpp::Buffer qbuf;
+                      const uint8_t* qptr = static_cast<const uint8_t*>(qmsg.data());
+                      if (qmsg.size() >= sizeof(lite3cpp::PackedNodeLayout) && (qptr[0] == 0x06 || qptr[0] == 0x07)) {
+                          qbuf = lite3cpp::Buffer(std::vector<uint8_t>(qptr, qptr + qmsg.size()));
+                      } else {
+                          std::string qstr = qmsg.to_string();
+                          qbuf = lite3cpp::lite3_json::from_json_string(qstr.empty() ? "{}" : qstr);
+                      }
+
                       if (s_server_debug) {
-                          std::fprintf(stderr, "L3_SERVER: Handling opcode R: nodes=%zu, query=%s\n", nodes.size(), query_json.c_str());
+                          std::fprintf(stderr, "L3_SERVER: Handling opcode R: nodes=%zu, query_size=%zu\n", nodes.size(), qmsg.size());
                           std::fflush(stderr);
                       }
                       uint32_t eff_principal = (principal_id != 0) ? principal_id : l3kvg::INTERNAL_UID;
-                      auto results = engine->query().set_principal_id(eff_principal).resume(nodes, query_json).execute();
+                      auto results = engine->query().set_principal_id(eff_principal).resume(nodes, qbuf).execute();
                       
-                      json j_res = json::array();
-                      for (const auto& row : results) {
-                          json j_row;
-                          j_row["fields"] = row.fields;
-                          j_res.push_back(j_row);
-                      }
-                      
-                      std::string resp_json = j_res.dump();
+                      lite3cpp::Buffer resp_buf = l3kvg::Query::serialize_results(results);
                       sock.send(identity, zmq::send_flags::sndmore);
                       sock.send(zmq::message_t(), zmq::send_flags::sndmore);
-                      sock.send(zmq::message_t(resp_json.data(), resp_json.size()), zmq::send_flags::none);
+                      sock.send(zmq::message_t(resp_buf.data(), resp_buf.size()), zmq::send_flags::none);
                   } catch (const std::exception& e) {
                       if(1) std::fprintf(stderr, "L3_SERVER: Error R (std::exception): %s\n", e.what()); //std::fflush(stderr);
+                      lite3cpp::Buffer empty_buf;
+                      empty_buf.init_array();
                       sock.send(identity, zmq::send_flags::sndmore);
                       sock.send(zmq::message_t(), zmq::send_flags::sndmore);
-                      sock.send(zmq::message_t("[]", 2), zmq::send_flags::none);
+                      sock.send(zmq::message_t(empty_buf.data(), empty_buf.size()), zmq::send_flags::none);
                   } catch (...) {
                       if(1) std::fprintf(stderr, "L3_SERVER: Error R (unknown exception)\n"); //std::fflush(stderr);
+                      lite3cpp::Buffer empty_buf;
+                      empty_buf.init_array();
                       sock.send(identity, zmq::send_flags::sndmore);
                       sock.send(zmq::message_t(), zmq::send_flags::sndmore);
-                      sock.send(zmq::message_t("[]", 2), zmq::send_flags::none);
+                      sock.send(zmq::message_t(empty_buf.data(), empty_buf.size()), zmq::send_flags::none);
                   }
               } else if (opcode == "P") {
                   try {
@@ -380,16 +428,14 @@ int main(int argc, char *argv[]) {
                                        (unsigned long long)target_node_id, label.c_str(), min_weight, neighs.size());
                       }
 
-                      json j_res = neighs;
-                      std::string resp_json = j_res.dump();
                       sock.send(identity, zmq::send_flags::sndmore);
                       sock.send(zmq::message_t(), zmq::send_flags::sndmore);
-                      sock.send(zmq::message_t(resp_json.data(), resp_json.size()), zmq::send_flags::none);
+                      sock.send(zmq::message_t(neighs.data(), neighs.size() * sizeof(uint64_t)), zmq::send_flags::none);
                   } catch (const std::exception& e) {
                       if(1) std::fprintf(stderr, "L3_SERVER: Error N: %s\n", e.what()); //std::fflush(stderr);
                       sock.send(identity, zmq::send_flags::sndmore);
                       sock.send(zmq::message_t(), zmq::send_flags::sndmore);
-                      sock.send(zmq::message_t("[]", 2), zmq::send_flags::none);
+                      sock.send(zmq::message_t(), zmq::send_flags::none);
                   }
               } else if (opcode == "I") {
                   try {
@@ -408,16 +454,14 @@ int main(int argc, char *argv[]) {
                                        (unsigned long long)target_node_id, label.c_str(), neighs.size());
                       }
 
-                      json j_res = neighs;
-                      std::string resp_json = j_res.dump();
                       sock.send(identity, zmq::send_flags::sndmore);
                       sock.send(zmq::message_t(), zmq::send_flags::sndmore);
-                      sock.send(zmq::message_t(resp_json.data(), resp_json.size()), zmq::send_flags::none);
+                      sock.send(zmq::message_t(neighs.data(), neighs.size() * sizeof(uint64_t)), zmq::send_flags::none);
                   } catch (const std::exception& e) {
                       if(1) std::fprintf(stderr, "L3_SERVER: Error I: %s\n", e.what()); //std::fflush(stderr);
                       sock.send(identity, zmq::send_flags::sndmore);
                       sock.send(zmq::message_t(), zmq::send_flags::sndmore);
-                      sock.send(zmq::message_t("[]", 2), zmq::send_flags::none);
+                      sock.send(zmq::message_t(), zmq::send_flags::none);
                   }
               }
           }
