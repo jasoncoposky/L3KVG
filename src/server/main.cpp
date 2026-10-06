@@ -556,6 +556,7 @@ static void process_request(l3kvg::Engine* engine, const Config& cfg, zmq::socke
             lite3cpp::Buffer kbuf;
             kbuf.init_array();
             for (const auto& [k, v] : entries) {
+                if (k.ends_with(":meta")) continue;
                 size_t e = kbuf.arr_append_obj(0);
                 kbuf.set_str(e, "k", k);
                 kbuf.set_str(e, "v", v);
