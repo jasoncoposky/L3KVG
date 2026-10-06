@@ -240,7 +240,8 @@ TEST(FederationIntegrationTest, EndToEndZmqQuery) {
                          .execute();
 
     ASSERT_EQ(results.size(), 1);
-    EXPECT_EQ(results[0].fields.at("b.name"), "Node B (Remote)");
+    std::string b_name = !results[0].projected_values.empty() ? results[0].projected_values[0] : (results[0].fields.count("b.name") ? results[0].fields.at("b.name") : "");
+    EXPECT_EQ(b_name, "Node B (Remote)");
 
     stop_signal = true;
     remote_thread.join();

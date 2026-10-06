@@ -587,9 +587,6 @@ std::future<std::vector<ResultRow>> RemoteL3KVClient::resume_query_async(
                                 row.projected_values.reserve(pnv.size());
                                 for (uint32_t pi = 0; pi < pnv.size(); ++pi) {
                                     row.projected_values.emplace_back(resp_buf.arr_get_str(proj_ofs, pi));
-                                    if (pi < cols.size()) {
-                                        row.fields[cols[pi]] = row.projected_values.back();
-                                    }
                                 }
                             } else if (resp_buf.get_type(row_ofs, "fields") == lite3cpp::Type::Object) {
                                 size_t fields_ofs = resp_buf.get_obj(row_ofs, "fields");

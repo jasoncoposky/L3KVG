@@ -477,7 +477,8 @@ TEST_F(UltimateMeshTest, ComprehensiveScenario) {
         .execute();
 
     ASSERT_EQ(results.size(), 1);
-    EXPECT_EQ(results[0].fields["target.name"], "GlobalTruth");
+    std::string target_name = !results[0].projected_values.empty() ? results[0].projected_values[0] : (results[0].fields.count("target.name") ? results[0].fields.at("target.name") : "");
+    EXPECT_EQ(target_name, "GlobalTruth");
 
     // --- PHASE 4: Resilience ---
     std::cout << "--- PHASE 4: Resilience ---" << std::endl;

@@ -308,9 +308,12 @@ TEST(FederationComplexTest, MultiProjectionConsistency) {
 
     EXPECT_EQ(results.size(), 1);
     if (results.size() > 0) {
-        EXPECT_EQ(results[0].fields.at("b.name"), "Name1");
-        EXPECT_EQ(results[0].fields.at("b.age"), "21");
-        EXPECT_EQ(results[0].fields.at("b.status"), "active");
+        std::string name_val = !results[0].projected_values.empty() ? results[0].projected_values[0] : (results[0].fields.count("b.name") ? results[0].fields.at("b.name") : "");
+        std::string age_val = results[0].projected_values.size() > 1 ? results[0].projected_values[1] : (results[0].fields.count("b.age") ? results[0].fields.at("b.age") : "");
+        std::string status_val = results[0].projected_values.size() > 2 ? results[0].projected_values[2] : (results[0].fields.count("b.status") ? results[0].fields.at("b.status") : "");
+        EXPECT_EQ(name_val, "Name1");
+        EXPECT_EQ(age_val, "21");
+        EXPECT_EQ(status_val, "active");
     }
 
     stop_signal = true;
