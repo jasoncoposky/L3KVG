@@ -571,11 +571,13 @@ std::future<std::vector<ResultRow>> RemoteL3KVClient::resume_query_async(
                             ResultRow row;
                             if (resp_buf.get_type(row_ofs, "cols") == lite3cpp::Type::Array) {
                                 size_t cols_ofs = resp_buf.get_arr(row_ofs, "cols");
-                                lite3cpp::NodeView cnv(reinterpret_cast<const lite3cpp::PackedNodeLayout*>(resp_buf.data() + cols_ofs));
-                                cols.clear();
-                                cols.reserve(cnv.size());
-                                for (uint32_t ci = 0; ci < cnv.size(); ++ci) {
-                                    cols.emplace_back(resp_buf.arr_get_str(cols_ofs, ci));
+                                if (cols_ofs + sizeof(lite3cpp::PackedNodeLayout) <= resp_buf.size()) {
+                                    lite3cpp::NodeView cnv(reinterpret_cast<const lite3cpp::PackedNodeLayout*>(resp_buf.data() + cols_ofs));
+                                    cols.clear();
+                                    cols.reserve(cnv.size());
+                                    for (uint32_t ci = 0; ci < cnv.size(); ++ci) {
+                                        cols.emplace_back(resp_buf.arr_get_str(cols_ofs, ci));
+                                    }
                                 }
                             }
                             if (r == 0) {
@@ -583,10 +585,12 @@ std::future<std::vector<ResultRow>> RemoteL3KVClient::resume_query_async(
                             }
                             if (resp_buf.get_type(row_ofs, "proj") == lite3cpp::Type::Array) {
                                 size_t proj_ofs = resp_buf.get_arr(row_ofs, "proj");
-                                lite3cpp::NodeView pnv(reinterpret_cast<const lite3cpp::PackedNodeLayout*>(resp_buf.data() + proj_ofs));
-                                row.projected_values.reserve(pnv.size());
-                                for (uint32_t pi = 0; pi < pnv.size(); ++pi) {
-                                    row.projected_values.emplace_back(resp_buf.arr_get_str(proj_ofs, pi));
+                                if (proj_ofs + sizeof(lite3cpp::PackedNodeLayout) <= resp_buf.size()) {
+                                    lite3cpp::NodeView pnv(reinterpret_cast<const lite3cpp::PackedNodeLayout*>(resp_buf.data() + proj_ofs));
+                                    row.projected_values.reserve(pnv.size());
+                                    for (uint32_t pi = 0; pi < pnv.size(); ++pi) {
+                                        row.projected_values.emplace_back(resp_buf.arr_get_str(proj_ofs, pi));
+                                    }
                                 }
                             } else if (resp_buf.get_type(row_ofs, "fields") == lite3cpp::Type::Object) {
                                 size_t fields_ofs = resp_buf.get_obj(row_ofs, "fields");
@@ -993,16 +997,23 @@ std::future<std::unordered_map<uint64_t, std::string>> RemoteL3KVClient::get_nod
                 lite3cpp::Buffer buf(static_cast<const uint8_t*>(body.data()), body.size());
                 
                 size_t root = 0;
-                for (auto it = buf.begin(root); it != buf.end(root); ++it) {
-                    std::string key(it->key);
-                    if (key.starts_with("n:{") && key.ends_with("}")) {
-                        uint64_t id = std::stoull(key.substr(3, key.size() - 4), nullptr, 16);
-                        auto type = buf.get_type(root, key);
-                        if (type == lite3cpp::Type::Bytes) {
-                            auto b = buf.get_bytes(root, key);
-                            results[id] = std::string(reinterpret_cast<const char*>(b.data()), b.size());
-                        } else if (type == lite3cpp::Type::String) {
-                            results[id] = buf.get_str(root, key);
+                if (buf.size() >= sizeof(lite3cpp::PackedNodeLayout)) {
+                    for (auto it = buf.begin(root); it != buf.end(root); ++it) {
+                        std::string key(it->key);
+                        if (key.starts_with("n:{") && key.ends_with("}")) {
+                            uint64_t id = 0;
+                            try {
+                                id = std::stoull(key.substr(3, key.size() - 4), nullptr, 16);
+                            } catch (...) {
+                                continue;
+                            }
+                            auto type = buf.get_type(root, key);
+                            if (type == lite3cpp::Type::Bytes) {
+                                auto b = buf.get_bytes(root, key);
+                                results[id] = std::string(reinterpret_cast<const char*>(b.data()), b.size());
+                            } else if (type == lite3cpp::Type::String) {
+                                results[id] = buf.get_str(root, key);
+                            }
                         }
                     }
                 }
