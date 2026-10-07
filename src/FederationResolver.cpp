@@ -118,7 +118,7 @@ uint64_t FederationResolver::parse_uuid(std::string_view uuid_str) const {
             local_uuid = uuid_str.substr(colon_pos + 1);
             cluster_id = it->second;
             found_cluster = true;
-        } else {
+        } else if (!cluster_name_to_id_.empty()) {
             throw std::runtime_error("Unknown cluster in UUID: " + std::string(cluster_name));
         }
     }
