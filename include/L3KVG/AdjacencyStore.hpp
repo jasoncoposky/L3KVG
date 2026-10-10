@@ -2,30 +2,28 @@
 #include <cstdint>
 #include <cstddef>
 #include <span>
+#include <vector>
 #include <deque>
 #include <shared_mutex>
 #include <unordered_map>
 #include <array>
 #include <type_traits>
+#include <functional>
 #include "L3KVG/PackedEdge.hpp"
 #include "L3KVG/LabelRegistry.hpp"
 
 namespace l3kvg {
 
-#if defined(__GNUC__) || defined(__clang__)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wpacked-not-aligned"
-#pragma GCC diagnostic ignored "-Wpedantic"
-#endif
-
-#pragma pack(push, 4)
 struct alignas(8) VertexRecord {
+    static constexpr uint32_t FLAG_PROMOTED = 1u << 31;
+    static constexpr uint32_t DEGREE_MASK = ~FLAG_PROMOTED;
+
     uint32_t out_degree{0};
     uint32_t in_degree{0};
     union {
-        PackedEdge inline_edge; // Inlined edge when out_degree == 1 && ext.out_block_id == 0
+        PackedEdge inline_edge; // Inlined edge when out_degree > 0 && !is_promoted()
         struct {
-            uint32_t out_block_id; // 1-indexed into page_pool (0 = inlined/none)
+            uint32_t out_block_id; // 1-indexed into page_pool (0 = none)
             uint32_t in_block_id;  // 1-indexed into page_pool (0 = none)
             uint64_t page_offset;
         } ext;
@@ -37,15 +35,18 @@ struct alignas(8) VertexRecord {
         ext.page_offset = 0;
     }
 
+    [[nodiscard]] bool is_promoted() const noexcept {
+        return (out_degree & FLAG_PROMOTED) != 0;
+    }
+
     [[nodiscard]] bool is_inlined() const noexcept {
-        return out_degree == 1 && in_degree == 0;
+        return !is_promoted() && (out_degree > 0);
+    }
+
+    [[nodiscard]] uint32_t get_out_degree() const noexcept {
+        return out_degree & DEGREE_MASK;
     }
 };
-#pragma pack(pop)
-
-#if defined(__GNUC__) || defined(__clang__)
-#pragma GCC diagnostic pop
-#endif
 
 static_assert(sizeof(VertexRecord) == 32, "VertexRecord must be exactly 32 bytes");
 static_assert(alignof(VertexRecord) == 8, "VertexRecord must be 8-byte aligned");
@@ -64,6 +65,24 @@ static_assert(alignof(AdjacencyPage) == 64, "AdjacencyPage must be 64-byte align
 
 class AdjacencyStore {
 public:
+    static constexpr size_t NUM_SHARDS = 64;
+
+    [[nodiscard]] static constexpr uint32_t decode_shard_index(uint32_t page_id) noexcept {
+        return (page_id >> 24) & 0xFF;
+    }
+
+    [[nodiscard]] static constexpr uint32_t decode_local_page_id(uint32_t page_id) noexcept {
+        return page_id & 0x00FFFFFF;
+    }
+
+    [[nodiscard]] static constexpr uint32_t encode_page_id(size_t shard_idx, uint32_t local_idx) noexcept {
+        return (static_cast<uint32_t>(shard_idx) << 24) | (local_idx & 0x00FFFFFF);
+    }
+
+    [[nodiscard]] static size_t shard_index(uint64_t id) noexcept {
+        return (std::hash<uint64_t>{}(id)) % NUM_SHARDS;
+    }
+
     AdjacencyStore();
     ~AdjacencyStore() = default;
 
@@ -78,7 +97,69 @@ public:
 
     bool del_edge(uint64_t src_id, uint64_t dst_id, uint16_t label_id);
 
+    template <typename F>
+    void for_each_outgoing_edge(uint64_t src_id, F&& visitor) const {
+        size_t s_idx = shard_index(src_id);
+        const auto& shard = shards_[s_idx];
+        std::shared_lock lock(shard.mutex);
+        auto it = shard.directory.find(src_id);
+        if (it == shard.directory.end()) return;
+        const auto& v = it->second;
+        if (v.is_inlined()) {
+            visitor(v.inline_edge);
+            return;
+        }
+        if (!v.is_promoted()) return;
+        uint32_t curr_id = v.ext.out_block_id;
+        while (curr_id != 0) {
+            uint32_t p_shard = decode_shard_index(curr_id);
+            uint32_t p_local = decode_local_page_id(curr_id);
+            if (p_shard >= NUM_SHARDS || p_local >= shards_[p_shard].page_pool.size()) break;
+            const auto& page = shards_[p_shard].page_pool[p_local];
+            for (uint32_t i = 0; i < page.count; ++i) {
+                visitor(page.edges[i]);
+            }
+            curr_id = page.next_page_id;
+        }
+    }
+
+    template <typename F>
+    void for_each_incoming_edge(uint64_t dst_id, F&& visitor) const {
+        size_t s_idx = shard_index(dst_id);
+        const auto& shard = shards_[s_idx];
+        std::shared_lock lock(shard.mutex);
+        auto it = shard.directory.find(dst_id);
+        if (it == shard.directory.end()) return;
+        const auto& v = it->second;
+        if (!v.is_promoted()) return;
+        uint32_t curr_id = v.ext.in_block_id;
+        while (curr_id != 0) {
+            uint32_t p_shard = decode_shard_index(curr_id);
+            uint32_t p_local = decode_local_page_id(curr_id);
+            if (p_shard >= NUM_SHARDS || p_local >= shards_[p_shard].page_pool.size()) break;
+            const auto& page = shards_[p_shard].page_pool[p_local];
+            for (uint32_t i = 0; i < page.count; ++i) {
+                visitor(page.edges[i]);
+            }
+            curr_id = page.next_page_id;
+        }
+    }
+
+    [[nodiscard]] std::vector<PackedEdge> get_outgoing_edges_snapshot(uint64_t src_id) const;
+    [[nodiscard]] std::vector<PackedEdge> get_incoming_edges_snapshot(uint64_t dst_id) const;
+
+    /**
+     * @brief Note: get_outgoing_edges returns a span of the first block only.
+     * For multi-page edge chains and thread-safe traversal, for_each_outgoing_edge
+     * or get_outgoing_edges_snapshot is the canonical API.
+     */
     [[nodiscard]] std::span<const PackedEdge> get_outgoing_edges(uint64_t src_id) const noexcept;
+
+    /**
+     * @brief Note: get_incoming_edges returns a span of the first block only.
+     * For multi-page edge chains and thread-safe traversal, for_each_incoming_edge
+     * or get_incoming_edges_snapshot is the canonical API.
+     */
     [[nodiscard]] std::span<const PackedEdge> get_incoming_edges(uint64_t dst_id) const noexcept;
 
     [[nodiscard]] size_t get_out_degree(uint64_t src_id) const noexcept;
@@ -101,12 +182,7 @@ private:
         }
     };
 
-    static constexpr size_t NUM_SHARDS = 64;
     std::array<Shard, NUM_SHARDS> shards_;
-
-    [[nodiscard]] static size_t shard_index(uint64_t id) noexcept {
-        return (id ^ (id >> 16)) % NUM_SHARDS;
-    }
 };
 
 } // namespace l3kvg

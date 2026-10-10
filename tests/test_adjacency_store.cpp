@@ -93,6 +93,8 @@ TEST(AdjacencyStoreTest, DeleteEdgeTombstone) {
     EXPECT_EQ(store.get_out_degree(10), 2);
     bool deleted = store.del_edge(10, 20, 1);
     EXPECT_TRUE(deleted);
+    EXPECT_EQ(store.get_out_degree(10), 1);
+    EXPECT_EQ(store.get_in_degree(20), 0);
 
     auto edges = store.get_outgoing_edges(10);
     int active_count = 0;
@@ -207,20 +209,111 @@ TEST(AdjacencyStoreTest, InlinedEdgeTombstoneAndReaddition) {
     EXPECT_EQ(store.get_in_degree(2), 1);
 
     EXPECT_TRUE(store.del_edge(1, 2, 10));
+    EXPECT_EQ(store.get_out_degree(1), 0);
+    EXPECT_EQ(store.get_in_degree(2), 0);
+
     auto out = store.get_outgoing_edges(1);
-    ASSERT_EQ(out.size(), 1);
-    EXPECT_FALSE(out[0].is_active());
+    EXPECT_TRUE(out.empty());
 
     auto in = store.get_incoming_edges(2);
     ASSERT_EQ(in.size(), 1);
     EXPECT_FALSE(in[0].is_active());
 
-    // Promotion after tombstone
+    // Readdition of an edge to vertex 1
     store.add_edge(1, 3, 20, 7.5f);
-    EXPECT_EQ(store.get_out_degree(1), 2);
+    EXPECT_EQ(store.get_out_degree(1), 1);
     out = store.get_outgoing_edges(1);
-    ASSERT_EQ(out.size(), 2);
-    EXPECT_FALSE(out[0].is_active());
-    EXPECT_TRUE(out[1].is_active());
-    EXPECT_EQ(out[1].target_id, 3);
+    ASSERT_EQ(out.size(), 1);
+    EXPECT_TRUE(out[0].is_active());
+    EXPECT_EQ(out[0].target_id, 3);
+}
+
+TEST(AdjacencyStoreTest, ForEachOutgoingEdgeChained) {
+    l3kvg::AdjacencyStore store;
+    uint64_t src = 700;
+    for (uint64_t i = 1; i <= 200; ++i) {
+        store.add_edge(src, 2000 + i, 1, static_cast<float>(i));
+    }
+    EXPECT_EQ(store.get_out_degree(src), 200);
+
+    size_t count = 0;
+    std::vector<uint64_t> visited_targets;
+    store.for_each_outgoing_edge(src, [&](const l3kvg::PackedEdge& edge) {
+        visited_targets.push_back(edge.target_id);
+        count++;
+    });
+
+    EXPECT_EQ(count, 200);
+    ASSERT_EQ(visited_targets.size(), 200);
+    for (size_t i = 0; i < 200; ++i) {
+        EXPECT_EQ(visited_targets[i], 2000 + i + 1);
+    }
+}
+
+TEST(AdjacencyStoreTest, OutgoingAndIncomingEdgesSnapshot) {
+    l3kvg::AdjacencyStore store;
+    uint64_t src = 800;
+    for (uint64_t i = 1; i <= 200; ++i) {
+        store.add_edge(src, 3000 + i, 1, static_cast<float>(i));
+    }
+
+    auto snapshot = store.get_outgoing_edges_snapshot(src);
+    EXPECT_EQ(snapshot.size(), 200);
+    for (size_t i = 0; i < 200; ++i) {
+        EXPECT_EQ(snapshot[i].target_id, 3000 + i + 1);
+        EXPECT_TRUE(snapshot[i].is_active());
+    }
+
+    // Verify incoming edges snapshot for a destination node
+    auto in_snapshot = store.get_incoming_edges_snapshot(3001);
+    ASSERT_EQ(in_snapshot.size(), 1);
+    EXPECT_EQ(in_snapshot[0].target_id, src);
+    EXPECT_TRUE(in_snapshot[0].is_active());
+}
+
+TEST(AdjacencyStoreTest, DeleteEdgeInSecondPageDecrementsDegree) {
+    l3kvg::AdjacencyStore store;
+    uint64_t src = 900;
+    for (uint64_t i = 1; i <= 200; ++i) {
+        store.add_edge(src, 4000 + i, 1, static_cast<float>(i));
+    }
+
+    EXPECT_EQ(store.get_out_degree(src), 200);
+
+    // Edge 180 is in the second page of the chain (since page capacity is 170)
+    uint64_t target_180 = 4180;
+    bool deleted = store.del_edge(src, target_180, 1);
+    EXPECT_TRUE(deleted);
+    EXPECT_EQ(store.get_out_degree(src), 199);
+    EXPECT_EQ(store.get_in_degree(target_180), 0);
+
+    // Verify snapshot reflects only active edges (199 edges)
+    auto snapshot = store.get_outgoing_edges_snapshot(src);
+    EXPECT_EQ(snapshot.size(), 199);
+    for (const auto& e : snapshot) {
+        EXPECT_NE(e.target_id, target_180);
+    }
+
+    // Verify for_each_outgoing_edge visits all 200 edges including the tombstoned one
+    size_t active_count = 0;
+    size_t total_count = 0;
+    store.for_each_outgoing_edge(src, [&](const l3kvg::PackedEdge& edge) {
+        total_count++;
+        if (edge.is_active()) {
+            active_count++;
+        } else {
+            EXPECT_EQ(edge.target_id, target_180);
+        }
+    });
+    EXPECT_EQ(total_count, 200);
+    EXPECT_EQ(active_count, 199);
+
+    // Verify for_each_incoming_edge on target_180 visits the tombstoned incoming edge
+    size_t in_count = 0;
+    store.for_each_incoming_edge(target_180, [&](const l3kvg::PackedEdge& edge) {
+        in_count++;
+        EXPECT_EQ(edge.target_id, src);
+        EXPECT_FALSE(edge.is_active());
+    });
+    EXPECT_EQ(in_count, 1);
 }
