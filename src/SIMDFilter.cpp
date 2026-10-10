@@ -17,6 +17,7 @@ size_t SIMDFilter::count_matching_edges(std::span<const PackedEdge> edges,
     const size_t n = edges.size();
     if (n == 0) return 0;
 
+    const bool is_wildcard = (target_label == 0);
     size_t count = 0;
     size_t i = 0;
 
@@ -27,7 +28,6 @@ size_t SIMDFilter::count_matching_edges(std::span<const PackedEdge> edges,
     const __m256i act_mask = _mm256_set1_epi32(static_cast<int>(PackedEdge::FLAG_ACTIVE << 16));
     const __m256i lbl_mask = _mm256_set1_epi32(0x0000FFFF);
     const __m256i target_vec = _mm256_set1_epi32(target_label);
-    const bool is_wildcard = (target_label == 0);
 
     for (; i + 16 <= n; i += 16) {
         const int* b0 = reinterpret_cast<const int*>(&edges[i]);
@@ -89,8 +89,8 @@ size_t SIMDFilter::count_matching_edges(std::span<const PackedEdge> edges,
     // Branchless scalar fallback
     for (; i < n; ++i) {
         const auto& edge = edges[i];
-        const bool is_active = (edge.flags & PackedEdge::FLAG_ACTIVE) != 0;
-        const bool label_match = (target_label == 0) | (edge.label_id == target_label);
+        const bool is_active = edge.is_active();
+        const bool label_match = is_wildcard | (edge.label_id == target_label);
         const bool weight_match = (edge.weight >= min_weight);
         count += static_cast<size_t>(is_active & label_match & weight_match);
     }

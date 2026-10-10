@@ -15,6 +15,12 @@
 
 namespace l3kvg {
 
+static_assert(offsetof(PackedEdge, label_id) == 8, "PackedEdge::label_id offset mismatch for SIMD gather");
+static_assert(offsetof(PackedEdge, flags) == 10, "PackedEdge::flags offset mismatch for SIMD gather");
+static_assert(offsetof(PackedEdge, weight) == 12, "PackedEdge::weight offset mismatch for SIMD gather");
+static_assert(std::endian::native == std::endian::little, "SIMDFilter requires little-endian architecture for dword gather");
+
+
 /**
  * @brief SIMD Predicate Filter Engine for high-throughput edge filtering.
  *
@@ -70,6 +76,7 @@ public:
         const size_t n = edges.size();
         if (n == 0) return;
 
+        const bool is_wildcard = (target_label == 0);
         size_t i = 0;
 
 #if defined(__AVX2__)
@@ -79,7 +86,6 @@ public:
         const __m256i act_mask = _mm256_set1_epi32(static_cast<int>(PackedEdge::FLAG_ACTIVE << 16));
         const __m256i lbl_mask = _mm256_set1_epi32(0x0000FFFF);
         const __m256i target_vec = _mm256_set1_epi32(target_label);
-        const bool is_wildcard = (target_label == 0);
 
         for (; i + 8 <= n; i += 8) {
             const int* base = reinterpret_cast<const int*>(&edges[i]);
@@ -111,8 +117,8 @@ public:
         // Scalar fallback / tail loop with branchless evaluation
         for (; i < n; ++i) {
             const auto& edge = edges[i];
-            const bool is_active = (edge.flags & PackedEdge::FLAG_ACTIVE) != 0;
-            const bool label_match = (target_label == 0) | (edge.label_id == target_label);
+            const bool is_active = edge.is_active();
+            const bool label_match = is_wildcard | (edge.label_id == target_label);
             const bool weight_match = (edge.weight >= min_weight);
             if (is_active & label_match & weight_match) {
                 invoke_cb(cb, edge);
@@ -127,6 +133,9 @@ private:
             cb(edge);
         } else if constexpr (std::is_invocable_v<F, uint64_t>) {
             cb(edge.target_id);
+        } else {
+            static_assert(std::is_invocable_v<F, const PackedEdge&> || std::is_invocable_v<F, uint64_t>,
+                "SIMDFilter::filter_edges_cb callback must accept (const PackedEdge&) or (uint64_t)");
         }
     }
 };

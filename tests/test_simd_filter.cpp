@@ -4,6 +4,8 @@
 #include <vector>
 #include <random>
 #include <algorithm>
+#include <limits>
+#include <cmath>
 
 using namespace l3kvg;
 
@@ -285,4 +287,110 @@ TEST(SIMDFilterTest, NegativeAndZeroWeights) {
     SIMDFilter::filter_edges(edges, 1, 0.0f, matched);
     EXPECT_EQ(matched, (std::vector<uint64_t>{4, 5}));
     EXPECT_EQ(SIMDFilter::count_matching_edges(edges, 1, 0.0f), 2);
+}
+
+TEST(SIMDFilterTest, SpecialFloatingPointValues) {
+    const float nan_val = std::numeric_limits<float>::quiet_NaN();
+    const float inf_pos = std::numeric_limits<float>::infinity();
+    const float inf_neg = -std::numeric_limits<float>::infinity();
+
+    // 1. Scalar tail test (< 8 elements)
+    std::vector<PackedEdge> small_edges = {
+        make_edge(1, 1, nan_val, true),
+        make_edge(2, 1, inf_pos, true),
+        make_edge(3, 1, inf_neg, true),
+        make_edge(4, 1, 10.0f, true),
+        make_edge(5, 1, -10.0f, true),
+        make_edge(6, 1, nan_val, false) // inactive NaN
+    };
+
+    // Filter min_weight = 0.0f:
+    // NaN >= 0.0f -> false (ordered comparison returns false for NaN)
+    // +Inf >= 0.0f -> true (edge 2)
+    // -Inf >= 0.0f -> false
+    // 10.0f >= 0.0f -> true (edge 4)
+    // -10.0f >= 0.0f -> false
+    std::vector<uint64_t> matched;
+    SIMDFilter::filter_edges(small_edges, 1, 0.0f, matched);
+    EXPECT_EQ(matched, (std::vector<uint64_t>{2, 4}));
+    EXPECT_EQ(SIMDFilter::count_matching_edges(small_edges, 1, 0.0f), 2);
+
+    // 2. Vectorized batch test (>= 16 elements to exercise 16-unroll and 8-unroll SIMD loops)
+    // Construct 24 edges with alternating NaN, +Inf, -Inf, and finite numbers
+    std::vector<PackedEdge> batch_edges(24);
+    for (size_t i = 0; i < 24; ++i) {
+        float wt = 0.0f;
+        switch (i % 6) {
+            case 0: wt = nan_val; break;
+            case 1: wt = inf_pos; break;
+            case 2: wt = inf_neg; break;
+            case 3: wt = 100.0f; break;
+            case 4: wt = -50.0f; break;
+            case 5: wt = 0.0f; break;
+        }
+        // Inactive tombstone every 7th element
+        bool active = (i % 7 != 0);
+        batch_edges[i] = make_edge(100 + i, 1, wt, active);
+    }
+
+    // Verify _CMP_GE_OQ and scalar >= treat NaN as non-matching (ordered quiet comparison returns false for NaN)
+    // and +Inf matching properly for min_weight = 0.0f
+    std::vector<uint64_t> ref_matched;
+    for (const auto& e : batch_edges) {
+        if (e.is_active() && (e.label_id == 1) && (e.weight >= 0.0f)) {
+            ref_matched.push_back(e.target_id);
+        }
+    }
+    // Explicitly verify ref_matched does not include any NaN edges
+    for (uint64_t id : ref_matched) {
+        const auto& e = batch_edges[id - 100];
+        EXPECT_FALSE(std::isnan(e.weight));
+    }
+
+    matched.clear();
+    SIMDFilter::filter_edges(batch_edges, 1, 0.0f, matched);
+    EXPECT_EQ(matched, ref_matched);
+    EXPECT_EQ(SIMDFilter::count_matching_edges(batch_edges, 1, 0.0f), ref_matched.size());
+
+    std::vector<uint64_t> cb_matched;
+    SIMDFilter::filter_edges_cb(batch_edges, 1, 0.0f, [&](const PackedEdge& e) {
+        cb_matched.push_back(e.target_id);
+    });
+    EXPECT_EQ(cb_matched, ref_matched);
+
+    // 3. Test min_weight = -inf:
+    // NaN >= -inf is false (NaN is unordered with respect to any float)
+    // +inf >= -inf is true
+    // -inf >= -inf is true
+    // finite >= -inf is true
+    std::vector<uint64_t> ref_min_inf;
+    for (const auto& e : batch_edges) {
+        if (e.is_active() && (e.label_id == 1) && (e.weight >= inf_neg)) {
+            ref_min_inf.push_back(e.target_id);
+        }
+    }
+    matched.clear();
+    SIMDFilter::filter_edges(batch_edges, 1, inf_neg, matched);
+    EXPECT_EQ(matched, ref_min_inf);
+    EXPECT_EQ(SIMDFilter::count_matching_edges(batch_edges, 1, inf_neg), ref_min_inf.size());
+
+    // 4. Test min_weight = +inf:
+    // Only active edges with weight == +inf should match
+    std::vector<uint64_t> ref_pos_inf;
+    for (const auto& e : batch_edges) {
+        if (e.is_active() && (e.label_id == 1) && (e.weight >= inf_pos)) {
+            ref_pos_inf.push_back(e.target_id);
+        }
+    }
+    matched.clear();
+    SIMDFilter::filter_edges(batch_edges, 1, inf_pos, matched);
+    EXPECT_EQ(matched, ref_pos_inf);
+    EXPECT_EQ(SIMDFilter::count_matching_edges(batch_edges, 1, inf_pos), ref_pos_inf.size());
+
+    // 5. Test min_weight = NaN:
+    // Ordered comparison with NaN always produces false, so no edge matches
+    matched.clear();
+    SIMDFilter::filter_edges(batch_edges, 1, nan_val, matched);
+    EXPECT_TRUE(matched.empty());
+    EXPECT_EQ(SIMDFilter::count_matching_edges(batch_edges, 1, nan_val), 0);
 }
