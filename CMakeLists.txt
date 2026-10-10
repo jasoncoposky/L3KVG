@@ -29,7 +29,21 @@ add_library(l3kvg_engine STATIC
     src/MutationBatch.cpp
     src/LabelRegistry.cpp
     src/AdjacencyStore.cpp
+    src/SIMDFilter.cpp
 )
+
+include(CheckCXXCompilerFlag)
+if(MSVC)
+    check_cxx_compiler_flag("/arch:AVX2" COMPILER_SUPPORTS_AVX2)
+    if(COMPILER_SUPPORTS_AVX2)
+        target_compile_options(l3kvg_engine PUBLIC /arch:AVX2)
+    endif()
+else()
+    check_cxx_compiler_flag("-mavx2" COMPILER_SUPPORTS_AVX2)
+    if(COMPILER_SUPPORTS_AVX2)
+        target_compile_options(l3kvg_engine PUBLIC -mavx2)
+    endif()
+endif()
 
 target_include_directories(l3kvg_engine PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -116,6 +130,10 @@ add_test(NAME test_packed_edge COMMAND test_packed_edge)
 add_executable(test_adjacency_store tests/test_adjacency_store.cpp)
 target_link_libraries(test_adjacency_store PRIVATE l3kvg_engine gtest_main Threads::Threads)
 add_test(NAME test_adjacency_store COMMAND test_adjacency_store)
+
+add_executable(test_simd_filter tests/test_simd_filter.cpp)
+target_link_libraries(test_simd_filter PRIVATE l3kvg_engine gtest_main Threads::Threads)
+add_test(NAME test_simd_filter COMMAND test_simd_filter)
 
 add_executable(test_federation_integration tests/test_federation_integration.cpp)
 target_link_libraries(test_federation_integration PRIVATE l3kvg_engine gtest_main Threads::Threads $<$<BOOL:${WIN32}>:ws2_32>)
