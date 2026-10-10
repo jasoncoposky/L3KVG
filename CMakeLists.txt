@@ -30,6 +30,7 @@ add_library(l3kvg_engine STATIC
     src/LabelRegistry.cpp
     src/AdjacencyStore.cpp
     src/SIMDFilter.cpp
+    src/BinaryEdgeWAL.cpp
 )
 
 include(CheckCXXCompilerFlag)
@@ -136,6 +137,10 @@ add_test(NAME test_adjacency_store COMMAND test_adjacency_store)
 add_executable(test_simd_filter tests/test_simd_filter.cpp)
 target_link_libraries(test_simd_filter PRIVATE l3kvg_engine gtest_main Threads::Threads)
 add_test(NAME test_simd_filter COMMAND test_simd_filter)
+
+add_executable(test_binary_edge_wal tests/test_binary_edge_wal.cpp)
+target_link_libraries(test_binary_edge_wal PRIVATE l3kvg_engine gtest_main Threads::Threads)
+add_test(NAME test_binary_edge_wal COMMAND test_binary_edge_wal)
 
 add_executable(test_federation_integration tests/test_federation_integration.cpp)
 target_link_libraries(test_federation_integration PRIVATE l3kvg_engine gtest_main Threads::Threads $<$<BOOL:${WIN32}>:ws2_32>)
