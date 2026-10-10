@@ -41,40 +41,48 @@ void AdjacencyStore::add_edge(uint64_t src_id, uint64_t dst_id, uint16_t label_i
             v.ext.in_block_id = 0;
             v.ext.page_offset = 0;
             v.out_degree = 2 | VertexRecord::FLAG_PROMOTED;
-        } else if (v.is_promoted() && v.ext.out_block_id == 0) {
-            // in_degree > 0 or already promoted, so ext is active, but no outgoing page allocated yet
-            uint32_t local_id = static_cast<uint32_t>(shard.page_pool.size());
-            shard.page_pool.emplace_back();
-            auto& page = shard.page_pool.back();
-            page.edges[0] = edge;
-            page.count = 1;
-            page.next_page_id = 0;
-
-            uint32_t page_id = encode_page_id(s_src, local_id);
-            v.ext.out_block_id = page_id;
-            v.out_degree = 1 | VertexRecord::FLAG_PROMOTED;
         } else {
-            // Already has page chain in ext.out_block_id
-            uint32_t curr_id = v.ext.out_block_id;
-            uint32_t local_id = decode_local_page_id(curr_id);
-            while (shard.page_pool[local_id].next_page_id != 0) {
-                curr_id = shard.page_pool[local_id].next_page_id;
-                local_id = decode_local_page_id(curr_id);
+            if (!v.is_promoted()) {
+                v.ext.out_block_id = 0;
+                v.ext.in_block_id = 0;
+                v.ext.page_offset = 0;
+                v.out_degree |= VertexRecord::FLAG_PROMOTED;
             }
-            auto* curr_page = &shard.page_pool[local_id];
-            if (curr_page->count < AdjacencyPage::CAPACITY) {
-                curr_page->edges[curr_page->count++] = edge;
-            } else {
-                uint32_t new_local_id = static_cast<uint32_t>(shard.page_pool.size());
+            if (v.ext.out_block_id == 0) {
+                // in_degree > 0 or already promoted, so ext is active, but no outgoing page allocated yet
+                uint32_t local_id = static_cast<uint32_t>(shard.page_pool.size());
                 shard.page_pool.emplace_back();
-                uint32_t new_page_id = encode_page_id(s_src, new_local_id);
-                curr_page->next_page_id = new_page_id;
-                auto& new_page = shard.page_pool.back();
-                new_page.edges[0] = edge;
-                new_page.count = 1;
-                new_page.next_page_id = 0;
+                auto& page = shard.page_pool.back();
+                page.edges[0] = edge;
+                page.count = 1;
+                page.next_page_id = 0;
+
+                uint32_t page_id = encode_page_id(s_src, local_id);
+                v.ext.out_block_id = page_id;
+                v.out_degree = 1 | VertexRecord::FLAG_PROMOTED;
+            } else {
+                // Already has page chain in ext.out_block_id
+                uint32_t curr_id = v.ext.out_block_id;
+                uint32_t local_id = decode_local_page_id(curr_id);
+                while (shard.page_pool[local_id].next_page_id != 0) {
+                    curr_id = shard.page_pool[local_id].next_page_id;
+                    local_id = decode_local_page_id(curr_id);
+                }
+                auto* curr_page = &shard.page_pool[local_id];
+                if (curr_page->count < AdjacencyPage::CAPACITY) {
+                    curr_page->edges[curr_page->count++] = edge;
+                } else {
+                    uint32_t new_local_id = static_cast<uint32_t>(shard.page_pool.size());
+                    shard.page_pool.emplace_back();
+                    uint32_t new_page_id = encode_page_id(s_src, new_local_id);
+                    curr_page->next_page_id = new_page_id;
+                    auto& new_page = shard.page_pool.back();
+                    new_page.edges[0] = edge;
+                    new_page.count = 1;
+                    new_page.next_page_id = 0;
+                }
+                v.out_degree = ((v.out_degree & VertexRecord::DEGREE_MASK) + 1) | VertexRecord::FLAG_PROMOTED;
             }
-            v.out_degree = ((v.out_degree & VertexRecord::DEGREE_MASK) + 1) | VertexRecord::FLAG_PROMOTED;
         }
     };
 
@@ -99,6 +107,11 @@ void AdjacencyStore::add_edge(uint64_t src_id, uint64_t dst_id, uint16_t label_i
             v.ext.page_offset = 0;
             v.out_degree = (v.out_degree & VertexRecord::DEGREE_MASK) | VertexRecord::FLAG_PROMOTED;
         } else {
+            if (!v.is_promoted()) {
+                v.ext.out_block_id = 0;
+                v.ext.in_block_id = 0;
+                v.ext.page_offset = 0;
+            }
             v.out_degree |= VertexRecord::FLAG_PROMOTED;
         }
 
@@ -166,22 +179,29 @@ bool AdjacencyStore::del_edge(uint64_t src_id, uint64_t dst_id, uint16_t label_i
                     v.inline_edge.is_active()) {
                     v.inline_edge.set_active(false);
                     found = true;
-                    v.out_degree = ((v.out_degree & VertexRecord::DEGREE_MASK) - 1) | (v.out_degree & VertexRecord::FLAG_PROMOTED);
+                    v.out_degree = 0;
+                    v.ext.out_block_id = 0;
+                    v.ext.in_block_id = 0;
+                    v.ext.page_offset = 0;
                 }
             } else if (v.is_promoted() && v.ext.out_block_id > 0) {
                 uint32_t curr_id = v.ext.out_block_id;
                 while (curr_id != 0) {
                     uint32_t p_shard = decode_shard_index(curr_id);
                     uint32_t local_id = decode_local_page_id(curr_id);
-                    if (p_shard >= NUM_SHARDS || local_id >= shards_[p_shard].page_pool.size()) break;
-                    auto& page = shards_[p_shard].page_pool[local_id];
+                    if (p_shard != s_src || local_id >= shard_src.page_pool.size()) break;
+                    auto& page = shard_src.page_pool[local_id];
+                    if (page.next_page_id == curr_id) break; // cycle guard
                     for (uint32_t i = 0; i < page.count; ++i) {
                         if (page.edges[i].target_id == dst_id &&
                             page.edges[i].label_id == label_id &&
                             page.edges[i].is_active()) {
                             page.edges[i].set_active(false);
                             found = true;
-                            v.out_degree = ((v.out_degree & VertexRecord::DEGREE_MASK) - 1) | (v.out_degree & VertexRecord::FLAG_PROMOTED);
+                            uint32_t current_deg = v.out_degree & VertexRecord::DEGREE_MASK;
+                            if (current_deg > 0) {
+                                v.out_degree = (current_deg - 1) | (v.out_degree & VertexRecord::FLAG_PROMOTED);
+                            }
                             break;
                         }
                     }
@@ -201,8 +221,9 @@ bool AdjacencyStore::del_edge(uint64_t src_id, uint64_t dst_id, uint16_t label_i
                     while (curr_id != 0) {
                         uint32_t p_shard = decode_shard_index(curr_id);
                         uint32_t local_id = decode_local_page_id(curr_id);
-                        if (p_shard >= NUM_SHARDS || local_id >= shards_[p_shard].page_pool.size()) break;
-                        auto& page = shards_[p_shard].page_pool[local_id];
+                        if (p_shard != s_dst || local_id >= shard_dst.page_pool.size()) break;
+                        auto& page = shard_dst.page_pool[local_id];
+                        if (page.next_page_id == curr_id) break; // cycle guard
                         for (uint32_t i = 0; i < page.count; ++i) {
                             if (page.edges[i].target_id == src_id &&
                                 page.edges[i].label_id == label_id &&
@@ -257,8 +278,9 @@ std::vector<PackedEdge> AdjacencyStore::get_outgoing_edges_snapshot(uint64_t src
     while (curr_id != 0) {
         uint32_t p_shard = decode_shard_index(curr_id);
         uint32_t p_local = decode_local_page_id(curr_id);
-        if (p_shard >= NUM_SHARDS || p_local >= shards_[p_shard].page_pool.size()) break;
-        const auto& page = shards_[p_shard].page_pool[p_local];
+        if (p_shard != s_idx || p_local >= shard.page_pool.size()) break;
+        const auto& page = shard.page_pool[p_local];
+        if (page.next_page_id == curr_id) break; // cycle guard
         for (uint32_t i = 0; i < page.count; ++i) {
             if (page.edges[i].is_active()) {
                 result.push_back(page.edges[i]);
@@ -283,8 +305,9 @@ std::vector<PackedEdge> AdjacencyStore::get_incoming_edges_snapshot(uint64_t dst
     while (curr_id != 0) {
         uint32_t p_shard = decode_shard_index(curr_id);
         uint32_t p_local = decode_local_page_id(curr_id);
-        if (p_shard >= NUM_SHARDS || p_local >= shards_[p_shard].page_pool.size()) break;
-        const auto& page = shards_[p_shard].page_pool[p_local];
+        if (p_shard != s_idx || p_local >= shard.page_pool.size()) break;
+        const auto& page = shard.page_pool[p_local];
+        if (page.next_page_id == curr_id) break; // cycle guard
         for (uint32_t i = 0; i < page.count; ++i) {
             if (page.edges[i].is_active()) {
                 result.push_back(page.edges[i]);
@@ -296,7 +319,8 @@ std::vector<PackedEdge> AdjacencyStore::get_incoming_edges_snapshot(uint64_t dst
 }
 
 std::span<const PackedEdge> AdjacencyStore::get_outgoing_edges(uint64_t src_id) const noexcept {
-    const auto& shard = shards_[shard_index(src_id)];
+    size_t s_idx = shard_index(src_id);
+    const auto& shard = shards_[s_idx];
     std::shared_lock lock(shard.mutex);
     auto it = shard.directory.find(src_id);
     if (it == shard.directory.end()) {
@@ -307,8 +331,9 @@ std::span<const PackedEdge> AdjacencyStore::get_outgoing_edges(uint64_t src_id) 
         return std::span<const PackedEdge>(&v.inline_edge, 1);
     }
     if (v.is_promoted() && v.ext.out_block_id > 0) {
+        uint32_t p_shard = decode_shard_index(v.ext.out_block_id);
         uint32_t local_id = decode_local_page_id(v.ext.out_block_id);
-        if (local_id < shard.page_pool.size()) {
+        if (p_shard == s_idx && local_id < shard.page_pool.size()) {
             return std::span<const PackedEdge>(shard.page_pool[local_id].edges,
                                                shard.page_pool[local_id].count);
         }
@@ -317,7 +342,8 @@ std::span<const PackedEdge> AdjacencyStore::get_outgoing_edges(uint64_t src_id) 
 }
 
 std::span<const PackedEdge> AdjacencyStore::get_incoming_edges(uint64_t dst_id) const noexcept {
-    const auto& shard = shards_[shard_index(dst_id)];
+    size_t s_idx = shard_index(dst_id);
+    const auto& shard = shards_[s_idx];
     std::shared_lock lock(shard.mutex);
     auto it = shard.directory.find(dst_id);
     if (it == shard.directory.end()) {
@@ -327,8 +353,9 @@ std::span<const PackedEdge> AdjacencyStore::get_incoming_edges(uint64_t dst_id) 
     if (!v.is_promoted() || v.ext.in_block_id == 0) {
         return {};
     }
+    uint32_t p_shard = decode_shard_index(v.ext.in_block_id);
     uint32_t local_id = decode_local_page_id(v.ext.in_block_id);
-    if (local_id < shard.page_pool.size()) {
+    if (p_shard == s_idx && local_id < shard.page_pool.size()) {
         return std::span<const PackedEdge>(shard.page_pool[local_id].edges,
                                            shard.page_pool[local_id].count);
     }

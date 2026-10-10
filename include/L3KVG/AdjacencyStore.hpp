@@ -80,7 +80,13 @@ public:
     }
 
     [[nodiscard]] static size_t shard_index(uint64_t id) noexcept {
-        return (std::hash<uint64_t>{}(id)) % NUM_SHARDS;
+        uint64_t x = id;
+        x ^= x >> 30;
+        x *= 0xbf58476d1ce4e5b9ULL;
+        x ^= x >> 27;
+        x *= 0x94d049bb133111ebULL;
+        x ^= x >> 31;
+        return x % NUM_SHARDS;
     }
 
     AdjacencyStore();
@@ -114,8 +120,9 @@ public:
         while (curr_id != 0) {
             uint32_t p_shard = decode_shard_index(curr_id);
             uint32_t p_local = decode_local_page_id(curr_id);
-            if (p_shard >= NUM_SHARDS || p_local >= shards_[p_shard].page_pool.size()) break;
-            const auto& page = shards_[p_shard].page_pool[p_local];
+            if (p_shard != s_idx || p_local >= shard.page_pool.size()) break;
+            const auto& page = shard.page_pool[p_local];
+            if (page.next_page_id == curr_id) break; // cycle guard
             for (uint32_t i = 0; i < page.count; ++i) {
                 visitor(page.edges[i]);
             }
@@ -136,8 +143,9 @@ public:
         while (curr_id != 0) {
             uint32_t p_shard = decode_shard_index(curr_id);
             uint32_t p_local = decode_local_page_id(curr_id);
-            if (p_shard >= NUM_SHARDS || p_local >= shards_[p_shard].page_pool.size()) break;
-            const auto& page = shards_[p_shard].page_pool[p_local];
+            if (p_shard != s_idx || p_local >= shard.page_pool.size()) break;
+            const auto& page = shard.page_pool[p_local];
+            if (page.next_page_id == curr_id) break; // cycle guard
             for (uint32_t i = 0; i < page.count; ++i) {
                 visitor(page.edges[i]);
             }

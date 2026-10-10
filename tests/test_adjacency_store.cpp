@@ -317,3 +317,55 @@ TEST(AdjacencyStoreTest, DeleteEdgeInSecondPageDecrementsDegree) {
     });
     EXPECT_EQ(in_count, 1);
 }
+
+TEST(AdjacencyStoreTest, InlinedDeletionFollowedByIncomingEdge) {
+    l3kvg::AdjacencyStore store;
+    const uint64_t large_target_id = 0x123456789ABCDEF0ULL;
+
+    // 1. Add inlined edge: large target ID with upper bits set
+    store.add_edge(100, large_target_id, 1);
+    EXPECT_EQ(store.get_out_degree(100), 1);
+    EXPECT_EQ(store.get_in_degree(100), 0);
+
+    // 2. Delete edge
+    bool deleted = store.del_edge(100, large_target_id, 1);
+    EXPECT_TRUE(deleted);
+    EXPECT_EQ(store.get_out_degree(100), 0);
+
+    // 3. Add incoming edge to vertex 100
+    store.add_edge(50, 100, 2);
+
+    // 4. Assert store.get_in_degree(100) == 1
+    EXPECT_EQ(store.get_in_degree(100), 1);
+
+    // 5. Assert incoming snapshot of 100 has exactly 1 edge from 50
+    auto in_snapshot = store.get_incoming_edges_snapshot(100);
+    ASSERT_EQ(in_snapshot.size(), 1);
+    EXPECT_EQ(in_snapshot[0].target_id, 50);
+    EXPECT_EQ(in_snapshot[0].label_id, 2);
+    EXPECT_TRUE(in_snapshot[0].is_active());
+
+    // 6. Assert store.get_out_degree(100) == 0
+    EXPECT_EQ(store.get_out_degree(100), 0);
+    auto out_snapshot = store.get_outgoing_edges_snapshot(100);
+    EXPECT_TRUE(out_snapshot.empty());
+
+    // 7. Add a new outgoing edge: store.add_edge(100, 200, 3);
+    store.add_edge(100, 200, 3);
+
+    // 8. Assert both degrees and snapshots are completely clean
+    EXPECT_EQ(store.get_out_degree(100), 1);
+    EXPECT_EQ(store.get_in_degree(100), 1);
+
+    auto out_snapshot2 = store.get_outgoing_edges_snapshot(100);
+    ASSERT_EQ(out_snapshot2.size(), 1);
+    EXPECT_EQ(out_snapshot2[0].target_id, 200);
+    EXPECT_EQ(out_snapshot2[0].label_id, 3);
+    EXPECT_TRUE(out_snapshot2[0].is_active());
+
+    auto in_snapshot2 = store.get_incoming_edges_snapshot(100);
+    ASSERT_EQ(in_snapshot2.size(), 1);
+    EXPECT_EQ(in_snapshot2[0].target_id, 50);
+    EXPECT_EQ(in_snapshot2[0].label_id, 2);
+    EXPECT_TRUE(in_snapshot2[0].is_active());
+}
