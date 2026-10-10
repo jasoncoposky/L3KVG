@@ -34,8 +34,8 @@ static bool evaluate_filter(Node* node, const Query::Filter& f, Engine* engine) 
             std::string s_val;
             try { s_val = node->get_attribute_as_string("id"); } catch (...) {}
             if (!s_val.empty()) {
-                if (f.op == Query::Op::Eq) return (s_val == f.value);
-                if (f.op == Query::Op::Ne) return (s_val != f.value);
+                if (f.op == Query::Op::Eq && s_val == f.value) return true;
+                if (f.op == Query::Op::Ne && s_val == f.value) return false;
             }
         }
         uint64_t target_id = engine->get_resolver().parse_uuid(f.value);
@@ -139,19 +139,34 @@ static bool evaluate_filter(Node* node, const Query::Filter& f, Engine* engine) 
     }
 
     L3_LOG(0, "evaluate_filter() key=%s, val=%s, op=%d", f.key.c_str(), f.value.c_str(), (int)f.op);
-    if (!node->has_attribute(f.key)) {
-        L3_LOG(0, "evaluate_filter() node %016llx does NOT have attribute '%s'", (unsigned long long)node->get_id(), f.key.c_str());
-        return false;
-    }
-
     std::string s_val;
-    try { s_val = node->get_attribute_as_string(f.key); } catch (...) { 
-        L3_LOG(0, "evaluate_filter() node %016llx failed to get attribute '%s' as string", (unsigned long long)node->get_id(), f.key.c_str());
-        return false; 
+    lite3cpp::Type type = lite3cpp::Type::String;
+    if (f.key == "id") {
+        char id_hex[24];
+        std::snprintf(id_hex, sizeof(id_hex), "%016llx", (unsigned long long)node->get_id());
+        if (f.op == Query::Op::Eq && f.value == id_hex) {
+            return true;
+        }
+        if (node->has_attribute("id")) {
+            try { s_val = node->get_attribute_as_string("id"); } catch (...) { s_val = std::string(id_hex); }
+            type = node->get_attribute_type("id");
+        } else {
+            s_val = std::string(id_hex);
+        }
+    } else {
+        if (!node->has_attribute(f.key)) {
+            L3_LOG(0, "evaluate_filter() node %016llx does NOT have attribute '%s'", (unsigned long long)node->get_id(), f.key.c_str());
+            return false;
+        }
+
+        try { s_val = node->get_attribute_as_string(f.key); } catch (...) { 
+            L3_LOG(0, "evaluate_filter() node %016llx failed to get attribute '%s' as string", (unsigned long long)node->get_id(), f.key.c_str());
+            return false; 
+        }
+        type = node->get_attribute_type(f.key);
     }
 
     bool res = false;
-    auto type = node->get_attribute_type(f.key);
     switch (f.op) {
         case Query::Op::Eq: 
             res = (s_val == f.value); 

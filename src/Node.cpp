@@ -2,6 +2,7 @@
 #include "L3KVG/Engine.hpp"
 #include "L3KVG/RemoteL3KVClient.hpp"
 #include "L3KVG/KeyBuilder.hpp"
+#include "L3KVG/SIMDFilter.hpp"
 #include "engine/store.hpp"
 #include <iostream>
 #include <cstdio>
@@ -117,6 +118,15 @@ std::vector<uint64_t> Node::get_neighbors(std::string_view label,
                                              uint32_t principal_id) {
   L3_LOG(0, "Node::get_neighbors() node=%016llx label=%.*s min_weight=%.2f", 
          (unsigned long long)id_, (int)label.size(), label.data(), min_weight);
+
+  if (engine_->get_adjacency_store().get_out_degree(id_) > 0) {
+      uint16_t lid = label.empty() ? 0 : engine_->get_label_registry().get_or_register(label);
+      auto snap = engine_->get_adjacency_store().get_outgoing_edges_snapshot(id_);
+      std::vector<uint64_t> neighbors;
+      SIMDFilter::filter_edges(snap, lid, static_cast<float>(min_weight), neighbors);
+      return neighbors;
+  }
+
   if (!might_have_edge(label)) {
     L3_LOG(0, "Node::get_neighbors() node=%016llx might_have_edge is false!", (unsigned long long)id_);
     return {};
@@ -182,6 +192,14 @@ std::vector<uint64_t> Node::get_neighbors(std::string_view label,
 }
 
 std::vector<uint64_t> Node::get_in_neighbors(std::string_view label, uint32_t principal_id) {
+  if (engine_->get_adjacency_store().get_in_degree(id_) > 0) {
+      uint16_t lid = label.empty() ? 0 : engine_->get_label_registry().get_or_register(label);
+      auto snap = engine_->get_adjacency_store().get_incoming_edges_snapshot(id_);
+      std::vector<uint64_t> neighbors;
+      SIMDFilter::filter_edges(snap, lid, -999999.0f, neighbors);
+      return neighbors;
+  }
+
   std::vector<uint64_t> neighbors;
   std::string_view prefix = KeyBuilder::edge_in_prefix(id_, label);
   

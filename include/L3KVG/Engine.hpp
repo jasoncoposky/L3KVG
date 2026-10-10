@@ -16,6 +16,9 @@
 #include "L3KVG/ThreadPool.hpp"
 #include "L3KVG/Settings.hpp"
 #include "L3KVG/HLC.hpp"
+#include "L3KVG/LabelRegistry.hpp"
+#include "L3KVG/AdjacencyStore.hpp"
+#include "L3KVG/BinaryEdgeWAL.hpp"
 #include "engine/credential_manager.hpp"
 
 namespace l3kv {
@@ -101,6 +104,14 @@ public:
   ThreadPool& get_thread_pool() { return *pool_; }
   std::shared_ptr<ThreadPool> get_thread_pool_ptr() { return pool_; }
 
+  // Native Graph Substrate Accessors
+  AdjacencyStore& get_adjacency_store() { return adjacency_store_; }
+  const AdjacencyStore& get_adjacency_store() const { return adjacency_store_; }
+  LabelRegistry& get_label_registry() { return label_registry_; }
+  const LabelRegistry& get_label_registry() const { return label_registry_; }
+  BinaryEdgeWAL* get_edge_wal() { return edge_wal_.get(); }
+  const BinaryEdgeWAL* get_edge_wal() const { return edge_wal_.get(); }
+
 private:
   struct CacheShard {
     mutable std::mutex mutex;
@@ -115,6 +126,11 @@ private:
 
   size_t get_cache_shard(uint64_t id);
   void invalidate_node_cache(uint64_t id);
+
+  std::string db_path_;
+  LabelRegistry label_registry_;
+  AdjacencyStore adjacency_store_;
+  std::unique_ptr<BinaryEdgeWAL> edge_wal_;
 
   std::unique_ptr<l3kv::Engine> store_;
   FederationResolver resolver_;

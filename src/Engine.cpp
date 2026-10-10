@@ -8,14 +8,23 @@
 #include <sstream>
 #include <iostream>
 #include <deque>
+#include <filesystem>
+#include <fstream>
 
 
 namespace l3kvg {
 
 Engine::Engine(const std::string &db_path, uint32_t node_id, std::shared_ptr<lite3::ConsistentHash> ring, size_t thread_pool_size, Settings settings)
-    : resolver_(std::move(ring), node_id), settings_(std::move(settings)), hlc_(node_id) {
+    : resolver_(std::move(ring), node_id), settings_(std::move(settings)), hlc_(node_id), db_path_(db_path) {
   settings_.node_id = node_id;
-  store_ = std::make_unique<l3kv::Engine>(db_path, node_id);
+  std::string store_wal_path = db_path;
+  std::string wal_path;
+  if (!db_path.empty() && db_path != ":memory:") {
+      std::filesystem::create_directories(db_path);
+      store_wal_path = db_path + "/kv.wal";
+      wal_path = db_path + "/edges.wal";
+  }
+  store_ = std::make_unique<l3kv::Engine>(store_wal_path, node_id);
   pool_ = std::make_shared<ThreadPool>(thread_pool_size);
   remote_client_ = std::make_unique<RemoteL3KVClient>(settings_);
   remote_client_->set_thread_pool(pool_);
@@ -29,9 +38,47 @@ Engine::Engine(const std::string &db_path, uint32_t node_id, std::shared_ptr<lit
   for (size_t i = 0; i < settings_.node_cache_shards; ++i) {
     cache_shards_.push_back(std::make_unique<CacheShard>());
   }
+
+  std::string dict_path = db_path.empty() || db_path == ":memory:" ? "" : (db_path + "/labels.dict");
+  if (!dict_path.empty() && std::filesystem::exists(dict_path)) {
+      try {
+          std::ifstream ifs(dict_path);
+          std::string line;
+          while (std::getline(ifs, line)) {
+              if (!line.empty()) {
+                  label_registry_.get_or_register(line);
+              }
+          }
+      } catch (...) {
+      }
+  }
+
+  if (!wal_path.empty()) {
+      try {
+          edge_wal_ = std::make_unique<BinaryEdgeWAL>(wal_path);
+          edge_wal_->recover(adjacency_store_);
+      } catch (...) {
+          // If opening WAL fails, edge_wal_ remains nullptr
+      }
+  }
 }
 
 Engine::~Engine() {
+  if (edge_wal_) {
+      edge_wal_->flush();
+      edge_wal_->close();
+  }
+  if (!db_path_.empty() && db_path_ != ":memory:") {
+      try {
+          std::string dict_path = db_path_ + "/labels.dict";
+          std::ofstream ofs(dict_path, std::ios::trunc);
+          for (size_t i = 1; i <= label_registry_.size(); ++i) {
+              ofs << label_registry_.get_label(static_cast<uint16_t>(i)) << "\n";
+          }
+      } catch (...) {
+      }
+  }
+
   // 1. Stop the EdgeCoordinator (which may use the pool)
   edge_coordinator_.reset();
   
@@ -381,6 +428,19 @@ void Engine::del_node(uint64_t id) {
 }
 
 void Engine::flush() {
+  if (edge_wal_) {
+      edge_wal_->flush();
+  }
+  if (!db_path_.empty() && db_path_ != ":memory:") {
+      try {
+          std::string dict_path = db_path_ + "/labels.dict";
+          std::ofstream ofs(dict_path, std::ios::trunc);
+          for (size_t i = 1; i <= label_registry_.size(); ++i) {
+              ofs << label_registry_.get_label(static_cast<uint16_t>(i)) << "\n";
+          }
+      } catch (...) {
+      }
+  }
   store_->wait_all_shards();
   store_->flush();
 }
@@ -392,6 +452,13 @@ std::string Engine::format_weight(double weight) {
 void Engine::add_edge(uint64_t src_id, std::string label,
                       double weight, uint64_t dst_id,
                       std::string payload) {
+  uint16_t lid = label_registry_.get_or_register(label);
+  auto hlc_ts = hlc_.now();
+  if (edge_wal_) {
+      EdgeMutationOp op{src_id, dst_id, hlc_ts.wall_time, lid, PackedEdge::FLAG_ACTIVE, static_cast<float>(weight)};
+      edge_wal_->append(op);
+  }
+  adjacency_store_.add_edge(src_id, dst_id, lid, static_cast<float>(weight), PackedEdge::FLAG_ACTIVE, 0, static_cast<uint32_t>(hlc_ts.logical));
   edge_coordinator_->atomic_put_edge(src_id, std::move(label), weight, dst_id, std::move(payload)).get();
   
   // Cache Invalidation
@@ -407,6 +474,13 @@ void Engine::add_edge(std::string_view src_uuid, std::string label,
 
 void Engine::del_edge(uint64_t src_id, std::string label,
                       double weight, uint64_t dst_id) {
+  uint16_t lid = label_registry_.get_or_register(label);
+  auto hlc_ts = hlc_.now();
+  if (edge_wal_) {
+      EdgeMutationOp op{src_id, dst_id, hlc_ts.wall_time, lid, EdgeMutationOp::OP_DELETE, static_cast<float>(weight)};
+      edge_wal_->append(op);
+  }
+  adjacency_store_.del_edge(src_id, dst_id, lid);
   edge_coordinator_->atomic_del_edge(src_id, std::move(label), weight, dst_id).get();
 
   // Cache Invalidation
@@ -507,6 +581,12 @@ bool Engine::apply_batch(const lite3cpp::Buffer& buffer, uint32_t principal_id) 
                 case MutationOp::AddEdge: {
                     nodes_to_invalidate.push_back(item.src);
                     nodes_to_invalidate.push_back(item.dst);
+                    uint16_t lid = label_registry_.get_or_register(item.label);
+                    adjacency_store_.add_edge(item.src, item.dst, lid, static_cast<float>(item.weight));
+                    if (edge_wal_) {
+                        EdgeMutationOp op{item.src, item.dst, static_cast<uint64_t>(now.wall_time), lid, PackedEdge::FLAG_ACTIVE, static_cast<float>(item.weight)};
+                        edge_wal_->append(op);
+                    }
                     std::string out_key = std::string(KeyBuilder::edge_out_key(item.src, std::string(item.label), item.weight, item.dst));
                     std::string in_key = std::string(KeyBuilder::edge_in_key(item.dst, std::string(item.label), item.src));
                     
@@ -522,6 +602,12 @@ bool Engine::apply_batch(const lite3cpp::Buffer& buffer, uint32_t principal_id) 
                 case MutationOp::DelEdge: {
                     nodes_to_invalidate.push_back(item.src);
                     nodes_to_invalidate.push_back(item.dst);
+                    uint16_t lid = label_registry_.get_or_register(item.label);
+                    adjacency_store_.del_edge(item.src, item.dst, lid);
+                    if (edge_wal_) {
+                        EdgeMutationOp op{item.src, item.dst, static_cast<uint64_t>(now.wall_time), lid, EdgeMutationOp::OP_DELETE, static_cast<float>(item.weight)};
+                        edge_wal_->append(op);
+                    }
                     std::string out_key = std::string(KeyBuilder::edge_out_key(item.src, std::string(item.label), item.weight, item.dst));
                     std::string in_key = std::string(KeyBuilder::edge_in_key(item.dst, std::string(item.label), item.src));
                     add_del(out_key);
