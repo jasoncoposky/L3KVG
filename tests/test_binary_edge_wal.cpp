@@ -132,14 +132,16 @@ TEST(BinaryEdgeWALTest, AppendAndRecover) {
     EXPECT_EQ(store.get_out_degree(200), 1);
     EXPECT_EQ(store.get_in_degree(300), 2);
 
-    auto out_100 = store.get_outgoing_edges_snapshot(100);
-    ASSERT_EQ(out_100.size(), 2);
-    EXPECT_EQ(out_100[0].target_id, 200);
-    EXPECT_EQ(out_100[0].label_id, 1);
-    EXPECT_FLOAT_EQ(out_100[0].weight, 1.5f);
-    EXPECT_EQ(out_100[1].target_id, 300);
-    EXPECT_EQ(out_100[1].label_id, 2);
-    EXPECT_FLOAT_EQ(out_100[1].weight, 2.5f);
+    auto edges = store.get_outgoing_edges_snapshot(100);
+    ASSERT_EQ(edges.size(), 2);
+    EXPECT_EQ(edges[0].target_id, 200);
+    EXPECT_EQ(edges[0].label_id, 1);
+    EXPECT_FLOAT_EQ(edges[0].weight, 1.5f);
+    EXPECT_EQ(edges[0].hlc_logical, 1000);
+    EXPECT_EQ(edges[1].target_id, 300);
+    EXPECT_EQ(edges[1].label_id, 2);
+    EXPECT_FLOAT_EQ(edges[1].weight, 2.5f);
+    EXPECT_EQ(edges[1].hlc_logical, 1001);
 
     auto out_200 = store.get_outgoing_edges_snapshot(200);
     ASSERT_EQ(out_200.size(), 1);

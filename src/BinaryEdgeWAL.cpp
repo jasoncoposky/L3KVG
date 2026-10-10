@@ -1,9 +1,12 @@
 #include "L3KVG/BinaryEdgeWAL.hpp"
 
+#include <algorithm>
 #include <cerrno>
+#include <climits>
 #include <cstring>
 #include <filesystem>
 #include <stdexcept>
+#include <vector>
 
 #if defined(_WIN32)
 #include <io.h>
@@ -70,7 +73,8 @@ void BinaryEdgeWAL::write_all_unlocked(const char* data, size_t total_bytes) {
     size_t written = 0;
     while (written < total_bytes) {
 #if defined(_WIN32)
-        int res = ::_write(fd_, data + written, static_cast<unsigned int>(total_bytes - written));
+        unsigned int chunk = static_cast<unsigned int>(std::min<size_t>(total_bytes - written, static_cast<size_t>(UINT_MAX)));
+        int res = ::_write(fd_, data + written, chunk);
 #else
         ssize_t res = ::write(fd_, data + written, total_bytes - written);
 #endif
@@ -193,31 +197,34 @@ size_t BinaryEdgeWAL::recover(AdjacencyStore& store) {
 
     size_t recovered_count = 0;
     constexpr size_t CHUNK_SIZE = 64 * 1024; // 65,536 bytes (2048 * sizeof(EdgeMutationOp))
-    alignas(alignof(EdgeMutationOp)) char buffer[CHUNK_SIZE];
+    static_assert(CHUNK_SIZE % sizeof(EdgeMutationOp) == 0, "CHUNK_SIZE must be a multiple of EdgeMutationOp size");
+    std::vector<char> buffer(CHUNK_SIZE);
 
-    off_t file_offset = 0;
+    uint64_t file_offset = 0;
 
     while (true) {
         size_t bytes_in_chunk = 0;
         while (bytes_in_chunk < CHUNK_SIZE) {
 #if defined(_WIN32)
-            __int64 seek_res = _lseeki64(read_fd, file_offset + bytes_in_chunk, SEEK_SET);
+            __int64 seek_res = _lseeki64(read_fd, static_cast<__int64>(file_offset + bytes_in_chunk), SEEK_SET);
             if (seek_res == -1) {
-                break;
-            }
-            int bytes_read = ::_read(read_fd, buffer + bytes_in_chunk, static_cast<unsigned int>(CHUNK_SIZE - bytes_in_chunk));
-#else
-            ssize_t bytes_read = ::pread(read_fd, buffer + bytes_in_chunk, CHUNK_SIZE - bytes_in_chunk, file_offset + bytes_in_chunk);
-#endif
-            if (bytes_read < 0) {
                 if (errno == EINTR) {
                     continue;
                 }
-                break;
+                throw std::runtime_error("Failed to seek in binary edge WAL during recovery: " + std::string(std::strerror(errno)));
             }
+            int bytes_read = ::_read(read_fd, buffer.data() + bytes_in_chunk, static_cast<unsigned int>(CHUNK_SIZE - bytes_in_chunk));
+#else
+            ssize_t bytes_read = ::pread(read_fd, buffer.data() + bytes_in_chunk, CHUNK_SIZE - bytes_in_chunk, static_cast<off_t>(file_offset + bytes_in_chunk));
+#endif
             if (bytes_read == 0) {
-                // EOF reached
-                break;
+                break; // Clean EOF
+            }
+            if (bytes_read < 0) {
+                if (errno == EINTR) {
+                    continue; // Interrupted by signal, retry
+                }
+                throw std::runtime_error("Failed to read from binary edge WAL during recovery: " + std::string(std::strerror(errno)));
             }
             bytes_in_chunk += static_cast<size_t>(bytes_read);
         }
@@ -227,7 +234,7 @@ size_t BinaryEdgeWAL::recover(AdjacencyStore& store) {
         }
 
         size_t full_records = bytes_in_chunk / sizeof(EdgeMutationOp);
-        const auto* ops = reinterpret_cast<const EdgeMutationOp*>(buffer);
+        const auto* ops = reinterpret_cast<const EdgeMutationOp*>(buffer.data());
 
         for (size_t i = 0; i < full_records; ++i) {
             const auto& op = ops[i];
@@ -244,7 +251,7 @@ size_t BinaryEdgeWAL::recover(AdjacencyStore& store) {
             break;
         }
 
-        file_offset += static_cast<off_t>(bytes_in_chunk);
+        file_offset += bytes_in_chunk;
     }
 
     return recovered_count;
