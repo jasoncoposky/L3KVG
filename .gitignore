@@ -1,7 +1,10 @@
 # Build directories
 build/
+build_*/
 out/
 bin/
+*db*/
+
 
 # Visual Studio / IDE
 .vs/
