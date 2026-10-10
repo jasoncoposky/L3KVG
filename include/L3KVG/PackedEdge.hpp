@@ -47,5 +47,7 @@ struct alignas(8) PackedEdge {
 
 static_assert(sizeof(PackedEdge) == 24, "PackedEdge must be exactly 24 bytes");
 static_assert(alignof(PackedEdge) == 8, "PackedEdge must be 8-byte aligned");
+static_assert(std::is_trivially_copyable_v<PackedEdge>, "PackedEdge must be trivially copyable for binary serialization");
+static_assert(std::is_standard_layout_v<PackedEdge>, "PackedEdge must be standard layout");
 
 } // namespace l3kvg

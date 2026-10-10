@@ -100,3 +100,19 @@ TEST(LabelRegistryTest, ConcurrentRegistration) {
     for (auto& th : threads) th.join();
     EXPECT_EQ(registry.size(), 100);
 }
+
+TEST(LabelRegistryTest, CapacityOverflow) {
+    l3kvg::LabelRegistry registry;
+    // Register up to maximum 65535 labels
+    for (uint32_t i = 1; i <= 65535; ++i) {
+        // Fast generated label
+        char buf[16];
+        snprintf(buf, sizeof(buf), "L%x", i);
+        uint16_t id = registry.get_or_register(buf);
+        ASSERT_EQ(id, i);
+    }
+    EXPECT_EQ(registry.size(), 65535);
+
+    // 65536th label must throw std::overflow_error
+    EXPECT_THROW(registry.get_or_register("OVERFLOW_LABEL"), std::overflow_error);
+}
