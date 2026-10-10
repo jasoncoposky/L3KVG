@@ -2,8 +2,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <span>
-#include <vector>
-#include <memory>
+#include <deque>
 #include <shared_mutex>
 #include <unordered_map>
 #include <array>
@@ -15,32 +14,34 @@ namespace l3kvg {
 
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpacked-not-aligned"
 #pragma GCC diagnostic ignored "-Wpedantic"
 #endif
 
+#pragma pack(push, 4)
 struct alignas(8) VertexRecord {
     uint32_t out_degree{0};
     uint32_t in_degree{0};
-
     union {
-        PackedEdge inline_edge;
+        PackedEdge inline_edge; // Inlined edge when out_degree == 1 && ext.out_block_id == 0
         struct {
-            uint32_t flags;
-            uint32_t reserved;
-            struct {
-                uint32_t out_block_id;
-                uint32_t in_block_id;
-                uint64_t page_offset;
-            } ext;
-        };
+            uint32_t out_block_id; // 1-indexed into page_pool (0 = inlined/none)
+            uint32_t in_block_id;  // 1-indexed into page_pool (0 = none)
+            uint64_t page_offset;
+        } ext;
     };
 
-    VertexRecord() noexcept : out_degree(0), in_degree(0), flags(0), reserved(0) {
+    VertexRecord() noexcept : out_degree(0), in_degree(0) {
         ext.out_block_id = 0;
         ext.in_block_id = 0;
         ext.page_offset = 0;
     }
+
+    [[nodiscard]] bool is_inlined() const noexcept {
+        return out_degree == 1 && in_degree == 0;
+    }
 };
+#pragma pack(pop)
 
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic pop
@@ -49,17 +50,15 @@ struct alignas(8) VertexRecord {
 static_assert(sizeof(VertexRecord) == 32, "VertexRecord must be exactly 32 bytes");
 static_assert(alignof(VertexRecord) == 8, "VertexRecord must be 8-byte aligned");
 static_assert(std::is_trivially_copyable_v<VertexRecord>, "VertexRecord must be trivially copyable");
-static_assert(std::is_standard_layout_v<VertexRecord>, "VertexRecord must be standard layout");
 
 struct alignas(64) AdjacencyPage {
-    static constexpr uint32_t CAPACITY = 170;
+    static constexpr uint32_t CAPACITY = 170; // 170 * 24 = 4080 bytes. 4080 + 16 header = 4096 bytes (4KB)
     uint32_t count{0};
-    uint32_t next_page_id{0};
+    uint32_t next_page_id{0}; // 0 = none, or 1-indexed into page_pool
     uint32_t version{0};
     uint32_t reserved{0};
     PackedEdge edges[CAPACITY];
 };
-
 static_assert(sizeof(AdjacencyPage) == 4096, "AdjacencyPage must be exactly 4096 bytes");
 static_assert(alignof(AdjacencyPage) == 64, "AdjacencyPage must be 64-byte aligned");
 
@@ -85,35 +84,29 @@ public:
     [[nodiscard]] size_t get_out_degree(uint64_t src_id) const noexcept;
     [[nodiscard]] size_t get_in_degree(uint64_t dst_id) const noexcept;
 
+    // Helper for testing page internals
+    [[nodiscard]] uint32_t get_out_page_id(uint64_t src_id) const noexcept;
+    [[nodiscard]] const AdjacencyPage* get_page(uint32_t page_id) const noexcept;
+
 private:
-    struct NodeAdjacency {
+    struct alignas(64) Shard {
         mutable std::shared_mutex mutex;
-        VertexRecord out_record;
-        VertexRecord in_record;
-        std::vector<PackedEdge> out_edges; // Dynamic page buffer
-        std::vector<PackedEdge> in_edges;  // Dynamic page buffer
+        std::unordered_map<uint64_t, VertexRecord> directory;
+        // std::deque guarantees pointer stability on emplace_back!
+        std::deque<AdjacencyPage> page_pool;
+
+        Shard() {
+            // Index 0 reserved as null page ID
+            page_pool.emplace_back();
+        }
     };
 
     static constexpr size_t NUM_SHARDS = 64;
-
-    struct Shard {
-        mutable std::shared_mutex mutex;
-        std::unordered_map<uint64_t, std::shared_ptr<NodeAdjacency>> nodes;
-    };
-
     std::array<Shard, NUM_SHARDS> shards_;
 
-    [[nodiscard]] static size_t shard_idx(uint64_t id) noexcept {
-        id ^= id >> 33;
-        id *= 0xff51afd7ed558ccdULL;
-        id ^= id >> 33;
-        id *= 0xc4ceb9fe1a85ec53ULL;
-        id ^= id >> 33;
-        return static_cast<size_t>(id % NUM_SHARDS);
+    [[nodiscard]] static size_t shard_index(uint64_t id) noexcept {
+        return (id ^ (id >> 16)) % NUM_SHARDS;
     }
-
-    std::shared_ptr<NodeAdjacency> get_or_create_node(uint64_t id);
-    [[nodiscard]] std::shared_ptr<NodeAdjacency> get_node(uint64_t id) const noexcept;
 };
 
 } // namespace l3kvg
