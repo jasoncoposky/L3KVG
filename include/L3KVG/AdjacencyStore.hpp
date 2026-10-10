@@ -101,7 +101,7 @@ public:
                   float weight = 1.0f, uint16_t flags = PackedEdge::FLAG_ACTIVE,
                   uint32_t prop_index = 0, uint32_t hlc = 0);
 
-    bool del_edge(uint64_t src_id, uint64_t dst_id, uint16_t label_id);
+    bool del_edge(uint64_t src_id, uint64_t dst_id, uint16_t label_id, float weight = -1.0f);
 
     template <typename F>
     void for_each_outgoing_edge(uint64_t src_id, F&& visitor) const {

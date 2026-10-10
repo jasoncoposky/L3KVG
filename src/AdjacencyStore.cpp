@@ -1,5 +1,6 @@
 #include "L3KVG/AdjacencyStore.hpp"
 #include <algorithm>
+#include <cmath>
 
 namespace l3kvg {
 
@@ -164,7 +165,7 @@ void AdjacencyStore::add_edge(uint64_t src_id, uint64_t dst_id, uint16_t label_i
     }
 }
 
-bool AdjacencyStore::del_edge(uint64_t src_id, uint64_t dst_id, uint16_t label_id) {
+bool AdjacencyStore::del_edge(uint64_t src_id, uint64_t dst_id, uint16_t label_id, float weight) {
     size_t s_src = shard_index(src_id);
     size_t s_dst = shard_index(dst_id);
     bool found = false;
@@ -176,6 +177,7 @@ bool AdjacencyStore::del_edge(uint64_t src_id, uint64_t dst_id, uint16_t label_i
             if (v.is_inlined()) {
                 if (v.inline_edge.target_id == dst_id &&
                     v.inline_edge.label_id == label_id &&
+                    (weight < 0.0f || std::abs(v.inline_edge.weight - weight) < 1e-6f) &&
                     v.inline_edge.is_active()) {
                     v.inline_edge.set_active(false);
                     found = true;
@@ -195,6 +197,7 @@ bool AdjacencyStore::del_edge(uint64_t src_id, uint64_t dst_id, uint16_t label_i
                     for (uint32_t i = 0; i < page.count; ++i) {
                         if (page.edges[i].target_id == dst_id &&
                             page.edges[i].label_id == label_id &&
+                            (weight < 0.0f || std::abs(page.edges[i].weight - weight) < 1e-6f) &&
                             page.edges[i].is_active()) {
                             page.edges[i].set_active(false);
                             found = true;
@@ -227,6 +230,7 @@ bool AdjacencyStore::del_edge(uint64_t src_id, uint64_t dst_id, uint16_t label_i
                         for (uint32_t i = 0; i < page.count; ++i) {
                             if (page.edges[i].target_id == src_id &&
                                 page.edges[i].label_id == label_id &&
+                                (weight < 0.0f || std::abs(page.edges[i].weight - weight) < 1e-6f) &&
                                 page.edges[i].is_active()) {
                                 page.edges[i].set_active(false);
                                 if (v.in_degree > 0) {

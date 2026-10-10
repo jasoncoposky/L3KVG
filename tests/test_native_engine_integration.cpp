@@ -4,11 +4,24 @@
 #include "L3KVG/Query.hpp"
 #include "L3KVG/MutationBatch.hpp"
 #include <filesystem>
+#include <fstream>
 #include <algorithm>
 
+struct TempDir {
+    std::string path;
+    explicit TempDir(std::string p) : path(std::move(p)) {
+        std::error_code ec;
+        std::filesystem::remove_all(path, ec);
+    }
+    ~TempDir() {
+        std::error_code ec;
+        std::filesystem::remove_all(path, ec);
+    }
+};
+
 TEST(NativeEngineIntegrationTest, AddAndTraverseEdges) {
-    std::string db_dir = "test_native_engine_add_traverse_db";
-    std::filesystem::remove_all(db_dir);
+    TempDir temp_dir("test_native_engine_add_traverse_db");
+    const std::string& db_dir = temp_dir.path;
 
     {
         l3kvg::Settings settings;
@@ -71,13 +84,11 @@ TEST(NativeEngineIntegrationTest, AddAndTraverseEdges) {
         auto in_n3_works = engine.get_node(n3)->get_in_neighbors("WORKS_WITH");
         EXPECT_TRUE(in_n3_works.empty());
     }
-
-    std::filesystem::remove_all(db_dir);
 }
 
 TEST(NativeEngineIntegrationTest, DeleteEdgeAndVerify) {
-    std::string db_dir = "test_native_engine_del_db";
-    std::filesystem::remove_all(db_dir);
+    TempDir temp_dir("test_native_engine_del_db");
+    const std::string& db_dir = temp_dir.path;
 
     {
         l3kvg::Settings settings;
@@ -119,13 +130,11 @@ TEST(NativeEngineIntegrationTest, DeleteEdgeAndVerify) {
         EXPECT_TRUE(n_src->get_neighbors("FRIEND").empty());
         EXPECT_TRUE(engine.get_node(dst2)->get_in_neighbors("FRIEND").empty());
     }
-
-    std::filesystem::remove_all(db_dir);
 }
 
 TEST(NativeEngineIntegrationTest, FluentQueryExecution) {
-    std::string db_dir = "test_native_engine_fluent_db";
-    std::filesystem::remove_all(db_dir);
+    TempDir temp_dir("test_native_engine_fluent_db");
+    const std::string& db_dir = temp_dir.path;
 
     {
         l3kvg::Settings settings;
@@ -170,13 +179,11 @@ TEST(NativeEngineIntegrationTest, FluentQueryExecution) {
         ASSERT_EQ(res2.size(), 1);
         EXPECT_EQ(res2[0].nodes.size(), 3);
     }
-
-    std::filesystem::remove_all(db_dir);
 }
 
 TEST(NativeEngineIntegrationTest, RecoveryAfterRestart) {
-    std::string db_dir = "test_native_engine_recovery_db";
-    std::filesystem::remove_all(db_dir);
+    TempDir temp_dir("test_native_engine_recovery_db");
+    const std::string& db_dir = temp_dir.path;
 
     uint64_t n501 = 501;
     uint64_t n502 = 502;
@@ -249,13 +256,11 @@ TEST(NativeEngineIntegrationTest, RecoveryAfterRestart) {
         ASSERT_NE(node502, nullptr);
         EXPECT_TRUE(node502->get_in_neighbors("FOLLOWS").empty());
     }
-
-    std::filesystem::remove_all(db_dir);
 }
 
 TEST(NativeEngineIntegrationTest, BatchMutationIntegration) {
-    std::string db_dir = "test_native_engine_batch_db";
-    std::filesystem::remove_all(db_dir);
+    TempDir temp_dir("test_native_engine_batch_db");
+    const std::string& db_dir = temp_dir.path;
 
     {
         l3kvg::Settings settings;
@@ -306,6 +311,143 @@ TEST(NativeEngineIntegrationTest, BatchMutationIntegration) {
 
         EXPECT_TRUE(engine.get_node(n8001)->get_in_neighbors("LINKED_TO").empty());
     }
+}
 
-    std::filesystem::remove_all(db_dir);
+TEST(NativeEngineIntegrationTest, ReadOnlyLabelLookup) {
+    TempDir temp_dir("test_native_engine_lookup_db");
+    const std::string& db_dir = temp_dir.path;
+
+    l3kvg::Settings settings;
+    l3kvg::Engine engine(db_dir, 1, nullptr, 4, settings);
+
+    // Initial label registry is empty
+    EXPECT_EQ(engine.get_label_registry().size(), 0);
+    EXPECT_EQ(engine.get_label_registry().lookup("UNKNOWN_LABEL"), 0);
+
+    uint64_t n1 = 3001;
+    uint64_t n2 = 3002;
+    engine.add_edge(n1, "KNOWN_LABEL", 1.0, n2);
+
+    EXPECT_EQ(engine.get_label_registry().size(), 1);
+    uint16_t known_lid = engine.get_label_registry().lookup("KNOWN_LABEL");
+    EXPECT_GT(known_lid, 0);
+
+    auto node = engine.get_node(n1);
+    ASSERT_NE(node, nullptr);
+
+    // Query with unregistered label - should return empty and NOT register new label!
+    auto unknown_neighbors = node->get_neighbors("NON_EXISTENT_LABEL");
+    EXPECT_TRUE(unknown_neighbors.empty());
+    EXPECT_EQ(engine.get_label_registry().size(), 1);
+    EXPECT_EQ(engine.get_label_registry().lookup("NON_EXISTENT_LABEL"), 0);
+
+    auto node2 = engine.get_node(n2);
+    ASSERT_NE(node2, nullptr);
+    auto unknown_in = node2->get_in_neighbors("NON_EXISTENT_LABEL");
+    EXPECT_TRUE(unknown_in.empty());
+    EXPECT_EQ(engine.get_label_registry().size(), 1);
+}
+
+TEST(NativeEngineIntegrationTest, WeightSensitiveEdgeDeletion) {
+    TempDir temp_dir("test_native_engine_weight_del_db");
+    const std::string& db_dir = temp_dir.path;
+
+    l3kvg::Settings settings;
+    l3kvg::Engine engine(db_dir, 1, nullptr, 4, settings);
+
+    uint64_t src = 4001;
+    uint64_t dst = 4002;
+
+    engine.add_edge(src, "CONNECTS", 1.5, dst);
+    engine.add_edge(src, "CONNECTS", 3.5, dst);
+
+    EXPECT_EQ(engine.get_adjacency_store().get_out_degree(src), 2);
+
+    // Try deleting with wrong weight (e.g. 2.0) -> should not delete anything
+    engine.del_edge(src, "CONNECTS", 2.0, dst);
+    EXPECT_EQ(engine.get_adjacency_store().get_out_degree(src), 2);
+
+    // Delete edge with weight 1.5
+    engine.del_edge(src, "CONNECTS", 1.5, dst);
+    EXPECT_EQ(engine.get_adjacency_store().get_out_degree(src), 1);
+
+    // Check remaining edge has weight 3.5:
+    auto node = engine.get_node(src);
+    ASSERT_NE(node, nullptr);
+    auto neigh_high = node->get_neighbors("CONNECTS", 3.0);
+    ASSERT_EQ(neigh_high.size(), 1);
+    EXPECT_EQ(neigh_high[0], dst);
+
+    // Delete edge with weight 3.5
+    engine.del_edge(src, "CONNECTS", 3.5, dst);
+    EXPECT_EQ(engine.get_adjacency_store().get_out_degree(src), 0);
+    EXPECT_TRUE(node->get_neighbors("CONNECTS", 0.0).empty());
+}
+
+TEST(NativeEngineIntegrationTest, BatchMutationAllOrNothingStaging) {
+    TempDir temp_dir("test_native_engine_staged_batch_db");
+    const std::string& db_dir = temp_dir.path;
+
+    l3kvg::Settings settings;
+    l3kvg::Engine engine(db_dir, 1, nullptr, 4, settings);
+
+    uint64_t src = 5001;
+    uint64_t dst = 5002;
+
+    l3kvg::MutationBatch batch;
+    batch.add_edge(src, "TEST_STAGED", 1.0, dst, "{}");
+
+    // Pass an unauthorized principal ID (non-admin, e.g. 8888) to trigger failure during add_put
+    bool ok = engine.apply_batch(batch.get_buffer(), 8888);
+    EXPECT_FALSE(ok);
+
+    // All-or-nothing: the staged edge should NOT be present in AdjacencyStore!
+    EXPECT_EQ(engine.get_adjacency_store().get_out_degree(src), 0);
+    EXPECT_EQ(engine.get_adjacency_store().get_in_degree(dst), 0);
+
+    auto node = engine.get_node(src);
+    ASSERT_NE(node, nullptr);
+    EXPECT_TRUE(node->get_neighbors("TEST_STAGED").empty());
+}
+
+TEST(NativeEngineIntegrationTest, LabelsDictCRLFAndAtomicWrite) {
+    TempDir temp_dir("test_native_engine_crlf_db");
+    const std::string& db_dir = temp_dir.path;
+
+    std::filesystem::create_directories(db_dir);
+    std::string dict_path = db_dir + "/labels.dict";
+    {
+        std::ofstream ofs(dict_path, std::ios::binary);
+        // Write CRLF separated labels
+        ofs << "ALPHA\r\nBETA\r\nGAMMA\r\n";
+    }
+
+    {
+        l3kvg::Settings settings;
+        l3kvg::Engine engine(db_dir, 1, nullptr, 4, settings);
+
+        // Verify CRLF was stripped and labels were loaded
+        EXPECT_EQ(engine.get_label_registry().size(), 3);
+        EXPECT_EQ(engine.get_label_registry().get_label(1), "ALPHA");
+        EXPECT_EQ(engine.get_label_registry().get_label(2), "BETA");
+        EXPECT_EQ(engine.get_label_registry().get_label(3), "GAMMA");
+
+        engine.add_edge(6001, "DELTA", 1.0, 6002);
+        EXPECT_EQ(engine.get_label_registry().size(), 4);
+
+        engine.flush();
+
+        // Verify .tmp file does not exist after flush
+        EXPECT_FALSE(std::filesystem::exists(dict_path + ".tmp"));
+        EXPECT_TRUE(std::filesystem::exists(dict_path));
+    }
+
+    // Reopen and verify DELTA is present
+    {
+        l3kvg::Settings settings;
+        l3kvg::Engine engine(db_dir, 1, nullptr, 4, settings);
+        EXPECT_EQ(engine.get_label_registry().size(), 4);
+        EXPECT_EQ(engine.get_label_registry().get_label(4), "DELTA");
+        EXPECT_FALSE(std::filesystem::exists(dict_path + ".tmp"));
+    }
 }

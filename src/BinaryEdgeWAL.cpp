@@ -239,7 +239,7 @@ size_t BinaryEdgeWAL::recover(AdjacencyStore& store) {
         for (size_t i = 0; i < full_records; ++i) {
             const auto& op = ops[i];
             if (op.is_delete()) {
-                store.del_edge(op.src_id, op.dst_id, op.label_id);
+                store.del_edge(op.src_id, op.dst_id, op.label_id, op.weight);
             } else {
                 store.add_edge(op.src_id, op.dst_id, op.label_id, op.weight, op.flags, 0, static_cast<uint32_t>(op.hlc_timestamp));
             }

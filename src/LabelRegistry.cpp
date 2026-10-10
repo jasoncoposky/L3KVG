@@ -32,6 +32,17 @@ uint16_t LabelRegistry::get_or_register(std::string_view label) {
     return new_id;
 }
 
+uint16_t LabelRegistry::lookup(std::string_view label) const noexcept {
+    if (label.empty()) {
+        return 0;
+    }
+    std::shared_lock read_lock(mutex_);
+    if (auto it = label_to_id_.find(label); it != label_to_id_.end()) {
+        return it->second;
+    }
+    return 0;
+}
+
 std::string_view LabelRegistry::get_label(uint16_t id) const noexcept {
     std::shared_lock read_lock(mutex_);
     if (id == 0 || id >= id_to_label_.size()) {

@@ -19,6 +19,7 @@ public:
     LabelRegistry& operator=(LabelRegistry&&) = delete;
 
     uint16_t get_or_register(std::string_view label);
+    [[nodiscard]] uint16_t lookup(std::string_view label) const noexcept;
     [[nodiscard]] std::string_view get_label(uint16_t id) const noexcept;
     [[nodiscard]] size_t size() const noexcept;
 

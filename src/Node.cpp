@@ -119,9 +119,17 @@ std::vector<uint64_t> Node::get_neighbors(std::string_view label,
   L3_LOG(0, "Node::get_neighbors() node=%016llx label=%.*s min_weight=%.2f", 
          (unsigned long long)id_, (int)label.size(), label.data(), min_weight);
 
-  if (engine_->get_adjacency_store().get_out_degree(id_) > 0) {
-      uint16_t lid = label.empty() ? 0 : engine_->get_label_registry().get_or_register(label);
-      auto snap = engine_->get_adjacency_store().get_outgoing_edges_snapshot(id_);
+  uint16_t lid = 0;
+  if (!label.empty()) {
+      lid = engine_->get_label_registry().lookup(label);
+      if (lid == 0) {
+          // Label is not registered in this database, cannot match any edges
+          return {};
+      }
+  }
+
+  auto snap = engine_->get_adjacency_store().get_outgoing_edges_snapshot(id_);
+  if (!snap.empty()) {
       std::vector<uint64_t> neighbors;
       SIMDFilter::filter_edges(snap, lid, static_cast<float>(min_weight), neighbors);
       return neighbors;
@@ -192,9 +200,16 @@ std::vector<uint64_t> Node::get_neighbors(std::string_view label,
 }
 
 std::vector<uint64_t> Node::get_in_neighbors(std::string_view label, uint32_t principal_id) {
-  if (engine_->get_adjacency_store().get_in_degree(id_) > 0) {
-      uint16_t lid = label.empty() ? 0 : engine_->get_label_registry().get_or_register(label);
-      auto snap = engine_->get_adjacency_store().get_incoming_edges_snapshot(id_);
+  uint16_t lid = 0;
+  if (!label.empty()) {
+      lid = engine_->get_label_registry().lookup(label);
+      if (lid == 0) {
+          return {};
+      }
+  }
+
+  auto snap = engine_->get_adjacency_store().get_incoming_edges_snapshot(id_);
+  if (!snap.empty()) {
       std::vector<uint64_t> neighbors;
       SIMDFilter::filter_edges(snap, lid, -999999.0f, neighbors);
       return neighbors;
