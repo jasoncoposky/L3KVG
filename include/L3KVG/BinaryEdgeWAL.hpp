@@ -89,6 +89,7 @@ private:
     int fd_{-1};
     mutable std::mutex write_mutex_;
     std::vector<char> buffer_;
+    size_t buffer_len_{0};
 };
 
 } // namespace l3kvg

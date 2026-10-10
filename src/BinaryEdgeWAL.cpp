@@ -41,6 +41,8 @@ BinaryEdgeWAL::BinaryEdgeWAL(const std::string& path)
     if (fd_ < 0) {
         throw std::runtime_error("Failed to open WAL file " + path_ + ": " + std::string(std::strerror(errno)));
     }
+    buffer_.resize(65536);
+    buffer_len_ = 0;
 }
 
 BinaryEdgeWAL::~BinaryEdgeWAL() {
@@ -56,6 +58,8 @@ BinaryEdgeWAL::BinaryEdgeWAL(BinaryEdgeWAL&& other) noexcept {
     path_ = std::move(other.path_);
     fd_ = other.fd_;
     buffer_ = std::move(other.buffer_);
+    buffer_len_ = other.buffer_len_;
+    other.buffer_len_ = 0;
     other.fd_ = -1;
 }
 
@@ -66,6 +70,8 @@ BinaryEdgeWAL& BinaryEdgeWAL::operator=(BinaryEdgeWAL&& other) noexcept {
         path_ = std::move(other.path_);
         fd_ = other.fd_;
         buffer_ = std::move(other.buffer_);
+        buffer_len_ = other.buffer_len_;
+        other.buffer_len_ = 0;
         other.fd_ = -1;
     }
     return *this;
@@ -95,9 +101,9 @@ void BinaryEdgeWAL::write_all_unlocked(const char* data, size_t total_bytes) {
 
 void BinaryEdgeWAL::flush_unlocked() {
     if (fd_ >= 0) {
-        if (!buffer_.empty()) {
-            write_all_unlocked(buffer_.data(), buffer_.size());
-            buffer_.clear();
+        if (buffer_len_ > 0) {
+            write_all_unlocked(buffer_.data(), buffer_len_);
+            buffer_len_ = 0;
         }
 #if defined(__linux__)
         if (::fdatasync(fd_) != 0) {
@@ -117,10 +123,10 @@ void BinaryEdgeWAL::flush_unlocked() {
 
 void BinaryEdgeWAL::close_unlocked() {
     if (fd_ >= 0) {
-        if (!buffer_.empty()) {
+        if (buffer_len_ > 0) {
             try {
-                write_all_unlocked(buffer_.data(), buffer_.size());
-                buffer_.clear();
+                write_all_unlocked(buffer_.data(), buffer_len_);
+                buffer_len_ = 0;
             } catch (...) {}
         }
 #if defined(__linux__)
@@ -140,12 +146,12 @@ void BinaryEdgeWAL::append(const EdgeMutationOp& op) {
     if (fd_ < 0) {
         throw std::runtime_error("Cannot append: WAL is closed");
     }
-    const char* ptr = reinterpret_cast<const char*>(&op);
-    if (buffer_.size() + sizeof(EdgeMutationOp) > 65536) {
-        write_all_unlocked(buffer_.data(), buffer_.size());
-        buffer_.clear();
+    if (buffer_len_ + sizeof(EdgeMutationOp) > 65536) {
+        write_all_unlocked(buffer_.data(), buffer_len_);
+        buffer_len_ = 0;
     }
-    buffer_.insert(buffer_.end(), ptr, ptr + sizeof(EdgeMutationOp));
+    std::memcpy(buffer_.data() + buffer_len_, &op, sizeof(EdgeMutationOp));
+    buffer_len_ += sizeof(EdgeMutationOp);
 }
 
 void BinaryEdgeWAL::append_batch(std::span<const EdgeMutationOp> ops) {
@@ -159,17 +165,18 @@ void BinaryEdgeWAL::append_batch(std::span<const EdgeMutationOp> ops) {
     const char* ptr = reinterpret_cast<const char*>(ops.data());
     size_t total_bytes = ops.size_bytes();
     if (total_bytes >= 65536) {
-        if (!buffer_.empty()) {
-            write_all_unlocked(buffer_.data(), buffer_.size());
-            buffer_.clear();
+        if (buffer_len_ > 0) {
+            write_all_unlocked(buffer_.data(), buffer_len_);
+            buffer_len_ = 0;
         }
         write_all_unlocked(ptr, total_bytes);
     } else {
-        if (buffer_.size() + total_bytes > 65536) {
-            write_all_unlocked(buffer_.data(), buffer_.size());
-            buffer_.clear();
+        if (buffer_len_ + total_bytes > 65536) {
+            write_all_unlocked(buffer_.data(), buffer_len_);
+            buffer_len_ = 0;
         }
-        buffer_.insert(buffer_.end(), ptr, ptr + total_bytes);
+        std::memcpy(buffer_.data() + buffer_len_, ptr, total_bytes);
+        buffer_len_ += total_bytes;
     }
 }
 

@@ -230,10 +230,9 @@ public:
             }
             size_++;
             auto& page = chunks_[chunk_idx][id % CHUNK_SIZE];
-            page.count = 0;
-            page.next_page_id = 0;
-            page.version = 0;
-            page.reserved = 0;
+            uint64_t* h = reinterpret_cast<uint64_t*>(&page);
+            h[0] = 0;
+            h[1] = 0;
             return id;
         }
 

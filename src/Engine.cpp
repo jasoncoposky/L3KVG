@@ -113,6 +113,9 @@ size_t Engine::get_cache_shard(uint64_t id) {
 }
 
 void Engine::invalidate_node_cache(uint64_t id) {
+    if (!has_cached_nodes_.load(std::memory_order_relaxed)) {
+        return;
+    }
     size_t h = get_cache_shard(id);
     auto& shard = *cache_shards_[h];
     if (shard.count.load(std::memory_order_relaxed) == 0) {
@@ -163,6 +166,7 @@ const std::shared_ptr<Node>& Engine::get_node(uint64_t id) {
   auto node = std::make_shared<Node>(this, id);
   shard.map[id] = {node, shard.lru.begin()};
   shard.count.store(shard.map.size(), std::memory_order_relaxed);
+  has_cached_nodes_.store(true, std::memory_order_relaxed);
   metrics_.cache_misses.fetch_add(1, std::memory_order_relaxed);
   tl_epoch = curr_epoch;
   tl_last_id = id;
@@ -489,9 +493,9 @@ std::string Engine::format_weight(double weight) {
   return std::string(KeyBuilder::format_weight(weight));
 }
 
-void Engine::add_edge(uint64_t src_id, std::string label,
+void Engine::add_edge(uint64_t src_id, std::string_view label,
                       double weight, uint64_t dst_id,
-                      std::string payload) {
+                      std::string_view payload) {
   uint16_t lid = label_registry_.get_or_register(label);
   auto hlc_ts = hlc_.now();
   if (edge_wal_) {
@@ -499,22 +503,24 @@ void Engine::add_edge(uint64_t src_id, std::string label,
       edge_wal_->append(op);
   }
   adjacency_store_.add_edge(src_id, dst_id, lid, static_cast<float>(weight), PackedEdge::FLAG_ACTIVE, 0, static_cast<uint32_t>(hlc_ts.logical));
-  if (!payload.empty() || resolver_.get_node_owner(src_id) != resolver_.get_local_node_id() || resolver_.get_node_owner(dst_id) != resolver_.get_local_node_id() || resolver_.has_remote_clusters()) {
-      edge_coordinator_->atomic_put_edge(src_id, std::move(label), weight, dst_id, std::move(payload)).get();
+  if (__builtin_expect(!payload.empty() || !resolver_.is_local(src_id) || !resolver_.is_local(dst_id) || resolver_.has_remote_clusters(), 0)) {
+      edge_coordinator_->atomic_put_edge(src_id, std::string(label), weight, dst_id, std::string(payload)).get();
   }
   
   // Cache Invalidation
-  invalidate_node_cache(src_id);
-  invalidate_node_cache(dst_id);
+  if (has_cached_nodes_.load(std::memory_order_relaxed)) {
+      invalidate_node_cache(src_id);
+      invalidate_node_cache(dst_id);
+  }
 }
 
-void Engine::add_edge(std::string_view src_uuid, std::string label,
+void Engine::add_edge(std::string_view src_uuid, std::string_view label,
                       double weight, std::string_view dst_uuid,
-                      std::string payload) {
-    add_edge(resolver_.parse_uuid(src_uuid), std::move(label), weight, resolver_.parse_uuid(dst_uuid), std::move(payload));
+                      std::string_view payload) {
+    add_edge(resolver_.parse_uuid(src_uuid), label, weight, resolver_.parse_uuid(dst_uuid), payload);
 }
 
-void Engine::del_edge(uint64_t src_id, std::string label,
+void Engine::del_edge(uint64_t src_id, std::string_view label,
                       double weight, uint64_t dst_id) {
   uint16_t lid = label_registry_.get_or_register(label);
   auto hlc_ts = hlc_.now();
@@ -523,11 +529,13 @@ void Engine::del_edge(uint64_t src_id, std::string label,
       edge_wal_->append(op);
   }
   adjacency_store_.del_edge(src_id, dst_id, lid, static_cast<float>(weight));
-  edge_coordinator_->atomic_del_edge(src_id, std::move(label), weight, dst_id).get();
+  edge_coordinator_->atomic_del_edge(src_id, std::string(label), weight, dst_id).get();
 
   // Cache Invalidation
-  invalidate_node_cache(src_id);
-  invalidate_node_cache(dst_id);
+  if (has_cached_nodes_.load(std::memory_order_relaxed)) {
+      invalidate_node_cache(src_id);
+      invalidate_node_cache(dst_id);
+  }
 }
 
 bool Engine::apply_batch(const lite3cpp::Buffer& buffer, uint32_t principal_id) {

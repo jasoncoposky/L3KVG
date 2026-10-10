@@ -72,14 +72,14 @@ public:
 
   static std::string format_weight(double weight);
 
-  void add_edge(uint64_t src_id, std::string label,
+  void add_edge(uint64_t src_id, std::string_view label,
                 double weight, uint64_t dst_id, 
-                std::string payload = "");
-  void add_edge(std::string_view src_uuid, std::string label,
+                std::string_view payload = "");
+  void add_edge(std::string_view src_uuid, std::string_view label,
                 double weight, std::string_view dst_uuid,
-                std::string payload = "");
+                std::string_view payload = "");
 
-  void del_edge(uint64_t src_id, std::string label,
+  void del_edge(uint64_t src_id, std::string_view label,
                 double weight, uint64_t dst_id);
 
   bool apply_batch(const lite3cpp::Buffer& buffer, uint32_t principal_id = l3kv::INTERNAL_UID);
@@ -143,6 +143,7 @@ private:
   
   std::vector<std::unique_ptr<CacheShard>> cache_shards_;
   std::atomic<uint64_t> cache_epoch_{1};
+  std::atomic<bool> has_cached_nodes_{false};
   
   HLCProvider hlc_;
   SREMetrics metrics_;
