@@ -203,3 +203,7 @@ target_link_libraries(bench_engine_core PRIVATE l3kvg_engine Threads::Threads)
 
 add_executable(bench_unified tests/bench_unified.cpp)
 target_link_libraries(bench_unified PRIVATE l3kvg_engine Threads::Threads $<$<BOOL:${WIN32}>:ws2_32> $<$<BOOL:${WIN32}>:wsock32> $<$<BOOL:${WIN32}>:crypt32>)
+
+add_executable(bench_bifurcated_substrate tests/bench_bifurcated_substrate.cpp)
+target_link_libraries(bench_bifurcated_substrate PRIVATE l3kvg_engine Threads::Threads)
+

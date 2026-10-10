@@ -1,10 +1,15 @@
 #include "L3KVG/AdjacencyStore.hpp"
+#include "L3KVG/SIMDFilter.hpp"
 #include <algorithm>
 #include <cmath>
 
 namespace l3kvg {
 
-AdjacencyStore::AdjacencyStore() = default;
+AdjacencyStore::AdjacencyStore() {
+    for (auto& shard : shards_) {
+        shard.directory.reserve(4096);
+    }
+}
 
 void AdjacencyStore::add_edge(uint64_t src_id, uint64_t dst_id, uint16_t label_id,
                               float weight, uint16_t flags,
@@ -293,6 +298,41 @@ std::vector<PackedEdge> AdjacencyStore::get_outgoing_edges_snapshot(uint64_t src
         curr_id = page.next_page_id;
     }
     return result;
+}
+
+void AdjacencyStore::filter_outgoing_edges(uint64_t src_id, uint16_t target_label, float min_weight, std::vector<uint64_t>& out_neighbors) const {
+    size_t s_idx = shard_index(src_id);
+    const auto& shard = shards_[s_idx];
+    std::shared_lock lock(shard.mutex);
+    auto it = shard.directory.find(src_id);
+    if (it == shard.directory.end()) return;
+    const auto& v = it->second;
+    if (v.is_inlined()) {
+        if (v.inline_edge.is_active()) {
+            if ((target_label == 0 || v.inline_edge.label_id == target_label) && (v.inline_edge.weight >= min_weight)) {
+                out_neighbors.push_back(v.inline_edge.target_id);
+            }
+        }
+        return;
+    }
+    if (!v.is_promoted()) return;
+    uint32_t curr_id = v.ext.out_block_id;
+    while (curr_id != 0) {
+        uint32_t p_shard = decode_shard_index(curr_id);
+        uint32_t p_local = decode_local_page_id(curr_id);
+        if (p_shard != s_idx || p_local >= shard.page_pool.size()) break;
+        const auto& page = shard.page_pool[p_local];
+        if (page.next_page_id == curr_id) break; // cycle guard
+        if (page.count == 1) {
+            const auto& e = page.edges[0];
+            if (e.is_active() && (target_label == 0 || e.label_id == target_label) && (e.weight >= min_weight)) {
+                out_neighbors.push_back(e.target_id);
+            }
+        } else {
+            SIMDFilter::filter_edges(std::span<const PackedEdge>(page.edges, page.count), target_label, min_weight, out_neighbors);
+        }
+        curr_id = page.next_page_id;
+    }
 }
 
 std::vector<PackedEdge> AdjacencyStore::get_incoming_edges_snapshot(uint64_t dst_id) const {

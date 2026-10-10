@@ -88,6 +88,7 @@ private:
     std::string path_;
     int fd_{-1};
     mutable std::mutex write_mutex_;
+    std::vector<char> buffer_;
 };
 
 } // namespace l3kvg

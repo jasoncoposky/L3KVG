@@ -55,6 +55,7 @@ BinaryEdgeWAL::BinaryEdgeWAL(BinaryEdgeWAL&& other) noexcept {
     std::lock_guard<std::mutex> lock(other.write_mutex_);
     path_ = std::move(other.path_);
     fd_ = other.fd_;
+    buffer_ = std::move(other.buffer_);
     other.fd_ = -1;
 }
 
@@ -64,6 +65,7 @@ BinaryEdgeWAL& BinaryEdgeWAL::operator=(BinaryEdgeWAL&& other) noexcept {
         close_unlocked();
         path_ = std::move(other.path_);
         fd_ = other.fd_;
+        buffer_ = std::move(other.buffer_);
         other.fd_ = -1;
     }
     return *this;
@@ -93,6 +95,10 @@ void BinaryEdgeWAL::write_all_unlocked(const char* data, size_t total_bytes) {
 
 void BinaryEdgeWAL::flush_unlocked() {
     if (fd_ >= 0) {
+        if (!buffer_.empty()) {
+            write_all_unlocked(buffer_.data(), buffer_.size());
+            buffer_.clear();
+        }
 #if defined(__linux__)
         if (::fdatasync(fd_) != 0) {
             throw std::runtime_error("fdatasync failed: " + std::string(std::strerror(errno)));
@@ -111,6 +117,12 @@ void BinaryEdgeWAL::flush_unlocked() {
 
 void BinaryEdgeWAL::close_unlocked() {
     if (fd_ >= 0) {
+        if (!buffer_.empty()) {
+            try {
+                write_all_unlocked(buffer_.data(), buffer_.size());
+                buffer_.clear();
+            } catch (...) {}
+        }
 #if defined(__linux__)
         ::fdatasync(fd_);
 #elif defined(_WIN32)
@@ -128,7 +140,12 @@ void BinaryEdgeWAL::append(const EdgeMutationOp& op) {
     if (fd_ < 0) {
         throw std::runtime_error("Cannot append: WAL is closed");
     }
-    write_all_unlocked(reinterpret_cast<const char*>(&op), sizeof(EdgeMutationOp));
+    const char* ptr = reinterpret_cast<const char*>(&op);
+    if (buffer_.size() + sizeof(EdgeMutationOp) > 65536) {
+        write_all_unlocked(buffer_.data(), buffer_.size());
+        buffer_.clear();
+    }
+    buffer_.insert(buffer_.end(), ptr, ptr + sizeof(EdgeMutationOp));
 }
 
 void BinaryEdgeWAL::append_batch(std::span<const EdgeMutationOp> ops) {
@@ -139,7 +156,21 @@ void BinaryEdgeWAL::append_batch(std::span<const EdgeMutationOp> ops) {
     if (fd_ < 0) {
         throw std::runtime_error("Cannot append batch: WAL is closed");
     }
-    write_all_unlocked(reinterpret_cast<const char*>(ops.data()), ops.size_bytes());
+    const char* ptr = reinterpret_cast<const char*>(ops.data());
+    size_t total_bytes = ops.size_bytes();
+    if (total_bytes >= 65536) {
+        if (!buffer_.empty()) {
+            write_all_unlocked(buffer_.data(), buffer_.size());
+            buffer_.clear();
+        }
+        write_all_unlocked(ptr, total_bytes);
+    } else {
+        if (buffer_.size() + total_bytes > 65536) {
+            write_all_unlocked(buffer_.data(), buffer_.size());
+            buffer_.clear();
+        }
+        buffer_.insert(buffer_.end(), ptr, ptr + total_bytes);
+    }
 }
 
 void BinaryEdgeWAL::flush() {
@@ -162,6 +193,11 @@ bool BinaryEdgeWAL::is_open() const noexcept {
 
 size_t BinaryEdgeWAL::recover(AdjacencyStore& store) {
     std::lock_guard<std::mutex> lock(write_mutex_);
+
+    if (fd_ >= 0 && !buffer_.empty()) {
+        write_all_unlocked(buffer_.data(), buffer_.size());
+        buffer_.clear();
+    }
 
     int read_fd = fd_;
     bool close_read_fd = false;
@@ -239,7 +275,7 @@ size_t BinaryEdgeWAL::recover(AdjacencyStore& store) {
         for (size_t i = 0; i < full_records; ++i) {
             const auto& op = ops[i];
             if (op.is_delete()) {
-                store.del_edge(op.src_id, op.dst_id, op.label_id, op.weight);
+                store.del_edge(op.src_id, op.dst_id, op.label_id, op.weight <= 0.0f ? -1.0f : op.weight);
             } else {
                 store.add_edge(op.src_id, op.dst_id, op.label_id, op.weight, op.flags, 0, static_cast<uint32_t>(op.hlc_timestamp));
             }

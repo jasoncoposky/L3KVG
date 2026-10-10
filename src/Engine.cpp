@@ -115,24 +115,43 @@ size_t Engine::get_cache_shard(uint64_t id) {
 void Engine::invalidate_node_cache(uint64_t id) {
     size_t h = get_cache_shard(id);
     auto& shard = *cache_shards_[h];
+    if (shard.count.load(std::memory_order_relaxed) == 0) {
+        return;
+    }
+    cache_epoch_.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard<std::mutex> lock(shard.mutex);
     if (auto it = shard.map.find(id); it != shard.map.end()) {
         shard.lru.erase(it->second.lru_it);
         shard.map.erase(it);
+        shard.count.store(shard.map.size(), std::memory_order_relaxed);
     }
 }
 
 Query Engine::query() { return Query(this); }
 
-std::shared_ptr<Node> Engine::get_node(uint64_t id) {
+const std::shared_ptr<Node>& Engine::get_node(uint64_t id) {
+  thread_local uint64_t tl_epoch = 0;
+  thread_local uint64_t tl_last_id = UINT64_MAX;
+  thread_local std::shared_ptr<Node> tl_last_node;
+
+  uint64_t curr_epoch = cache_epoch_.load(std::memory_order_relaxed);
+  if (tl_last_node && tl_last_id == id && tl_epoch == curr_epoch) {
+      return tl_last_node;
+  }
+
   size_t h = get_cache_shard(id);
   auto& shard = *cache_shards_[h];
 
   std::lock_guard<std::mutex> lock(shard.mutex);
   if (auto it = shard.map.find(id); it != shard.map.end()) {
     // O(1) zero-allocation LRU update
-    shard.lru.splice(shard.lru.begin(), shard.lru, it->second.lru_it);
-    return it->second.node;
+    if (shard.lru.begin() != it->second.lru_it) {
+        shard.lru.splice(shard.lru.begin(), shard.lru, it->second.lru_it);
+    }
+    tl_epoch = curr_epoch;
+    tl_last_id = id;
+    tl_last_node = it->second.node;
+    return tl_last_node;
   }
 
   if (shard.map.size() >= settings_.node_cache_size_per_shard && !shard.lru.empty()) {
@@ -143,11 +162,15 @@ std::shared_ptr<Node> Engine::get_node(uint64_t id) {
   shard.lru.push_front(id);
   auto node = std::make_shared<Node>(this, id);
   shard.map[id] = {node, shard.lru.begin()};
+  shard.count.store(shard.map.size(), std::memory_order_relaxed);
   metrics_.cache_misses.fetch_add(1, std::memory_order_relaxed);
-  return node;
+  tl_epoch = curr_epoch;
+  tl_last_id = id;
+  tl_last_node = node;
+  return tl_last_node;
 }
 
-std::shared_ptr<Node> Engine::get_node(std::string_view uuid) {
+const std::shared_ptr<Node>& Engine::get_node(std::string_view uuid) {
     return get_node(resolver_.parse_uuid(uuid));
 }
 
@@ -158,7 +181,9 @@ void Engine::swizzle_node(uint64_t id, std::shared_ptr<Node> ptr) {
   std::lock_guard<std::mutex> lock(shard.mutex);
   if (auto it = shard.map.find(id); it != shard.map.end()) {
       it->second.node = ptr;
-      shard.lru.splice(shard.lru.begin(), shard.lru, it->second.lru_it);
+      if (shard.lru.begin() != it->second.lru_it) {
+          shard.lru.splice(shard.lru.begin(), shard.lru, it->second.lru_it);
+      }
       metrics_.cache_hits.fetch_add(1, std::memory_order_relaxed);
   } else {
       if (shard.map.size() >= settings_.node_cache_size_per_shard && !shard.lru.empty()) {
@@ -168,6 +193,7 @@ void Engine::swizzle_node(uint64_t id, std::shared_ptr<Node> ptr) {
       }
       shard.lru.push_front(id);
       shard.map[id] = {ptr, shard.lru.begin()};
+      shard.count.store(shard.map.size(), std::memory_order_relaxed);
   }
 }
 
@@ -473,7 +499,9 @@ void Engine::add_edge(uint64_t src_id, std::string label,
       edge_wal_->append(op);
   }
   adjacency_store_.add_edge(src_id, dst_id, lid, static_cast<float>(weight), PackedEdge::FLAG_ACTIVE, 0, static_cast<uint32_t>(hlc_ts.logical));
-  edge_coordinator_->atomic_put_edge(src_id, std::move(label), weight, dst_id, std::move(payload)).get();
+  if (!payload.empty() || resolver_.get_node_owner(src_id) != resolver_.get_local_node_id() || resolver_.get_node_owner(dst_id) != resolver_.get_local_node_id() || resolver_.has_remote_clusters()) {
+      edge_coordinator_->atomic_put_edge(src_id, std::move(label), weight, dst_id, std::move(payload)).get();
+  }
   
   // Cache Invalidation
   invalidate_node_cache(src_id);

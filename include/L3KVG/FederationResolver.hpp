@@ -6,6 +6,7 @@
 #include <vector>
 #include <unordered_map>
 #include <shared_mutex>
+#include <atomic>
 #include <lite3/ring.hpp>
 #include <cstdint>
 
@@ -32,6 +33,7 @@ public:
   [[nodiscard]] bool is_local_cluster(uint16_t cluster_id) const noexcept;
   [[nodiscard]] uint16_t get_local_cluster_id() const noexcept { return local_cluster_id_; }
   [[nodiscard]] std::vector<uint16_t> get_remote_cluster_ids() const;
+  [[nodiscard]] bool has_remote_clusters() const noexcept { return has_remote_clusters_.load(std::memory_order_relaxed); }
   [[nodiscard]] std::vector<lite3::NodeID> get_all_node_ids() const;
   [[nodiscard]] std::shared_ptr<const std::vector<std::string>> get_federation_endpoints(uint16_t cluster_id) const noexcept;
 
@@ -50,6 +52,7 @@ private:
   std::shared_ptr<lite3::ConsistentHash> ring_;
   lite3::NodeID local_node_id_;
   uint16_t local_cluster_id_ = 0;
+  std::atomic<bool> has_remote_clusters_{false};
   std::unordered_map<uint16_t, ClusterInfo> federation_map_;
   std::unordered_map<std::string, uint16_t> cluster_name_to_id_;
 };

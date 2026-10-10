@@ -122,17 +122,26 @@ std::vector<uint64_t> Node::get_neighbors(std::string_view label,
   uint16_t lid = 0;
   if (!label.empty()) {
       lid = engine_->get_label_registry().lookup(label);
-      if (lid == 0) {
-          // Label is not registered in this database, cannot match any edges
-          return {};
-      }
   }
 
-  auto snap = engine_->get_adjacency_store().get_outgoing_edges_snapshot(id_);
-  if (!snap.empty()) {
-      std::vector<uint64_t> neighbors;
-      SIMDFilter::filter_edges(snap, lid, static_cast<float>(min_weight), neighbors);
-      return neighbors;
+  uint64_t curr_epoch = engine_->get_cache_epoch();
+  if (lid != 0 && neighbor_cache_.valid && neighbor_cache_.epoch == curr_epoch &&
+      neighbor_cache_.label_id == lid && neighbor_cache_.min_weight == min_weight) {
+      return neighbor_cache_.neighbors;
+  }
+
+  std::vector<uint64_t> neighbors;
+  if (lid != 0) {
+      neighbors.reserve(1);
+      engine_->get_adjacency_store().filter_outgoing_edges(id_, lid, static_cast<float>(min_weight), neighbors);
+      if (!neighbors.empty() || engine_->get_adjacency_store().get_out_degree(id_) > 0) {
+          neighbor_cache_.epoch = curr_epoch;
+          neighbor_cache_.label_id = lid;
+          neighbor_cache_.min_weight = min_weight;
+          neighbor_cache_.neighbors = neighbors;
+          neighbor_cache_.valid = true;
+          return neighbors;
+      }
   }
 
   if (!might_have_edge(label)) {
@@ -140,7 +149,7 @@ std::vector<uint64_t> Node::get_neighbors(std::string_view label,
     return {};
   }
 
-  std::vector<uint64_t> neighbors;
+  neighbors.clear();
   std::string_view prefix = KeyBuilder::edge_prefix(id_, label);
   std::string_view min_w_str = KeyBuilder::format_weight(min_weight);
   
@@ -182,6 +191,11 @@ std::vector<uint64_t> Node::get_neighbors(std::string_view label,
   L3_LOG(0, "Node::get_neighbors() node=%016llx total local neighbors=%zu", 
          (unsigned long long)id_, neighbors.size());
   if (!neighbors.empty()) {
+    neighbor_cache_.epoch = curr_epoch;
+    neighbor_cache_.label_id = lid;
+    neighbor_cache_.min_weight = min_weight;
+    neighbor_cache_.neighbors = neighbors;
+    neighbor_cache_.valid = true;
     return neighbors;
   }
 

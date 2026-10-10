@@ -12,8 +12,11 @@ FederationResolver::FederationResolver(std::shared_ptr<lite3::ConsistentHash> ri
     : ring_(std::move(ring)), local_node_id_(local_node_id) {}
 
 lite3::NodeID FederationResolver::get_node_owner(uint64_t vertex_id) const {
-  std::shared_lock lock(mutex_);
   uint16_t cluster_id = FederationID::get_cluster(vertex_id);
+  if (cluster_id == 0 && (!ring_ || ring_->size() == 0)) {
+      return local_node_id_;
+  }
+  std::shared_lock lock(mutex_);
   if (cluster_id != 0 && cluster_id != local_cluster_id_) {
       return cluster_id; // Remote cluster owner
   }
@@ -21,13 +24,19 @@ lite3::NodeID FederationResolver::get_node_owner(uint64_t vertex_id) const {
 }
 
 lite3::NodeID FederationResolver::get_local_shard_owner(uint64_t vertex_id) const {
+  if (!ring_ || ring_->size() == 0) {
+      return local_node_id_;
+  }
   std::shared_lock lock(mutex_);
   return get_node_owner_impl(vertex_id);
 }
 
 bool FederationResolver::is_local(uint64_t vertex_id) const {
-  std::shared_lock lock(mutex_);
   uint16_t cluster_id = FederationID::get_cluster(vertex_id);
+  if (cluster_id == 0 && (!ring_ || ring_->size() == 0)) {
+      return true;
+  }
+  std::shared_lock lock(mutex_);
   if (cluster_id != 0 && cluster_id != local_cluster_id_) {
       return false;
   }
@@ -52,6 +61,9 @@ void FederationResolver::register_federation(std::string name, uint16_t id, std:
     std::unique_lock lock(mutex_);
     cluster_name_to_id_[name] = id;
     federation_map_[id] = {std::move(name), std::make_shared<const std::vector<std::string>>(std::move(endpoints))};
+    if (id != local_cluster_id_) {
+        has_remote_clusters_.store(true, std::memory_order_relaxed);
+    }
 }
 
 bool FederationResolver::is_local_cluster(uint16_t cluster_id) const noexcept {

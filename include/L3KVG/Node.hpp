@@ -65,6 +65,15 @@ private:
   std::atomic<bool> loaded_{false};
   std::mutex loading_mutex_;
   uint64_t bloom_filter_{0};
+
+  struct NeighborCache {
+      uint64_t epoch{UINT64_MAX};
+      double min_weight{0.0};
+      uint16_t label_id{0};
+      bool valid{false};
+      std::vector<uint64_t> neighbors;
+  };
+  mutable NeighborCache neighbor_cache_;
 };
 
 template <typename T> T Node::get_attribute(std::string_view key) {

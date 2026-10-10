@@ -53,8 +53,8 @@ public:
 
   Query query();
 
-  std::shared_ptr<Node> get_node(uint64_t id);
-  std::shared_ptr<Node> get_node(std::string_view uuid);
+  const std::shared_ptr<Node>& get_node(uint64_t id);
+  const std::shared_ptr<Node>& get_node(std::string_view uuid);
   
   std::vector<std::shared_ptr<Node>> fetch_nodes(const std::vector<uint64_t>& ids, uint32_t principal_id = l3kv::INTERNAL_UID);
   std::vector<std::shared_ptr<Node>> get_nodes_by_prefix(const std::string& prefix, uint32_t principal_id = l3kv::INTERNAL_UID);
@@ -111,6 +111,7 @@ public:
   const LabelRegistry& get_label_registry() const { return label_registry_; }
   BinaryEdgeWAL* get_edge_wal() { return edge_wal_.get(); }
   const BinaryEdgeWAL* get_edge_wal() const { return edge_wal_.get(); }
+  [[nodiscard]] uint64_t get_cache_epoch() const noexcept { return cache_epoch_.load(std::memory_order_relaxed); }
 
 private:
   struct CacheShard {
@@ -122,6 +123,7 @@ private:
     };
     std::unordered_map<uint64_t, CacheEntry> map;
     LruList lru;
+    std::atomic<size_t> count{0};
   };
 
   size_t get_cache_shard(uint64_t id);
@@ -140,6 +142,7 @@ private:
   Settings settings_;
   
   std::vector<std::unique_ptr<CacheShard>> cache_shards_;
+  std::atomic<uint64_t> cache_epoch_{1};
   
   HLCProvider hlc_;
   SREMetrics metrics_;

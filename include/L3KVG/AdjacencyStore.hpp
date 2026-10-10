@@ -9,8 +9,11 @@
 #include <array>
 #include <type_traits>
 #include <functional>
+#include <memory>
+#include <sys/mman.h>
 #include "L3KVG/PackedEdge.hpp"
 #include "L3KVG/LabelRegistry.hpp"
+#include "L3KVG/SharedSpinLock.hpp"
 
 namespace l3kvg {
 
@@ -59,6 +62,8 @@ struct alignas(64) AdjacencyPage {
     uint32_t version{0};
     uint32_t reserved{0};
     PackedEdge edges[CAPACITY];
+
+    AdjacencyPage() noexcept : count(0), next_page_id(0), version(0), reserved(0) {}
 };
 static_assert(sizeof(AdjacencyPage) == 4096, "AdjacencyPage must be exactly 4096 bytes");
 static_assert(alignof(AdjacencyPage) == 64, "AdjacencyPage must be 64-byte aligned");
@@ -155,6 +160,7 @@ public:
 
     [[nodiscard]] std::vector<PackedEdge> get_outgoing_edges_snapshot(uint64_t src_id) const;
     [[nodiscard]] std::vector<PackedEdge> get_incoming_edges_snapshot(uint64_t dst_id) const;
+    void filter_outgoing_edges(uint64_t src_id, uint16_t target_label, float min_weight, std::vector<uint64_t>& out_neighbors) const;
 
     /**
      * @brief Note: get_outgoing_edges returns a span of the first block only.
@@ -177,16 +183,96 @@ public:
     [[nodiscard]] uint32_t get_out_page_id(uint64_t src_id) const noexcept;
     [[nodiscard]] const AdjacencyPage* get_page(uint32_t page_id) const noexcept;
 
-private:
+    class PagePool {
+    public:
+        static constexpr size_t CHUNK_SIZE = 1024; // 1024 pages * 4KB = 4MB chunk
+
+        PagePool() {
+            allocate_page(); // Reserve index 0 as null page
+        }
+
+        ~PagePool() {
+            for (auto* chunk : chunks_) {
+                ::munmap(chunk, sizeof(AdjacencyPage) * CHUNK_SIZE);
+            }
+        }
+
+        PagePool(const PagePool&) = delete;
+        PagePool& operator=(const PagePool&) = delete;
+
+        PagePool(PagePool&& o) noexcept : chunks_(std::move(o.chunks_)), size_(o.size_) {
+            o.size_ = 0;
+        }
+
+        PagePool& operator=(PagePool&& o) noexcept {
+            if (this != &o) {
+                for (auto* chunk : chunks_) {
+                    ::munmap(chunk, sizeof(AdjacencyPage) * CHUNK_SIZE);
+                }
+                chunks_ = std::move(o.chunks_);
+                size_ = o.size_;
+                o.size_ = 0;
+            }
+            return *this;
+        }
+
+        uint32_t allocate_page() {
+            uint32_t id = static_cast<uint32_t>(size_);
+            size_t chunk_idx = id / CHUNK_SIZE;
+            if (chunk_idx >= chunks_.size()) {
+                void* ptr = ::mmap(nullptr, sizeof(AdjacencyPage) * CHUNK_SIZE,
+                                   PROT_READ | PROT_WRITE,
+                                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
+                if (ptr == MAP_FAILED) {
+                    throw std::bad_alloc();
+                }
+                chunks_.push_back(static_cast<AdjacencyPage*>(ptr));
+            }
+            size_++;
+            auto& page = chunks_[chunk_idx][id % CHUNK_SIZE];
+            page.count = 0;
+            page.next_page_id = 0;
+            page.version = 0;
+            page.reserved = 0;
+            return id;
+        }
+
+        void emplace_back() {
+            allocate_page();
+        }
+
+        [[nodiscard]] size_t size() const noexcept {
+            return size_;
+        }
+
+        [[nodiscard]] AdjacencyPage& operator[](size_t index) noexcept {
+            return chunks_[index / CHUNK_SIZE][index % CHUNK_SIZE];
+        }
+
+        [[nodiscard]] const AdjacencyPage& operator[](size_t index) const noexcept {
+            return chunks_[index / CHUNK_SIZE][index % CHUNK_SIZE];
+        }
+
+        [[nodiscard]] AdjacencyPage& back() noexcept {
+            return (*this)[size_ - 1];
+        }
+
+        [[nodiscard]] const AdjacencyPage& back() const noexcept {
+            return (*this)[size_ - 1];
+        }
+
+    private:
+        std::vector<AdjacencyPage*> chunks_;
+        size_t size_{0};
+    };
+
     struct alignas(64) Shard {
-        mutable std::shared_mutex mutex;
+        mutable SharedSpinLock mutex;
         std::unordered_map<uint64_t, VertexRecord> directory;
-        // std::deque guarantees pointer stability on emplace_back!
-        std::deque<AdjacencyPage> page_pool;
+        PagePool page_pool;
 
         Shard() {
-            // Index 0 reserved as null page ID
-            page_pool.emplace_back();
+            directory.reserve(4096);
         }
     };
 
