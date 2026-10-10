@@ -13,6 +13,10 @@ namespace l3kvg {
 class LabelRegistry {
 public:
     LabelRegistry() = default;
+    LabelRegistry(const LabelRegistry&) = delete;
+    LabelRegistry& operator=(const LabelRegistry&) = delete;
+    LabelRegistry(LabelRegistry&&) = delete;
+    LabelRegistry& operator=(LabelRegistry&&) = delete;
 
     uint16_t get_or_register(std::string_view label);
     [[nodiscard]] std::string_view get_label(uint16_t id) const noexcept;
@@ -20,7 +24,7 @@ public:
 
 private:
     mutable std::shared_mutex mutex_;
-    std::unordered_map<std::string, uint16_t> label_to_id_;
+    std::unordered_map<std::string_view, uint16_t> label_to_id_;
     std::deque<std::string> id_to_label_{""}; // 1-indexed (0 reserved for NONE)
 };
 

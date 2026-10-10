@@ -1,4 +1,6 @@
 #include "L3KVG/LabelRegistry.hpp"
+#include <limits>
+#include <stdexcept>
 
 namespace l3kvg {
 
@@ -9,20 +11,24 @@ uint16_t LabelRegistry::get_or_register(std::string_view label) {
 
     {
         std::shared_lock read_lock(mutex_);
-        if (auto it = label_to_id_.find(std::string(label)); it != label_to_id_.end()) {
+        if (auto it = label_to_id_.find(label); it != label_to_id_.end()) {
             return it->second;
         }
     }
 
     std::unique_lock write_lock(mutex_);
-    if (auto it = label_to_id_.find(std::string(label)); it != label_to_id_.end()) {
+    if (auto it = label_to_id_.find(label); it != label_to_id_.end()) {
         return it->second;
     }
 
+    if (id_to_label_.size() > std::numeric_limits<uint16_t>::max()) {
+        throw std::overflow_error("LabelRegistry capacity exceeded (maximum 65535 labels supported)");
+    }
+
     uint16_t new_id = static_cast<uint16_t>(id_to_label_.size());
-    std::string str(label);
-    id_to_label_.push_back(str);
-    label_to_id_[std::move(str)] = new_id;
+    id_to_label_.emplace_back(label);
+    std::string_view stored_view = id_to_label_.back();
+    label_to_id_[stored_view] = new_id;
     return new_id;
 }
 

@@ -3,7 +3,6 @@
 
 namespace l3kvg {
 
-#pragma pack(push, 4)
 struct alignas(8) PackedEdge {
     static constexpr uint16_t FLAG_ACTIVE         = 1 << 0;
     static constexpr uint16_t FLAG_HAS_PROPERTIES = 1 << 1;
@@ -24,14 +23,27 @@ struct alignas(8) PackedEdge {
         return (flags & FLAG_HAS_PROPERTIES) != 0;
     }
 
+    [[nodiscard]] constexpr bool is_directed() const noexcept {
+        return (flags & FLAG_DIRECTED) != 0;
+    }
+
     constexpr void set_active(bool active) noexcept {
         if (active) flags |= FLAG_ACTIVE;
         else flags &= ~FLAG_ACTIVE;
     }
 
+    constexpr void set_directed(bool directed) noexcept {
+        if (directed) flags |= FLAG_DIRECTED;
+        else flags &= ~FLAG_DIRECTED;
+    }
+
+    constexpr void set_has_properties(bool has_props) noexcept {
+        if (has_props) flags |= FLAG_HAS_PROPERTIES;
+        else flags &= ~FLAG_HAS_PROPERTIES;
+    }
+
     bool operator==(const PackedEdge&) const noexcept = default;
 };
-#pragma pack(pop)
 
 static_assert(sizeof(PackedEdge) == 24, "PackedEdge must be exactly 24 bytes");
 static_assert(alignof(PackedEdge) == 8, "PackedEdge must be 8-byte aligned");

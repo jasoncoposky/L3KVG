@@ -6,6 +6,7 @@
 
 TEST(PackedEdgeTest, StructSizeAndAlignment) {
     EXPECT_EQ(sizeof(l3kvg::PackedEdge), 24);
+    EXPECT_EQ(alignof(l3kvg::PackedEdge), 8);
     l3kvg::PackedEdge edge{};
     edge.target_id = 0x123456789ABCDEF0ULL;
     edge.label_id = 42;
@@ -16,8 +17,17 @@ TEST(PackedEdgeTest, StructSizeAndAlignment) {
 
     EXPECT_TRUE(edge.is_active());
     EXPECT_FALSE(edge.has_properties());
-    edge.flags |= l3kvg::PackedEdge::FLAG_HAS_PROPERTIES;
+    EXPECT_TRUE(edge.is_directed());
+
+    edge.set_has_properties(true);
     EXPECT_TRUE(edge.has_properties());
+    edge.set_has_properties(false);
+    EXPECT_FALSE(edge.has_properties());
+
+    edge.set_directed(false);
+    EXPECT_FALSE(edge.is_directed());
+    edge.set_directed(true);
+    EXPECT_TRUE(edge.is_directed());
 
     edge.set_active(false);
     EXPECT_FALSE(edge.is_active());
@@ -25,10 +35,42 @@ TEST(PackedEdgeTest, StructSizeAndAlignment) {
     EXPECT_TRUE(edge.is_active());
 }
 
+TEST(PackedEdgeTest, EqualityOperator) {
+    l3kvg::PackedEdge e1{
+        .target_id = 12345,
+        .label_id = 1,
+        .flags = l3kvg::PackedEdge::FLAG_ACTIVE | l3kvg::PackedEdge::FLAG_DIRECTED,
+        .weight = 2.5f,
+        .prop_index = 42,
+        .hlc_logical = 99
+    };
+    l3kvg::PackedEdge e2 = e1;
+    EXPECT_EQ(e1, e2);
+
+    e2.target_id = 12346;
+    EXPECT_NE(e1, e2);
+    e2 = e1;
+    e2.label_id = 2;
+    EXPECT_NE(e1, e2);
+    e2 = e1;
+    e2.flags = 0;
+    EXPECT_NE(e1, e2);
+    e2 = e1;
+    e2.weight = 3.0f;
+    EXPECT_NE(e1, e2);
+    e2 = e1;
+    e2.prop_index = 43;
+    EXPECT_NE(e1, e2);
+    e2 = e1;
+    e2.hlc_logical = 100;
+    EXPECT_NE(e1, e2);
+}
+
 TEST(LabelRegistryTest, BidirectionalMapping) {
     l3kvg::LabelRegistry registry;
     EXPECT_EQ(registry.size(), 0);
     EXPECT_EQ(registry.get_label(0), "");
+    EXPECT_EQ(registry.get_or_register(""), 0);
 
     uint16_t id_contains = registry.get_or_register("CONTAINS");
     uint16_t id_replica = registry.get_or_register("HAS_REPLICA");
@@ -56,5 +98,5 @@ TEST(LabelRegistryTest, ConcurrentRegistration) {
         });
     }
     for (auto& th : threads) th.join();
-    EXPECT_GE(registry.size(), 100);
+    EXPECT_EQ(registry.size(), 100);
 }
