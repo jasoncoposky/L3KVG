@@ -7,6 +7,7 @@
 #include <iomanip>
 #include <sstream>
 #include <iostream>
+#include <deque>
 
 
 namespace l3kvg {
@@ -425,6 +426,8 @@ bool Engine::apply_batch(const lite3cpp::Buffer& buffer, uint32_t principal_id) 
 
         auto now = store_->get_clock().now();
 
+        std::deque<std::string> string_pool;
+
         auto add_put = [&](const std::string& key, const std::string& val) {
             auto perm = (principal_id == INTERNAL_UID || principal_id == 0) ? l3kv::Permission::ADMIN : store_->credentials().check_permission(principal_id, key);
             if (!(perm & l3kv::Permission::WRITE) && !(perm & l3kv::Permission::ADMIN)) {
@@ -435,11 +438,21 @@ bool Engine::apply_batch(const lite3cpp::Buffer& buffer, uint32_t principal_id) 
             mbuf.set_i64(0, "ts", now.wall_time); mbuf.set_i64(0, "l", now.logical); mbuf.set_i64(0, "n", now.node_id);
             std::string meta_val = mbuf.move_to_string();
 
-            wal_batch.push_back({l3kv::WalOp::PUT, key, val});
-            wal_batch.push_back({l3kv::WalOp::PUT, mkey_s, meta_val});
+            string_pool.push_back(key);
+            std::string_view key_v = string_pool.back();
+            string_pool.push_back(val);
+            std::string_view val_v = string_pool.back();
 
-            shard_works[store_->get_routing_shard(key)].puts.emplace_back(key, val);
-            shard_works[store_->get_routing_shard(mkey_s)].puts.emplace_back(mkey_s, meta_val);
+            string_pool.push_back(std::move(mkey_s));
+            std::string_view mkey_v = string_pool.back();
+            string_pool.push_back(std::move(meta_val));
+            std::string_view mval_v = string_pool.back();
+
+            wal_batch.push_back({l3kv::WalOp::PUT, key_v, val_v});
+            wal_batch.push_back({l3kv::WalOp::PUT, mkey_v, mval_v});
+
+            shard_works[store_->get_routing_shard(key_v)].puts.emplace_back(key_v, val_v);
+            shard_works[store_->get_routing_shard(mkey_v)].puts.emplace_back(mkey_v, mval_v);
         };
 
         auto add_del = [&](const std::string& key) {
@@ -453,11 +466,19 @@ bool Engine::apply_batch(const lite3cpp::Buffer& buffer, uint32_t principal_id) 
             mbuf.set_bool(0, "tombstone", true);
             std::string meta_val = mbuf.move_to_string();
 
-            wal_batch.push_back({l3kv::WalOp::DELETE_, key, ""});
-            wal_batch.push_back({l3kv::WalOp::PUT, mkey_s, meta_val});
+            string_pool.push_back(key);
+            std::string_view key_v = string_pool.back();
 
-            shard_works[store_->get_routing_shard(key)].dels.push_back(key);
-            shard_works[store_->get_routing_shard(mkey_s)].puts.emplace_back(mkey_s, meta_val);
+            string_pool.push_back(std::move(mkey_s));
+            std::string_view mkey_v = string_pool.back();
+            string_pool.push_back(std::move(meta_val));
+            std::string_view mval_v = string_pool.back();
+
+            wal_batch.push_back({l3kv::WalOp::DELETE_, key_v, ""});
+            wal_batch.push_back({l3kv::WalOp::PUT, mkey_v, mval_v});
+
+            shard_works[store_->get_routing_shard(key_v)].dels.push_back(std::string(key_v));
+            shard_works[store_->get_routing_shard(mkey_v)].puts.emplace_back(mkey_v, mval_v);
         };
 
         for (size_t i = 0; i < count; ++i) {
