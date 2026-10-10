@@ -28,6 +28,7 @@ add_library(l3kvg_engine STATIC
     src/ThreadPool.cpp
     src/MutationBatch.cpp
     src/LabelRegistry.cpp
+    src/AdjacencyStore.cpp
 )
 
 target_include_directories(l3kvg_engine PUBLIC
@@ -111,6 +112,10 @@ add_test(NAME test_mutation_batch COMMAND test_mutation_batch)
 add_executable(test_packed_edge tests/test_packed_edge.cpp)
 target_link_libraries(test_packed_edge PRIVATE l3kvg_engine gtest_main Threads::Threads)
 add_test(NAME test_packed_edge COMMAND test_packed_edge)
+
+add_executable(test_adjacency_store tests/test_adjacency_store.cpp)
+target_link_libraries(test_adjacency_store PRIVATE l3kvg_engine gtest_main Threads::Threads)
+add_test(NAME test_adjacency_store COMMAND test_adjacency_store)
 
 add_executable(test_federation_integration tests/test_federation_integration.cpp)
 target_link_libraries(test_federation_integration PRIVATE l3kvg_engine gtest_main Threads::Threads $<$<BOOL:${WIN32}>:ws2_32>)
