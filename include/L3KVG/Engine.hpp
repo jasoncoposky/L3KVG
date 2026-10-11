@@ -130,6 +130,7 @@ private:
   void invalidate_node_cache(uint64_t id);
 
   std::string db_path_;
+  std::string dict_path_;
   LabelRegistry label_registry_;
   AdjacencyStore adjacency_store_;
   std::unique_ptr<BinaryEdgeWAL> edge_wal_;

@@ -22,9 +22,27 @@ Engine::Engine(const std::string &db_path, uint32_t node_id, std::shared_ptr<lit
   std::string store_wal_path = db_path;
   std::string wal_path;
   if (!db_path.empty() && db_path != ":memory:") {
-      std::filesystem::create_directories(db_path);
-      store_wal_path = db_path + "/kv.wal";
-      wal_path = db_path + "/edges.wal";
+      std::error_code ec;
+      if (std::filesystem::is_regular_file(db_path, ec)) {
+          store_wal_path = db_path;
+          wal_path = db_path + ".edges.wal";
+          dict_path_ = db_path + ".labels.dict";
+      } else if (std::filesystem::is_directory(db_path, ec)) {
+          store_wal_path = db_path + "/kv.wal";
+          wal_path = db_path + "/edges.wal";
+          dict_path_ = db_path + "/labels.dict";
+      } else {
+          std::error_code dir_ec;
+          if (std::filesystem::create_directories(db_path, dir_ec) || std::filesystem::is_directory(db_path, dir_ec)) {
+              store_wal_path = db_path + "/kv.wal";
+              wal_path = db_path + "/edges.wal";
+              dict_path_ = db_path + "/labels.dict";
+          } else {
+              store_wal_path = db_path;
+              wal_path = db_path + ".edges.wal";
+              dict_path_ = db_path + ".labels.dict";
+          }
+      }
   }
   store_ = std::make_unique<l3kv::Engine>(store_wal_path, node_id);
   pool_ = std::make_shared<ThreadPool>(thread_pool_size);
@@ -41,10 +59,9 @@ Engine::Engine(const std::string &db_path, uint32_t node_id, std::shared_ptr<lit
     cache_shards_.push_back(std::make_unique<CacheShard>());
   }
 
-  std::string dict_path = db_path.empty() || db_path == ":memory:" ? "" : (db_path + "/labels.dict");
-  if (!dict_path.empty() && std::filesystem::exists(dict_path)) {
+  if (!dict_path_.empty() && std::filesystem::exists(dict_path_)) {
       try {
-          std::ifstream ifs(dict_path);
+          std::ifstream ifs(dict_path_);
           std::string line;
           while (std::getline(ifs, line)) {
               if (!line.empty() && line.back() == '\r') {
@@ -60,7 +77,8 @@ Engine::Engine(const std::string &db_path, uint32_t node_id, std::shared_ptr<lit
 
   if (!wal_path.empty()) {
       try {
-          std::filesystem::create_directories(db_path);
+          std::error_code ec;
+          std::filesystem::create_directories(std::filesystem::path(wal_path).parent_path(), ec);
           edge_wal_ = std::make_unique<BinaryEdgeWAL>(wal_path);
           edge_wal_->recover(adjacency_store_);
       } catch (...) {
@@ -74,10 +92,9 @@ Engine::~Engine() {
       edge_wal_->flush();
       edge_wal_->close();
   }
-  if (!db_path_.empty() && db_path_ != ":memory:") {
+  if (!dict_path_.empty()) {
       try {
-          std::string dict_path = db_path_ + "/labels.dict";
-          std::string tmp_path = dict_path + ".tmp";
+          std::string tmp_path = dict_path_ + ".tmp";
           {
               std::ofstream ofs(tmp_path, std::ios::trunc);
               for (size_t i = 1; i <= label_registry_.size(); ++i) {
@@ -85,7 +102,7 @@ Engine::~Engine() {
               }
               ofs.flush();
           }
-          std::filesystem::rename(tmp_path, dict_path);
+          std::filesystem::rename(tmp_path, dict_path_);
       } catch (...) {
       }
   }
