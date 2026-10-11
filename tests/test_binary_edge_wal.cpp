@@ -543,3 +543,47 @@ TEST(BinaryEdgeWALTest, EmptyWALRecovery) {
     size_t rec = wal.recover(store);
     EXPECT_EQ(rec, 0);
 }
+
+TEST(BinaryEdgeWALTest, RecoveryDoesNotWritePhantomRecordsOrZeroBuffer) {
+    TempWALFile temp_file("test_wal_no_phantom_write.bin");
+
+    {
+        l3kvg::BinaryEdgeWAL wal(temp_file.path());
+        wal.append(l3kvg::EdgeMutationOp{
+            .src_id = 10,
+            .dst_id = 20,
+            .hlc_timestamp = 100,
+            .label_id = 1,
+            .flags = l3kvg::EdgeMutationOp::FLAG_ACTIVE,
+            .weight = 1.0f
+        });
+
+        l3kvg::AdjacencyStore store1;
+        size_t recovered = wal.recover(store1);
+        EXPECT_EQ(recovered, 1);
+        EXPECT_EQ(store1.get_out_degree(10), 1);
+
+        // Verify file size on disk is exactly 32 bytes (1 record), NOT 64KB (65536 bytes)
+        auto file_size = std::filesystem::file_size(temp_file.path());
+        EXPECT_EQ(file_size, sizeof(l3kvg::EdgeMutationOp));
+
+        // Subsequent append must work without heap corruption or buffer capacity issues
+        wal.append(l3kvg::EdgeMutationOp{
+            .src_id = 10,
+            .dst_id = 30,
+            .hlc_timestamp = 200,
+            .label_id = 1,
+            .flags = l3kvg::EdgeMutationOp::FLAG_ACTIVE,
+            .weight = 2.0f
+        });
+        wal.flush();
+
+        file_size = std::filesystem::file_size(temp_file.path());
+        EXPECT_EQ(file_size, 2 * sizeof(l3kvg::EdgeMutationOp));
+
+        l3kvg::AdjacencyStore store2;
+        size_t rec2 = wal.recover(store2);
+        EXPECT_EQ(rec2, 2);
+        EXPECT_EQ(store2.get_out_degree(10), 2);
+    }
+}

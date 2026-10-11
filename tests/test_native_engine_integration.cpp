@@ -451,3 +451,65 @@ TEST(NativeEngineIntegrationTest, LabelsDictCRLFAndAtomicWrite) {
         EXPECT_FALSE(std::filesystem::exists(dict_path + ".tmp"));
     }
 }
+
+TEST(NativeEngineIntegrationTest, WildcardAndSynthesizedEdgeTraversal) {
+    TempDir temp_dir("test_wildcard_synthesized_edges_db");
+    const std::string& db_dir = temp_dir.path;
+
+    {
+        l3kvg::Settings settings;
+        l3kvg::Engine engine(db_dir, 1, nullptr, 4, settings);
+
+        uint64_t parent = 9001;
+        uint64_t child1 = 9002;
+        uint64_t child2 = 9003;
+        uint64_t friend1 = 9004;
+
+        engine.add_edge(parent, "CONTAINS", 1.0, child1);
+        engine.add_edge(parent, "CONTAINS", 2.5, child2);
+        engine.add_edge(parent, "KNOWS", 0.5, friend1);
+
+        auto node = engine.get_node(parent);
+        ASSERT_NE(node, nullptr);
+
+        // 1. Wildcard node->get_neighbors("") returning native edges
+        auto all_neighbors = node->get_neighbors("");
+        ASSERT_EQ(all_neighbors.size(), 3);
+        std::sort(all_neighbors.begin(), all_neighbors.end());
+        EXPECT_EQ(all_neighbors[0], child1);
+        EXPECT_EQ(all_neighbors[1], child2);
+        EXPECT_EQ(all_neighbors[2], friend1);
+
+        // 2. node->get_edges("CONTAINS") returning synthesized Edge objects
+        auto contains_edges = node->get_edges("CONTAINS");
+        ASSERT_EQ(contains_edges.size(), 2);
+        for (const auto& e : contains_edges) {
+            EXPECT_EQ(e->get_src(), parent);
+            EXPECT_EQ(e->get_label(), "CONTAINS");
+            EXPECT_TRUE(e->get_dst() == child1 || e->get_dst() == child2);
+            if (e->get_dst() == child1) {
+                EXPECT_FLOAT_EQ(static_cast<float>(e->get_weight()), 1.0f);
+            } else if (e->get_dst() == child2) {
+                EXPECT_FLOAT_EQ(static_cast<float>(e->get_weight()), 2.5f);
+            }
+        }
+
+        // 3. node->get_edges("") returning all synthesized Edge objects
+        auto all_edges = node->get_edges("");
+        ASSERT_EQ(all_edges.size(), 3);
+        size_t contains_count = 0;
+        size_t knows_count = 0;
+        for (const auto& e : all_edges) {
+            EXPECT_EQ(e->get_src(), parent);
+            if (e->get_label() == "CONTAINS") {
+                contains_count++;
+            } else if (e->get_label() == "KNOWS") {
+                knows_count++;
+                EXPECT_EQ(e->get_dst(), friend1);
+                EXPECT_FLOAT_EQ(static_cast<float>(e->get_weight()), 0.5f);
+            }
+        }
+        EXPECT_EQ(contains_count, 2);
+        EXPECT_EQ(knows_count, 1);
+    }
+}

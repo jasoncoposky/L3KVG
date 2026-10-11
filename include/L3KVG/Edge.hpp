@@ -20,6 +20,11 @@ public:
       : engine_(engine), src_(src), label_(std::move(label)), 
         weight_(weight), dst_(dst), payload_(std::move(payload)) {}
 
+  Edge(Engine *engine, uint64_t src, std::string label, double weight, uint64_t dst, std::string_view payload_str)
+      : engine_(engine), src_(src), label_(std::move(label)), 
+        weight_(weight), dst_(dst),
+        payload_(payload_str.empty() ? std::nullopt : std::make_optional<lite3cpp::Buffer>(payload_str)) {}
+
   uint64_t get_src() const { return src_; }
   const std::string& get_label() const { return label_; }
   double get_weight() const { return weight_; }

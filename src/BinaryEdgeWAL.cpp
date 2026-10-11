@@ -201,11 +201,6 @@ bool BinaryEdgeWAL::is_open() const noexcept {
 size_t BinaryEdgeWAL::recover(AdjacencyStore& store) {
     std::lock_guard<std::mutex> lock(write_mutex_);
 
-    if (fd_ >= 0 && !buffer_.empty()) {
-        write_all_unlocked(buffer_.data(), buffer_.size());
-        buffer_.clear();
-    }
-
     int read_fd = fd_;
     bool close_read_fd = false;
 

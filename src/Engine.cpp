@@ -14,8 +14,10 @@
 
 namespace l3kvg {
 
+static std::atomic<uint64_t> s_next_engine_instance_id{1};
+
 Engine::Engine(const std::string &db_path, uint32_t node_id, std::shared_ptr<lite3::ConsistentHash> ring, size_t thread_pool_size, Settings settings)
-    : resolver_(std::move(ring), node_id), settings_(std::move(settings)), hlc_(node_id), db_path_(db_path) {
+    : resolver_(std::move(ring), node_id), settings_(std::move(settings)), engine_instance_id_(s_next_engine_instance_id.fetch_add(1, std::memory_order_relaxed)), hlc_(node_id), db_path_(db_path) {
   settings_.node_id = node_id;
   std::string store_wal_path = db_path;
   std::string wal_path;
@@ -113,6 +115,7 @@ size_t Engine::get_cache_shard(uint64_t id) {
 }
 
 void Engine::invalidate_node_cache(uint64_t id) {
+    cache_epoch_.fetch_add(1, std::memory_order_relaxed);
     if (!has_cached_nodes_.load(std::memory_order_relaxed)) {
         return;
     }
@@ -121,7 +124,6 @@ void Engine::invalidate_node_cache(uint64_t id) {
     if (shard.count.load(std::memory_order_relaxed) == 0) {
         return;
     }
-    cache_epoch_.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard<std::mutex> lock(shard.mutex);
     if (auto it = shard.map.find(id); it != shard.map.end()) {
         shard.lru.erase(it->second.lru_it);
@@ -133,12 +135,15 @@ void Engine::invalidate_node_cache(uint64_t id) {
 Query Engine::query() { return Query(this); }
 
 const std::shared_ptr<Node>& Engine::get_node(uint64_t id) {
+  thread_local const Engine* tl_last_engine = nullptr;
+  thread_local uint64_t tl_engine_instance_id = 0;
   thread_local uint64_t tl_epoch = 0;
   thread_local uint64_t tl_last_id = UINT64_MAX;
   thread_local std::shared_ptr<Node> tl_last_node;
 
   uint64_t curr_epoch = cache_epoch_.load(std::memory_order_relaxed);
-  if (tl_last_node && tl_last_id == id && tl_epoch == curr_epoch) {
+  if (tl_last_engine == this && tl_engine_instance_id == engine_instance_id_ &&
+      tl_last_node && tl_last_id == id && tl_epoch == curr_epoch) {
       return tl_last_node;
   }
 
@@ -151,6 +156,8 @@ const std::shared_ptr<Node>& Engine::get_node(uint64_t id) {
     if (shard.lru.begin() != it->second.lru_it) {
         shard.lru.splice(shard.lru.begin(), shard.lru, it->second.lru_it);
     }
+    tl_last_engine = this;
+    tl_engine_instance_id = engine_instance_id_;
     tl_epoch = curr_epoch;
     tl_last_id = id;
     tl_last_node = it->second.node;
@@ -168,6 +175,8 @@ const std::shared_ptr<Node>& Engine::get_node(uint64_t id) {
   shard.count.store(shard.map.size(), std::memory_order_relaxed);
   has_cached_nodes_.store(true, std::memory_order_relaxed);
   metrics_.cache_misses.fetch_add(1, std::memory_order_relaxed);
+  tl_last_engine = this;
+  tl_engine_instance_id = engine_instance_id_;
   tl_epoch = curr_epoch;
   tl_last_id = id;
   tl_last_node = node;
@@ -498,11 +507,15 @@ void Engine::add_edge(uint64_t src_id, std::string_view label,
                       std::string_view payload) {
   uint16_t lid = label_registry_.get_or_register(label);
   auto hlc_ts = hlc_.now();
+  uint16_t flags = PackedEdge::FLAG_ACTIVE;
+  if (!payload.empty()) {
+      flags |= PackedEdge::FLAG_HAS_PROPERTIES;
+  }
   if (edge_wal_) {
-      EdgeMutationOp op{src_id, dst_id, hlc_ts.wall_time, lid, PackedEdge::FLAG_ACTIVE, static_cast<float>(weight)};
+      EdgeMutationOp op{src_id, dst_id, hlc_ts.wall_time, lid, flags, static_cast<float>(weight)};
       edge_wal_->append(op);
   }
-  adjacency_store_.add_edge(src_id, dst_id, lid, static_cast<float>(weight), PackedEdge::FLAG_ACTIVE, 0, static_cast<uint32_t>(hlc_ts.logical));
+  adjacency_store_.add_edge(src_id, dst_id, lid, static_cast<float>(weight), flags, 0, static_cast<uint32_t>(hlc_ts.logical));
   if (__builtin_expect(!payload.empty() || !resolver_.is_local(src_id) || !resolver_.is_local(dst_id) || resolver_.has_remote_clusters(), 0)) {
       edge_coordinator_->atomic_put_edge(src_id, std::string(label), weight, dst_id, std::string(payload)).get();
   }
@@ -612,6 +625,7 @@ bool Engine::apply_batch(const lite3cpp::Buffer& buffer, uint32_t principal_id) 
             uint16_t label_id;
             float weight;
             uint64_t timestamp;
+            bool has_props;
         };
         std::vector<StagedEdgeOp> staged_edge_ops;
 
@@ -642,7 +656,8 @@ bool Engine::apply_batch(const lite3cpp::Buffer& buffer, uint32_t principal_id) 
                     nodes_to_invalidate.push_back(item.src);
                     nodes_to_invalidate.push_back(item.dst);
                     uint16_t lid = label_registry_.get_or_register(item.label);
-                    staged_edge_ops.push_back({true, item.src, item.dst, lid, static_cast<float>(item.weight), static_cast<uint64_t>(now.wall_time)});
+                    bool has_props = !item.value.empty();
+                    staged_edge_ops.push_back({true, item.src, item.dst, lid, static_cast<float>(item.weight), static_cast<uint64_t>(now.wall_time), has_props});
                     std::string out_key = std::string(KeyBuilder::edge_out_key(item.src, std::string(item.label), item.weight, item.dst));
                     std::string in_key = std::string(KeyBuilder::edge_in_key(item.dst, std::string(item.label), item.src));
                     
@@ -659,7 +674,7 @@ bool Engine::apply_batch(const lite3cpp::Buffer& buffer, uint32_t principal_id) 
                     nodes_to_invalidate.push_back(item.src);
                     nodes_to_invalidate.push_back(item.dst);
                     uint16_t lid = label_registry_.get_or_register(item.label);
-                    staged_edge_ops.push_back({false, item.src, item.dst, lid, static_cast<float>(item.weight), static_cast<uint64_t>(now.wall_time)});
+                    staged_edge_ops.push_back({false, item.src, item.dst, lid, static_cast<float>(item.weight), static_cast<uint64_t>(now.wall_time), false});
                     std::string out_key = std::string(KeyBuilder::edge_out_key(item.src, std::string(item.label), item.weight, item.dst));
                     std::string in_key = std::string(KeyBuilder::edge_in_key(item.dst, std::string(item.label), item.src));
                     add_del(out_key);
@@ -671,20 +686,28 @@ bool Engine::apply_batch(const lite3cpp::Buffer& buffer, uint32_t principal_id) 
 
         store_->apply_batch_mutations(wal_batch, std::move(shard_works));
 
+        std::vector<EdgeMutationOp> wal_ops;
+        if (edge_wal_ && !staged_edge_ops.empty()) {
+            wal_ops.reserve(staged_edge_ops.size());
+        }
+
         for (const auto& op : staged_edge_ops) {
             if (op.is_add) {
-                adjacency_store_.add_edge(op.src, op.dst, op.label_id, op.weight);
+                uint16_t flags = PackedEdge::FLAG_ACTIVE | (op.has_props ? PackedEdge::FLAG_HAS_PROPERTIES : 0);
+                adjacency_store_.add_edge(op.src, op.dst, op.label_id, op.weight, flags);
                 if (edge_wal_) {
-                    EdgeMutationOp wal_op{op.src, op.dst, op.timestamp, op.label_id, PackedEdge::FLAG_ACTIVE, op.weight};
-                    edge_wal_->append(wal_op);
+                    wal_ops.push_back(EdgeMutationOp{op.src, op.dst, op.timestamp, op.label_id, flags, op.weight});
                 }
             } else {
                 adjacency_store_.del_edge(op.src, op.dst, op.label_id, op.weight);
                 if (edge_wal_) {
-                    EdgeMutationOp wal_op{op.src, op.dst, op.timestamp, op.label_id, EdgeMutationOp::OP_DELETE, op.weight};
-                    edge_wal_->append(wal_op);
+                    wal_ops.push_back(EdgeMutationOp{op.src, op.dst, op.timestamp, op.label_id, EdgeMutationOp::OP_DELETE, op.weight});
                 }
             }
+        }
+
+        if (edge_wal_ && !wal_ops.empty()) {
+            edge_wal_->append_batch(wal_ops);
         }
 
         for (uint64_t nid : nodes_to_invalidate) {

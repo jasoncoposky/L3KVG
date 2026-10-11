@@ -144,6 +144,7 @@ private:
   std::vector<std::unique_ptr<CacheShard>> cache_shards_;
   std::atomic<uint64_t> cache_epoch_{1};
   std::atomic<bool> has_cached_nodes_{false};
+  uint64_t engine_instance_id_{0};
   
   HLCProvider hlc_;
   SREMetrics metrics_;

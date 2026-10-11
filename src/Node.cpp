@@ -125,13 +125,13 @@ std::vector<uint64_t> Node::get_neighbors(std::string_view label,
   }
 
   uint64_t curr_epoch = engine_->get_cache_epoch();
-  if (lid != 0 && neighbor_cache_.valid && neighbor_cache_.epoch == curr_epoch &&
+  if ((lid != 0 || label.empty()) && neighbor_cache_.valid && neighbor_cache_.epoch == curr_epoch &&
       neighbor_cache_.label_id == lid && neighbor_cache_.min_weight == min_weight) {
       return neighbor_cache_.neighbors;
   }
 
   std::vector<uint64_t> neighbors;
-  if (lid != 0) {
+  if (lid != 0 || label.empty()) {
       neighbors.reserve(1);
       engine_->get_adjacency_store().filter_outgoing_edges(id_, lid, static_cast<float>(min_weight), neighbors);
       if (!neighbors.empty() || engine_->get_adjacency_store().get_out_degree(id_) > 0) {
@@ -270,6 +270,34 @@ std::vector<uint64_t> Node::get_in_neighbors(std::string_view label, uint32_t pr
 std::vector<std::shared_ptr<Edge>> Node::get_edges(std::string_view label,
                                                  double min_weight,
                                                  uint32_t principal_id) {
+  uint16_t lid = 0;
+  if (!label.empty()) {
+      lid = engine_->get_label_registry().lookup(label);
+  }
+  if (lid != 0 || label.empty()) {
+      std::vector<PackedEdge> snap = engine_->get_adjacency_store().get_outgoing_edges_snapshot(id_);
+      if (!snap.empty()) {
+          std::vector<std::shared_ptr<Edge>> edges;
+          for (const auto& pe : snap) {
+              if (pe.is_active() && (lid == 0 || pe.label_id == lid) && pe.weight >= min_weight) {
+                  std::string edge_label(engine_->get_label_registry().get_label(pe.label_id));
+                  std::optional<lite3cpp::Buffer> payload_buf = std::nullopt;
+                  if (pe.has_properties()) {
+                      std::string key = std::string(KeyBuilder::edge_out_key(id_, edge_label, pe.weight, pe.target_id));
+                      lite3cpp::Buffer buf = engine_->get_store()->get(key);
+                      if (buf.size() > 0) {
+                          payload_buf = std::move(buf);
+                      }
+                  }
+                  edges.push_back(std::make_shared<Edge>(engine_, id_, std::move(edge_label), pe.weight, pe.target_id, std::move(payload_buf)));
+              }
+          }
+          if (!edges.empty()) {
+              return edges;
+          }
+      }
+  }
+
   if (!might_have_edge(label)) {
 
     return {};
