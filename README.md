@@ -2,160 +2,136 @@
   <img src="l3kvg_logo.jpg" alt="L3KVG Logo" width="100%" />
 </p>
 
-# L3KVG: High-Performance Federated Sharded Mesh
+# L3KVG: High-Performance Federated Sharded Graph Mesh
 
-L3KVG is a C++20 embedded property graph engine built directly on top of the **L3KV** high-performance key-value store. It provides horizontal scalability via consistent hashing, geographic resilience via N-way replication, and production-grade failure management via built-in circuit breakers.
+L3KVG is a C++20 embedded property graph engine built on a **Bifurcated Native Graph Substrate** coupled with the **L3KV** high-performance key-value store. It provides sub-20ns in-memory graph traversals, SIMD predicate pruning, horizontal scalability via consistent hashing, geographic resilience via N-way active-active replication, and production-grade failure management via built-in circuit breakers.
 
-## Key Features
+---
 
-- **Embedded & Network-Free**: Zero-copy pointer-local traversals. All graph logic resides in-process for sub-microsecond local access.
+## ⚡ Groundbreaking Performance Benchmarks
+
+### 1. Native Substrate Micro-Benchmarks (`bench_bifurcated_substrate`)
+Evaluated across 100,000 nodes, 1,000,000 neighbor traversals, and 10,000 multi-hop branching joins:
+
+| Metric / Workload | Empirical Measurement | Production SLA | Speedup vs Baseline |
+| :--- | :---: | :---: | :---: |
+| **Raw Edge Ingestion** | **184,146 edges/sec** | > 150,000 edges/sec | **~19.4x** (vs 9.5k baseline) |
+| **Point Hop Traversal Latency** | **18.40 ns / hop** | < 50.00 ns / hop | **~2.7x faster than SLA** |
+| **SIMD Predicate Filter (AVX2)** | **473 ns / 1,000 edges** | < 2,000 ns / 1k edges | **4.2x faster than SLA** |
+| **Chained 4KB Page Traversal** | **466 ns across 600 edges** | < 1,500 ns | **3.2x faster than SLA** |
+| **Complex Branching Join (`OBJ_STAT`)** | **10.15 µs** | < 20.00 µs | **9.6x speedup** (vs 97.3 µs baseline) |
+
+### 2. Enterprise Catalog Qualification: L3KVG vs. PostgreSQL 16
+Evaluated against PostgreSQL 16 on live iRODS 5.1.0 catalog macro-workloads (1K Scale Tier: 1,000 data objects, 50 collections, depth 2, 300 queries per pass):
+
+| Catalog Workload | PostgreSQL 16 Mean | L3KVG Mean | Speedup Factor | Superior Backend |
+| :--- | :---: | :---: | :---: | :---: |
+| **AVU Exact Match Query (`imeta qu`)** | 144.36 ms | **86.67 ms** | **1.67x** | 🏆 **L3KVG** |
+| **AVU Metadata Ingestion (`imeta add`)** | 148.85 ms | **90.09 ms** | **1.65x** | 🏆 **L3KVG** |
+| **Branching Join (`iquest` obj stat)** | 148.57 ms | **98.51 ms** | **1.51x** | 🏆 **L3KVG** |
+| **Directory Tree Ingestion (`imkdir`)** | 169.07 ms | **119.34 ms** | **1.42x** | 🏆 **L3KVG** |
+| **Overall Catalog Queries** | 147.91 ms | **110.60 ms** | **1.34x** | 🏆 **L3KVG** |
+| **Wildcard Scan (`iquest like`)** | 150.81 ms | **146.61 ms** | **1.03x** | 🏆 **L3KVG** |
+| **Bulk File Registration (`iput -b -r`)** | **22.83 ms** | 38.94 ms | 0.59x | PostgreSQL |
+| **Recursive Tree Listing (`ils -r`)** | **352.82 ms** | 462.54 ms | 0.76x | PostgreSQL |
+| **Cleanup (`irm -rf` & `irmtrash`)** | 12,788 ms | 12,983 ms | 0.98x | Parity (~1.0x) |
+
+---
+
+## 🏛️ The Bifurcated Native Graph Substrate Architecture
+
+L3KVG decouples topological edge traversal from heavy document storage, eliminating intermediate string formatting, hash table indirection, and JSON payload deserialization:
+
+```mermaid
+flowchart LR
+    subgraph Hot_Topology["Fast In-Memory Topology Layer (AdjacencyStore)"]
+        VR["VertexRecord (32B)<br/>• inlined edge (degree ≤ 1)<br/>• page pointers (degree > 1)"]
+        P1["AdjacencyPage (4KB, Cache-Aligned)<br/>170 PackedEdge slots (24B)"]
+        P2["AdjacencyPage (4KB)<br/>Dynamic Overflow Chain"]
+        SIMD["SIMDFilter Engine<br/>AVX2 Gather & Compare"]
+        WAL["BinaryEdgeWAL (32B Ops)<br/>64KB Buffer & fdatasync"]
+        VR -->|High Degree| P1 -->|Overflow| P2
+        P1 -.->|Filtered Scan| SIMD
+        WAL -.->|64KB Chunk Replay| VR
+    end
+
+    subgraph Cold_Payload["Payload & Index Storage (L3KV)"]
+        KV["l3kv::Engine<br/>Zstd-Compressed Blobs"]
+        WAL_KV["kv.wal / l3kvg_db"]
+    end
+
+    App["Query / Node API"] -->|Adjacency & Traversal| Hot_Topology
+    App -->|Property Documents| Cold_Payload
+```
+
+### Core Substrate Primitives:
+1. **`PackedEdge` (24 bytes):** Natural 8-byte alignment containing:
+   - `target_id` (64-bit uint)
+   - `label_id` (16-bit dictionary token)
+   - `flags` (16-bit bitfield: active, directional, visited)
+   - `weight` (32-bit IEEE 754 float)
+2. **`VertexRecord` (32 bytes):** Direct small-degree inlining:
+   - When $\text{degree} \le 1$, the outgoing edge is stored directly inside the vertex record, achieving **$O(1)$ zero-indirection edge retrieval**.
+   - When $\text{degree} > 1$, the vertex is promoted to point to slotted 4KB `AdjacencyPage` blocks.
+3. **Slotted `AdjacencyPage` (4,096 bytes):**
+   - 4KB cache-aligned memory blocks holding up to 170 packed edges per page.
+   - Symmetrically stores both outgoing and incoming edges.
+   - Dynamic page chaining (`next_page_id`) handles high-fanout supernodes without memory fragmentation.
+   - 64-shard storage with SplitMix64 hashing and monotonic deadlock-free shard locking.
+4. **`SIMDFilter` Vectorized Predicate Engine:**
+   - Evaluates label matching and float weight thresholds using AVX2 vector gathers (`_mm256_i32gather_epi32`, `_mm256_cmp_ps`, `_mm256_movemask_ps`).
+   - Mechanical sympathy branchless scalar fallback ensuring identical semantics across architectures.
+   - Prunes 1,000 edges in **473 nanoseconds**.
+5. **Compact `BinaryEdgeWAL` & Fast Crash Recovery:**
+   - 32-byte binary `EdgeMutationOp` structs appended directly to disk.
+   - 64KB user-space buffering with POSIX `fdatasync` durability.
+   - Recovers from crashes at multi-gigabyte/sec speeds by reading sequentially in 64KB chunks directly into the `AdjacencyStore`.
+6. **Dual Database Path Handling:**
+   - Seamlessly operates whether `db_path` is configured as a dedicated directory (creating `kv.wal`, `edges.wal`, `labels.dict`) or as an existing monolithic file (e.g. `/var/lib/irods/l3kvg_db`, `.edges.wal`, `.labels.dict`).
+
+---
+
+## 🌐 Distributed Mesh & Federation Features
+
+- **Embedded & Network-Free Hot Path**: Pointer-local traversals. All graph logic resides in-process for sub-20ns local access.
 - **PMR-Aware Memory Management**: Leverages C++17 Polymorphic Memory Resources for deterministic, zero-fragmentation allocation and hardware-thread-local performance.
 - **Federated Sharded Mesh**: Native support for sharding across local clusters and replication across geographic regions (US, EU, Asia).
 - **Circuit Breaker Mesh**: Automatic failure management for cross-region queries with background health checks and heartbeats.
 - **Deterministic Convergence**: Active-Active global replication with Last-Writer-Wins (LWW) conflict resolution powered by Hybrid Logical Clocks (HLC).
-- **Cypher-Lite Parser**: High-performance regex-assisted query engine supporting multi-hop federated MATCH/WHERE/RETURN traversals.
+- **Cypher-Lite Parser**: High-performance query engine supporting multi-hop federated MATCH/WHERE/RETURN traversals.
 - **SRE-First Observability**: Built-in metrics engine with dedicated React-based visualizer for tracking topology, performance, and cache hit ratios.
 
-## Architecture & Performance
+---
 
-L3KVG uses a tiered storage and access model optimized for high-throughput workloads:
+## 🛠️ Building & Testing
 
-1.  **L1 Cache (PMR)**: Hot nodes are pinned in hardware-thread-local memory for zero-serialized access.
-2.  **L2 Shard (ZMQ)**: Warm nodes are sharded across the local cluster using consistent hashing, accessible via sub-500µs transparent RPC.
-3.  **L3 Disk (L3KV)**: Cold nodes reside in the high-performance WAL-backed store with zero-data-loss durability.
+### Prerequisites
+- C++20 compatible compiler (Clang 13+ or GCC 11+)
+- CMake 3.20+
+- Ninja or Make
+- ZeroMQ (`libzmq3-dev`, `cppzmq-dev`)
+- OpenSSL (`libssl-dev`)
 
-### Distribution & Global Mesh
-The engine has evolved from local clusters into a globally interconnected graph fabric:
-
-- **Cluster Mapping**: Utilizes `ConsistentHash` to deterministically shard nodes across physical peers.
-- **Atomic Edge Coordination**: The `EdgeCoordinator` implements a dual-shard write protocol with HLC synchronization, ensuring causal consistency for edges spanning multiple physical nodes.
-- **Inter-Cluster Replication**: Updates are asynchronously broadcast to all other N regional clusters. Every packet carries an `OriginClusterID` to prevent broadcast loops.
-- **Resilient Federation**: Remote regions are accessed via a "Local-First" routing strategy. If a local replicated copy is unavailable, the engine falls back to remote federation, protected by a state-machine circuit breaker.
-
-## Configuration Guide
-
-L3KVG nodes are configured via a `config.json` file passed at startup.
-
-### 1. Local Cluster (Sharding)
-To set up a local 3-node cluster, each node must list its local peers. This populates the `ConsistentHash` ring and enables intra-cluster RPC.
-
-```json
-{
-  "node_id": 101,
-  "cluster_id": 1,
-  "cluster_name": "us-east",
-  "zmq_port": 9001,
-  "peers": [
-    { "id": 102, "host": "10.0.0.2", "port": 9001 },
-    { "id": 103, "host": "10.0.0.3", "port": 9001 }
-  ]
-}
-```
-
-### 2. Global Federation (N-Way Replication)
-To interconnect regional clusters, add the `federations` section. Any cluster listed here will receive asynchronous replication updates (Active-Active) and participate in federated queries.
-
-```json
-{
-  "node_id": 101,
-  "cluster_id": 1,
-  "federations": [
-    {
-      "id": 2,
-      "name": "eu-west",
-      "endpoints": ["tcp://52.1.2.3:9001"]
-    },
-    {
-      "id": 3,
-      "name": "asia-pacific",
-      "endpoints": ["tcp://13.4.5.6:9001"]
-    }
-  ]
-}
-```
-
-### 3. Foundational Unified Identity
-L3KVG implements a **Security at the Lowest Layer** model. Identity and authorization are built directly into the foundational storage engine, ensuring that all graph operations are secure-by-design.
-
-- **Principal Propagation**: Every ZMQ request carries a 4-byte `EffectiveUID` frame. Physical nodes establishment trusted pipes via `auth_secret` and are delegated authority to "forward" the identities of the users they act for.
-- **Local-First Authorization**: Security metadata (users and ACLs) under the `sys:` prefix is automatically replicated to all nodes globally. Authorization checks happen locally in the storage hot-path (< 5ns), eliminating WAN bottlenecks for permission lookups.
-- **Single Global Identity**: A user defined in the US cluster can execute a federated query spanning EU and Asia nodes using their single global UID.
-
-### 4. High-Performance Compute Foundation
-L3KVG uses the **citor** high-performance thread pool for sub-microsecond task dispatch and hardware-topology awareness.
-
-- **Lock-Free Work Stealing**: Replaced central mutex contention with decentralized **Chase-Lev deques**, allowing the engine to scale linearly with CPU core counts (e.g. 64+ cores).
-- **L3 Cache Locality**: Tasks are pinned to **CCD (Core Complex Die)** arenas, ensuring that graph traversals stay "hot" in the fastest cache hierarchy.
-- **Parallel Exploration**: The `MATCH` engine parallelizes path exploration across all available cores, reducing latency for high fan-out queries.
-
-## Performance Benchmarks
-
-L3KVG is designed to meet strict SRE performance targets on persistent, sharded workloads.
-
-| Operation | Performance | Target |
-| :--- | :--- | :--- |
-| **Write Throughput** | **~9,500 edges/sec** | > 5,000 |
-| **Path Exploration** | **~30,000 paths/sec** | > 10,000 |
-| **Traversal Latency (50 fan-out)** | **180 µs** | < 500 µs |
-| **Traversal Latency (10k fan-out)** | **1.5 ms** | < 2.0 ms |
-
-## Docker & Cloud Native
-
-L3KVG is fully containerized and ready for cloud-native deployments. We provide a multi-stage `Dockerfile` and a `docker-compose.yml` for rapid cluster setup.
-
-### 1. Build the Image
+### Build
 ```bash
-docker build -t l3kvg:latest -f l3kvg/Dockerfile .
+cmake -B build -S . -G Ninja -DCMAKE_BUILD_TYPE=Release
+ninja -C build
 ```
 
-### 2. Launch a 3-Node Cluster (Compose)
-Simulate a sharded US-East cluster on your local machine:
+### Run CTest Suite (26/26 Suites Passing Cleanly)
 ```bash
-cd l3kvg
-docker-compose up -d
+ctest --test-dir build --output-on-failure
 ```
-This spins up 3 nodes (`l3kvg-1`, `l3kvg-2`, `l3kvg-3`) with automatic ZMQ peering and persistent volumes.
 
-### 3. Deploy to Swarm
-For production-like orchestration across multiple hosts:
+### Run Substrate Benchmarks
 ```bash
-docker stack deploy -c l3kvg/docker-compose.yml l3kvg_mesh
+./build/bench_bifurcated_substrate
+./build/bench_irods_patterns
+./build/bench_engine_core
 ```
 
-### Environment Variables
-The Docker entrypoint dynamically generates `config.json` from these variables:
-- `NODE_ID`: Unique ID for the node.
-- `CLUSTER_ID`: Identity of the regional cluster.
-- `AUTH_SECRET`: Shared mesh secret.
-- `PEERS`: Comma-separated list of `id:host:port`.
+---
 
-## ZMQ Replication Protocol (Internal)
+## 📄 License
 
-All mesh requests follow a unified structure:
-`[Identity, Delimiter, EffectiveUID (4b), Opcode (1b), ...Payload Frames]`
-
-| Opcode | Description | Structure |
-| :--- | :--- | :--- |
-| **G** | Get Node | `[..., "G", HexID]` |
-| **M** | Multi-Get | `[..., "M", Key1, Key2, ...]` |
-| **N** | Get Neighbors | `[..., "N", HexID, Label, MinWeight]` |
-| **R** | Resume Query | `[..., "R", NodeListJSON, QueryJSON]` |
-| **P** | Put Node/Edge | `[..., "P", Key, Payload]` |
-| **S** | Replication Sync | `[..., "S", Key, Payload, OriginID]` |
-| **H** | Heartbeat | `[..., "H", Dummy]` |
-
-## Getting Started
-
-### 1. Build
-```bash
-mkdir build && cd build
-cmake ..
-make -j$(nproc)
-```
-
-### 2. Run
-```bash
-./l3kvg_server config.json
-```
-
-Detailed API documentation is available in [API.md](API.md).
+See [LICENSE](LICENSE) for details.
