@@ -32,6 +32,7 @@ public:
 
     void put_raw(std::string_view key, std::string_view value);
     void put_node(uint64_t node_id, std::string_view payload);
+    void put_node(uint64_t node_id, const lite3cpp::Buffer& payload);
     void add_edge(uint64_t src, std::string_view label, double weight, uint64_t dst, std::string_view payload = "{}");
     void add_index(std::string_view key, std::string_view value_hex);
     

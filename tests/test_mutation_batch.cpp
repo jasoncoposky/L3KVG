@@ -75,3 +75,23 @@ TEST(MutationBatchTest, EngineApplyBatch) {
 
     std::filesystem::remove_all(db_path);
 }
+
+TEST(MutationBatchTest, PutNodeBufferZeroCopy) {
+    lite3cpp::Buffer node_buf(512);
+    node_buf.init_object();
+    node_buf.set_str(0, "n", "zero_copy_node");
+    node_buf.set_i64(0, "id", 42);
+
+    l3kvg::MutationBatch batch;
+    batch.put_node(0x7001, node_buf);
+    ASSERT_EQ(batch.size(), 1u);
+
+    auto item = batch.get(0);
+    EXPECT_EQ(item.op, l3kvg::MutationOp::PutNode);
+    EXPECT_EQ(item.src, 0x7001u);
+    EXPECT_EQ(item.value.size(), node_buf.size());
+
+    lite3cpp::Buffer roundtrip(reinterpret_cast<const uint8_t*>(item.value.data()), item.value.size());
+    EXPECT_EQ(roundtrip.get_str(0, "n"), "zero_copy_node");
+    EXPECT_EQ(roundtrip.get_i64(0, "id"), 42);
+}

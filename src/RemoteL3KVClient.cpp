@@ -494,6 +494,73 @@ std::future<std::vector<uint64_t>> RemoteL3KVClient::get_in_neighbors_async(lite
     });
 }
 
+std::future<lite3cpp::Buffer> RemoteL3KVClient::resume_query_buffer_async(
+    uint16_t cluster_id,
+    const std::vector<uint64_t>& starting_nodes,
+    const lite3cpp::Buffer& query_buf,
+    uint32_t principal_id) {
+    if (!task_pool_) {
+        std::promise<lite3cpp::Buffer> p;
+        p.set_value(lite3cpp::Buffer());
+        return p.get_future();
+    }
+    return task_pool_->enqueue([this, cluster_id, starting_nodes, query_buf, principal_id]() -> lite3cpp::Buffer {
+        auto session = get_session(cluster_id);
+        if (!session) return {};
+
+        try {
+            check_circuit(session);
+            ensure_authenticated(session, cluster_id);
+        } catch (...) {
+            throw;
+        }
+
+        std::lock_guard<std::recursive_mutex> lock(session->mu);
+        try {
+            session->socket->send(zmq::message_t(), zmq::send_flags::sndmore);
+            uint32_t pid = principal_id;
+            session->socket->send(zmq::message_t(&pid, 4), zmq::send_flags::sndmore);
+            session->socket->send(zmq::message_t("R", 1), zmq::send_flags::sndmore);
+            session->socket->send(zmq::message_t(starting_nodes.data(), starting_nodes.size() * sizeof(uint64_t)), zmq::send_flags::sndmore);
+            session->socket->send(zmq::message_t(query_buf.data(), query_buf.size()), zmq::send_flags::none);
+
+            std::vector<zmq::message_t> recv_msgs;
+            zmq::message_t msg;
+            auto res = session->socket->recv(msg, zmq::recv_flags::none);
+            if (res) {
+                recv_msgs.push_back(std::move(msg));
+                while (recv_msgs.back().more()) {
+                    zmq::message_t m;
+                    auto res_more = session->socket->recv(m, zmq::recv_flags::none);
+                    if (!res_more) break;
+                    recv_msgs.push_back(std::move(m));
+                }
+            }
+
+            if (res && recv_msgs.size() >= 2) {
+                const auto& resp_msg = recv_msgs[1];
+                if (resp_msg.size() == 3 && std::memcmp(resp_msg.data(), "ERR", 3) == 0) {
+                    report_failure(cluster_id);
+                    return {};
+                }
+                report_success(cluster_id);
+                const uint8_t* ptr = static_cast<const uint8_t*>(resp_msg.data());
+                if (resp_msg.size() >= sizeof(lite3cpp::PackedNodeLayout) && (ptr[0] == 0x06 || ptr[0] == 0x07)) {
+                    return lite3cpp::Buffer(ptr, resp_msg.size());
+                } else {
+                    std::string raw_json = resp_msg.to_string();
+                    return lite3cpp::lite3_json::from_json_string(raw_json.empty() ? "[]" : raw_json);
+                }
+            } else {
+                throw FederationTimeoutException("Remote query timed out");
+            }
+        } catch (...) {
+            report_failure(cluster_id);
+            throw;
+        }
+    });
+}
+
 std::future<std::vector<ResultRow>> RemoteL3KVClient::resume_query_async(
     uint16_t cluster_id,
     const std::vector<uint64_t>& starting_nodes,
@@ -899,6 +966,94 @@ std::future<std::vector<std::string>> RemoteL3KVClient::get_prefix_keys_async(
         } catch (...) {
             report_failure(owner_id);
             throw;
+        }
+    });
+}
+
+std::future<lite3cpp::Buffer> RemoteL3KVClient::get_node_buffer_async(lite3::NodeID owner_id, uint64_t target_node_id, uint32_t principal_id) {
+    if (!task_pool_) {
+        std::promise<lite3cpp::Buffer> p; p.set_value({}); return p.get_future();
+    }
+
+    return task_pool_->enqueue([this, owner_id, target_node_id, principal_id]() -> lite3cpp::Buffer {
+        auto session = get_session(owner_id);
+        if (!session) return {};
+
+        try {
+            check_circuit(session);
+            ensure_authenticated(session, owner_id);
+        } catch (...) {
+            throw;
+        }
+
+        std::lock_guard<std::recursive_mutex> lock(session->mu);
+        try {
+            std::string key = std::string(l3kvg::KeyBuilder::node_key(target_node_id));
+
+            session->socket->send(zmq::message_t(), zmq::send_flags::sndmore);
+            uint32_t pid = principal_id;
+            session->socket->send(zmq::message_t(&pid, 4), zmq::send_flags::sndmore);
+            session->socket->send(zmq::message_t("G", 1), zmq::send_flags::sndmore);
+            session->socket->send(zmq::message_t(key.data(), key.size()), zmq::send_flags::none);
+
+            std::vector<zmq::message_t> recv_msgs;
+            auto res = zmq::recv_multipart(*session->socket, std::back_inserter(recv_msgs));
+
+            if (res && recv_msgs.size() >= 2) {
+                const auto& msg = recv_msgs[1];
+                if (msg.size() == 0) {
+                    report_success(owner_id);
+                    return {};
+                }
+                if (msg.size() >= 4 && std::memcmp(msg.data(), "ERR_", 4) == 0) {
+                    return {};
+                }
+                report_success(owner_id);
+                return lite3cpp::Buffer(static_cast<const uint8_t*>(msg.data()), msg.size());
+            } else {
+                throw FederationTimeoutException("Node fetch timed out");
+            }
+        } catch (...) {
+            report_failure(owner_id);
+            throw;
+        }
+    });
+}
+
+std::future<bool> RemoteL3KVClient::put_node_async(lite3::NodeID owner_id, uint64_t target_node_id, const lite3cpp::Buffer& payload, uint32_t principal_id) {
+    auto session = get_session(owner_id);
+    if (!session) {
+        std::promise<bool> p; p.set_value(false); return p.get_future();
+    }
+
+    try {
+        check_circuit(session);
+        ensure_authenticated(session, owner_id);
+    } catch (...) {
+        std::promise<bool> p; p.set_exception(std::current_exception()); return p.get_future();
+    }
+
+    return task_pool_->enqueue([this, owner_id, session, target_node_id, payload, principal_id]() -> bool {
+        std::lock_guard<std::recursive_mutex> lock(session->mu);
+        try {
+            std::string key = std::string(KeyBuilder::node_key(target_node_id));
+            session->socket->send(zmq::message_t(), zmq::send_flags::sndmore);
+            uint32_t pid = principal_id;
+            session->socket->send(zmq::message_t(&pid, 4), zmq::send_flags::sndmore);
+            session->socket->send(zmq::message_t("P", 1), zmq::send_flags::sndmore);
+            session->socket->send(zmq::message_t(key.data(), key.size()), zmq::send_flags::sndmore);
+            session->socket->send(zmq::message_t(payload.data(), payload.size()), zmq::send_flags::none);
+
+            std::vector<zmq::message_t> recv_msgs;
+            auto res = zmq::recv_multipart(*session->socket, std::back_inserter(recv_msgs));
+            if (res && recv_msgs.size() >= 2 && recv_msgs[1].to_string() == "OK") {
+                report_success(owner_id);
+                return true;
+            }
+            return false;
+        } catch (...) {
+            report_failure(owner_id);
+            return false;
         }
     });
 }

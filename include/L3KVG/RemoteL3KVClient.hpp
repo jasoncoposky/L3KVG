@@ -67,6 +67,13 @@ public:
         uint32_t principal_id = l3kv::INTERNAL_UID
     );
 
+    virtual std::future<lite3cpp::Buffer> resume_query_buffer_async(
+        uint16_t cluster_id,
+        const std::vector<uint64_t>& starting_nodes,
+        const lite3cpp::Buffer& query_buf,
+        uint32_t principal_id = l3kv::INTERNAL_UID
+    );
+
     virtual std::future<std::vector<ResultRow>> resume_query_async(
         uint16_t cluster_id,
         const std::vector<uint64_t>& starting_nodes,
@@ -82,6 +89,12 @@ public:
     );
 
     std::future<std::string> get_node_payload_async(
+        lite3::NodeID owner_id,
+        uint64_t target_node_id,
+        uint32_t principal_id = l3kv::INTERNAL_UID
+    );
+
+    std::future<lite3cpp::Buffer> get_node_buffer_async(
         lite3::NodeID owner_id,
         uint64_t target_node_id,
         uint32_t principal_id = l3kv::INTERNAL_UID
@@ -140,6 +153,13 @@ public:
         lite3::NodeID owner_id,
         uint64_t target_node_id, 
         const std::string& json_payload,
+        uint32_t principal_id = l3kv::INTERNAL_UID
+    );
+
+    std::future<bool> put_node_async(
+        lite3::NodeID owner_id,
+        uint64_t target_node_id,
+        const lite3cpp::Buffer& payload,
         uint32_t principal_id = l3kv::INTERNAL_UID
     );
 

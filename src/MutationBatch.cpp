@@ -32,6 +32,10 @@ void MutationBatch::put_node(uint64_t node_id, std::string_view payload) {
     buf_.set_i64(0, "c", static_cast<int64_t>(count_));
 }
 
+void MutationBatch::put_node(uint64_t node_id, const lite3cpp::Buffer& payload) {
+    put_node(node_id, std::string_view(reinterpret_cast<const char*>(payload.data()), payload.size()));
+}
+
 void MutationBatch::add_edge(uint64_t src, std::string_view label, double weight, uint64_t dst, std::string_view payload) {
     size_t ofs = buf_.arr_append_obj(arr_ofs_);
     buf_.set_i64(ofs, "op", static_cast<int64_t>(MutationOp::AddEdge));
