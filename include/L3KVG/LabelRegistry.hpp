@@ -25,10 +25,15 @@ public:
     [[nodiscard]] std::string_view get_label(uint16_t id) const noexcept;
     [[nodiscard]] size_t size() const noexcept;
     [[nodiscard]] uint64_t instance_id() const noexcept { return instance_id_; }
+    void set_dict_path(std::string path);
+    bool persist() const noexcept;
 
 private:
+    bool persist_unlocked() const noexcept;
+
     uint64_t instance_id_{0};
     mutable std::shared_mutex mutex_;
+    std::string dict_path_;
     std::unordered_map<std::string_view, uint16_t> label_to_id_;
     std::deque<std::string> id_to_label_{""}; // 1-indexed (0 reserved for NONE)
 };

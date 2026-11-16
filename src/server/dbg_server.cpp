@@ -18,9 +18,7 @@
 #include "observability.hpp"
 #include "buffer.hpp"
 
-namespace lite3cpp::lite3_json {
-    Buffer from_json_string(const std::string& json_str);
-}
+#include "json.hpp"
 
 class FileLogger : public lite3cpp::ILogger {
 public:

@@ -11,9 +11,7 @@
 #include "irods/rodsLog.h"
 #endif
 
-namespace lite3cpp::lite3_json {
-    Buffer from_json_string(const std::string& json_str);
-}
+#include "json.hpp"
 
 namespace l3kvg {
 

@@ -1,21 +1,15 @@
 cmake_minimum_required(VERSION 3.20)
 project(L3KVG VERSION 0.1.0 LANGUAGES CXX C)
 
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Choose the type of build." FORCE)
+endif()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Include L3KV, which transitively includes lite3-cpp and now ZeroMQ via FetchContent
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../L3KV ${CMAKE_CURRENT_BINARY_DIR}/L3KV)
-
-include(FetchContent)
-FetchContent_Declare(
-  citor
-  GIT_REPOSITORY https://github.com/Lallapallooza/citor.git
-  GIT_TAG        main
-)
-FetchContent_MakeAvailable(citor)
-
-
 
 add_library(l3kvg_engine STATIC
     src/Engine.cpp
@@ -54,12 +48,12 @@ target_include_directories(l3kvg_engine PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/../L3KV/src"
     "${CMAKE_CURRENT_SOURCE_DIR}/../L3KV/lib/concurrentqueue"
     "${CMAKE_CURRENT_SOURCE_DIR}/../lib/liblite3client/external"
-    ${citor_SOURCE_DIR}/single_include
-    ${citor_SOURCE_DIR}/include
 )
 
 if(MSVC)
     target_compile_options(l3kvg_engine PRIVATE /bigobj)
+else()
+    target_compile_options(l3kvg_engine PUBLIC $<$<CONFIG:Release,RelWithDebInfo>:-O3>)
 endif()
 
 target_link_libraries(l3kvg_engine PUBLIC
@@ -81,6 +75,16 @@ endif()
 # Tests
 enable_testing()
 find_package(Threads REQUIRED)
+if(NOT TARGET gtest_main)
+    include(FetchContent)
+    set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+    FetchContent_Declare(
+      gtest
+      GIT_REPOSITORY https://github.com/google/googletest.git
+      GIT_TAG v1.17.0
+    )
+    FetchContent_MakeAvailable(gtest)
+endif()
 add_executable(test_l3kvg tests/test_engine.cpp)
 target_link_libraries(test_l3kvg PRIVATE l3kvg_engine gtest_main Threads::Threads)
 
@@ -188,6 +192,9 @@ add_test(NAME test_server_concurrency COMMAND test_server_concurrency)
 
 add_executable(l3kvg_server src/server/main.cpp)
 target_link_libraries(l3kvg_server PRIVATE l3kvg_engine Threads::Threads $<$<BOOL:${WIN32}>:ws2_32> $<$<BOOL:${WIN32}>:wsock32> $<$<BOOL:${WIN32}>:crypt32>)
+if(NOT MSVC)
+    target_compile_options(l3kvg_server PRIVATE $<$<CONFIG:Release,RelWithDebInfo>:-O3>)
+endif()
 
 add_executable(dbg_server src/server/dbg_server.cpp)
 target_link_libraries(dbg_server PRIVATE l3kvg_engine Threads::Threads $<$<BOOL:${WIN32}>:ws2_32> $<$<BOOL:${WIN32}>:wsock32> $<$<BOOL:${WIN32}>:crypt32>)

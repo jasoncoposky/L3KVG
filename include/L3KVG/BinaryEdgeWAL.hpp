@@ -74,7 +74,12 @@ public:
 
     void append(const EdgeMutationOp& op);
     void append_batch(std::span<const EdgeMutationOp> ops);
+    void append_unlocked(const EdgeMutationOp& op);
+    void append_batch_unlocked(std::span<const EdgeMutationOp> ops);
+    [[nodiscard]] std::mutex& write_mutex() noexcept { return write_mutex_; }
     size_t recover(AdjacencyStore& store);
+    bool compact(const AdjacencyStore& store);
+    [[nodiscard]] uint64_t file_size() const noexcept;
     void flush();
     void close();
     [[nodiscard]] bool is_open() const noexcept;

@@ -244,15 +244,15 @@ TEST(SIMDFilterTest, FilterEdgesCallback) {
         make_edge(103, 1, 6.0f, true),
         make_edge(104, 1, 8.0f, false) // tombstone
     };
-    edges[0].prop_index = 42;
-    edges[2].prop_index = 84;
+    edges[0].hlc_timestamp = (1ULL << 40) + 42;
+    edges[2].hlc_timestamp = (1ULL << 40) + 84;
 
     // 1. Callback taking `const PackedEdge&`
-    std::vector<uint32_t> prop_indices;
+    std::vector<uint64_t> hlc_timestamps;
     SIMDFilter::filter_edges_cb(edges, 1, 1.0f, [&](const PackedEdge& edge) {
-        prop_indices.push_back(edge.prop_index);
+        hlc_timestamps.push_back(edge.hlc_timestamp);
     });
-    EXPECT_EQ(prop_indices, (std::vector<uint32_t>{42, 84}));
+    EXPECT_EQ(hlc_timestamps, (std::vector<uint64_t>{(1ULL << 40) + 42, (1ULL << 40) + 84}));
 
     // 2. Callback taking `uint64_t`
     std::vector<uint64_t> target_ids;

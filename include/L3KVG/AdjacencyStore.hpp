@@ -102,11 +102,110 @@ public:
     AdjacencyStore(AdjacencyStore&&) = delete;
     AdjacencyStore& operator=(AdjacencyStore&&) = delete;
 
-    void add_edge(uint64_t src_id, uint64_t dst_id, uint16_t label_id,
+    bool add_edge(uint64_t src_id, uint64_t dst_id, uint16_t label_id,
                   float weight = 1.0f, uint16_t flags = PackedEdge::FLAG_ACTIVE,
-                  uint32_t prop_index = 0, uint32_t hlc = 0);
+                  uint32_t prop_index = 0, uint64_t hlc = 0);
 
-    bool del_edge(uint64_t src_id, uint64_t dst_id, uint16_t label_id, float weight = -1.0f);
+    bool del_edge(uint64_t src_id, uint64_t dst_id, uint16_t label_id,
+                  float weight = -1.0f,
+                  uint16_t* out_removed_flags = nullptr,
+                  float* out_removed_weight = nullptr);
+
+    struct IncidentEdgeRecord {
+        uint64_t src_id{0};
+        uint64_t dst_id{0};
+        uint16_t label_id{0};
+        uint16_t flags{0};
+        float weight{1.0f};
+    };
+
+    [[nodiscard]] std::vector<IncidentEdgeRecord> remove_vertex(uint64_t id);
+
+    template <typename ReserveFn, typename VisitFn>
+    void snapshot_active_edges(ReserveFn&& reserve_fn, VisitFn&& visitor) const {
+        std::array<std::shared_lock<SharedSpinLock>, NUM_SHARDS> locks;
+        for (size_t s_idx = 0; s_idx < NUM_SHARDS; ++s_idx) {
+            locks[s_idx] = std::shared_lock<SharedSpinLock>(shards_[s_idx].mutex);
+        }
+
+        size_t total = 0;
+        for (size_t s_idx = 0; s_idx < NUM_SHARDS; ++s_idx) {
+            for (const auto& [_, v] : shards_[s_idx].directory) {
+                total += v.get_out_degree();
+            }
+        }
+        reserve_fn(total);
+
+        for (size_t s_idx = 0; s_idx < NUM_SHARDS; ++s_idx) {
+            const auto& shard = shards_[s_idx];
+            for (const auto& [src_id, v] : shard.directory) {
+                if (v.is_inlined()) {
+                    if (v.inline_edge.is_active()) {
+                        visitor(src_id, v.inline_edge);
+                    }
+                    continue;
+                }
+                if (!v.is_promoted()) continue;
+                uint32_t curr_id = v.ext.out_block_id;
+                while (curr_id != 0) {
+                    uint32_t p_shard = decode_shard_index(curr_id);
+                    uint32_t p_local = decode_local_page_id(curr_id);
+                    if (p_shard != s_idx || p_local >= shard.page_pool.size()) break;
+                    const auto& page = shard.page_pool[p_local];
+                    if (page.next_page_id == curr_id) break;
+                    for (uint32_t i = 0; i < page.count; ++i) {
+                        if (page.edges[i].is_active()) {
+                            visitor(src_id, page.edges[i]);
+                        }
+                    }
+                    curr_id = page.next_page_id;
+                }
+            }
+        }
+    }
+
+    template <typename F>
+    void for_each_active_edge(F&& visitor) const {
+        for (size_t s_idx = 0; s_idx < NUM_SHARDS; ++s_idx) {
+            const auto& shard = shards_[s_idx];
+            std::shared_lock lock(shard.mutex);
+            for (const auto& [src_id, v] : shard.directory) {
+                if (v.is_inlined()) {
+                    if (v.inline_edge.is_active()) {
+                        visitor(src_id, v.inline_edge);
+                    }
+                    continue;
+                }
+                if (!v.is_promoted()) continue;
+                uint32_t curr_id = v.ext.out_block_id;
+                while (curr_id != 0) {
+                    uint32_t p_shard = decode_shard_index(curr_id);
+                    uint32_t p_local = decode_local_page_id(curr_id);
+                    if (p_shard != s_idx || p_local >= shard.page_pool.size()) break;
+                    const auto& page = shard.page_pool[p_local];
+                    if (page.next_page_id == curr_id) break;
+                    for (uint32_t i = 0; i < page.count; ++i) {
+                        if (page.edges[i].is_active()) {
+                            visitor(src_id, page.edges[i]);
+                        }
+                    }
+                    curr_id = page.next_page_id;
+                }
+            }
+        }
+    }
+
+    [[nodiscard]] size_t total_active_edges() const noexcept {
+        size_t total = 0;
+        for (size_t s_idx = 0; s_idx < NUM_SHARDS; ++s_idx) {
+            const auto& shard = shards_[s_idx];
+            std::shared_lock lock(shard.mutex);
+            for (const auto& [_, v] : shard.directory) {
+                total += v.get_out_degree();
+            }
+        }
+        return total;
+    }
 
     template <typename F>
     void for_each_outgoing_edge(uint64_t src_id, F&& visitor) const {

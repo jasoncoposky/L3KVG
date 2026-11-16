@@ -12,8 +12,7 @@ TEST(PackedEdgeTest, StructSizeAndAlignment) {
     edge.label_id = 42;
     edge.flags = l3kvg::PackedEdge::FLAG_ACTIVE | l3kvg::PackedEdge::FLAG_DIRECTED;
     edge.weight = 1.5f;
-    edge.prop_index = 100;
-    edge.hlc_logical = 7;
+    edge.hlc_timestamp = 0x0011223344556677ULL;
 
     EXPECT_TRUE(edge.is_active());
     EXPECT_FALSE(edge.has_properties());
@@ -41,8 +40,7 @@ TEST(PackedEdgeTest, EqualityOperator) {
         .label_id = 1,
         .flags = l3kvg::PackedEdge::FLAG_ACTIVE | l3kvg::PackedEdge::FLAG_DIRECTED,
         .weight = 2.5f,
-        .prop_index = 42,
-        .hlc_logical = 99
+        .hlc_timestamp = 0x123456789ABCDEF0ULL
     };
     l3kvg::PackedEdge e2 = e1;
     EXPECT_EQ(e1, e2);
@@ -59,10 +57,7 @@ TEST(PackedEdgeTest, EqualityOperator) {
     e2.weight = 3.0f;
     EXPECT_NE(e1, e2);
     e2 = e1;
-    e2.prop_index = 43;
-    EXPECT_NE(e1, e2);
-    e2 = e1;
-    e2.hlc_logical = 100;
+    e2.hlc_timestamp = 0x123456789ABCDEF1ULL;
     EXPECT_NE(e1, e2);
 }
 

@@ -69,6 +69,7 @@ public:
 
   void del_node(uint64_t id);
   void flush();
+  void compact_wal();
 
   static std::string format_weight(double weight);
 
@@ -134,6 +135,7 @@ private:
   LabelRegistry label_registry_;
   AdjacencyStore adjacency_store_;
   std::unique_ptr<BinaryEdgeWAL> edge_wal_;
+  std::mutex local_edge_mu_;
 
   std::unique_ptr<l3kv::Engine> store_;
   FederationResolver resolver_;

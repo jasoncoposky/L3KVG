@@ -13,7 +13,8 @@ enum class MutationOp : uint8_t {
     AddEdge = 2,
     DelRaw = 3,
     DelNode = 4,
-    DelEdge = 5
+    DelEdge = 5,
+    IncNodeInt = 6
 };
 
 struct MutationItem {
@@ -24,6 +25,7 @@ struct MutationItem {
     uint64_t dst = 0;
     std::string_view label;
     double weight = 1.0;
+    int64_t int_delta = 0;
 };
 
 class MutationBatch {
@@ -33,8 +35,9 @@ public:
     void put_raw(std::string_view key, std::string_view value);
     void put_node(uint64_t node_id, std::string_view payload);
     void put_node(uint64_t node_id, const lite3cpp::Buffer& payload);
-    void add_edge(uint64_t src, std::string_view label, double weight, uint64_t dst, std::string_view payload = "{}");
+    void add_edge(uint64_t src, std::string_view label, double weight, uint64_t dst, std::string_view payload = "");
     void add_index(std::string_view key, std::string_view value_hex);
+    void inc_node_int(uint64_t node_id, std::string_view key, int64_t delta);
     
     void del_raw(std::string_view key);
     void del_node(uint64_t node_id);
@@ -42,6 +45,7 @@ public:
 
     [[nodiscard]] MutationItem get(size_t index) const;
     static MutationItem read_item(const lite3cpp::Buffer& buf, size_t index);
+    static MutationItem read_item_at_offset(const lite3cpp::Buffer& buf, size_t item_ofs) noexcept;
     static size_t item_count(const lite3cpp::Buffer& buf);
 
     [[nodiscard]] const lite3cpp::Buffer& get_buffer() const noexcept { return buf_; }
