@@ -62,6 +62,14 @@ Node::~Node() = default;
 
 bool Node::try_load_local(uint32_t principal_id) {
   using namespace lite3cpp::literals;
+  std::string_view key = KeyBuilder::node_key(id_);
+  if (principal_id != INTERNAL_UID && principal_id != ADMIN_UID) {
+    auto perm = engine_->get_store()->credentials().check_permission(principal_id, key);
+    if (!(perm & l3kv::Permission::READ) && !(perm & l3kv::Permission::ADMIN)) {
+      return false;
+    }
+  }
+
   if (loaded_.load(std::memory_order_acquire))
     return true;
 
@@ -69,8 +77,7 @@ bool Node::try_load_local(uint32_t principal_id) {
   if (loaded_.load(std::memory_order_relaxed))
     return true;
 
-  std::string_view key = KeyBuilder::node_key(id_);
-  auto blob = engine_->get_store()->get_blob(key, principal_id);
+  auto blob = engine_->get_store()->get_blob(key, INTERNAL_UID);
   if (blob && blob->view().size() > 0) {
     blob_pin_ = std::move(blob);
     auto v = blob_pin_->view();
@@ -155,6 +162,9 @@ void Node::ensure_loaded() {
           }
       } catch (const std::exception& e) {
           std::cerr << "[Node::ensure_loaded] Remote Fetch Failed: " << e.what() << "\n";
+          return;
+      } catch (...) {
+          return;
       }
   }
   loaded_.store(true, std::memory_order_release);
@@ -239,15 +249,17 @@ std::vector<uint64_t> Node::get_neighbors(std::string_view label,
       lid = engine_->get_label_registry().lookup(label);
   }
 
+  const bool allow_kv_fallback = engine_->has_legacy_kv_edges() || !engine_->get_settings().cluster_endpoints.empty();
+  auto& resolver = engine_->get_resolver();
+
   std::vector<uint64_t> neighbors;
   if (lid != 0 || label.empty()) {
       engine_->get_adjacency_store().filter_outgoing_edges(id_, lid, static_cast<float>(min_weight), neighbors);
-      if (!neighbors.empty() || engine_->get_adjacency_store().get_out_degree(id_) > 0) {
+      if (!neighbors.empty() || (!allow_kv_fallback && resolver.is_local(id_))) {
           return neighbors;
       }
   }
 
-  const bool allow_kv_fallback = engine_->has_legacy_kv_edges() || !engine_->get_settings().cluster_endpoints.empty();
   if (allow_kv_fallback && might_have_edge(label)) {
       std::string_view prefix = KeyBuilder::edge_prefix(id_, label);
       std::string_view min_w_str = KeyBuilder::format_weight(min_weight);
@@ -286,7 +298,6 @@ std::vector<uint64_t> Node::get_neighbors(std::string_view label,
       }
   }
 
-  auto& resolver = engine_->get_resolver();
   if (!resolver.is_local(id_)) {
       lite3::NodeID owner = resolver.get_node_owner(id_);
       auto& client = engine_->get_remote_client();
@@ -306,6 +317,9 @@ std::vector<uint64_t> Node::get_in_neighbors(std::string_view label, uint32_t pr
       lid = engine_->get_label_registry().lookup(label);
   }
 
+  const bool allow_kv_fallback = engine_->has_legacy_kv_edges() || !engine_->get_settings().cluster_endpoints.empty();
+  auto& resolver = engine_->get_resolver();
+
   std::vector<uint64_t> neighbors;
   if (lid != 0 || label.empty()) {
       engine_->get_adjacency_store().for_each_incoming_edge(id_, [&](const PackedEdge& pe) {
@@ -313,12 +327,11 @@ std::vector<uint64_t> Node::get_in_neighbors(std::string_view label, uint32_t pr
               neighbors.push_back(pe.target_id);
           }
       });
-      if (!neighbors.empty() || engine_->get_adjacency_store().get_in_degree(id_) > 0) {
+      if (!neighbors.empty() || (!allow_kv_fallback && resolver.is_local(id_))) {
           return neighbors;
       }
   }
 
-  const bool allow_kv_fallback = engine_->has_legacy_kv_edges() || !engine_->get_settings().cluster_endpoints.empty();
   if (allow_kv_fallback) {
       std::string prefix_str(KeyBuilder::edge_in_prefix(id_, label));
       auto *store = engine_->get_store();
@@ -349,7 +362,6 @@ std::vector<uint64_t> Node::get_in_neighbors(std::string_view label, uint32_t pr
       }
   }
 
-  auto& resolver = engine_->get_resolver();
   if (!resolver.is_local(id_)) {
       lite3::NodeID owner = resolver.get_node_owner(id_);
       auto& client = engine_->get_remote_client();
@@ -597,6 +609,16 @@ std::string Node::get_attribute_as_string(std::string_view key) {
       bin && bin->size() >= sizeof(lite3cpp::PackedNodeLayout)) {
       lite3cpp::Buffer nested = lite3cpp::Buffer::from_view(*bin);
       if (auto span = nested.try_get_bytes(0, hk)) {
+          return format_bytes_hex(*span);
+      }
+      if (auto p_ofs = nested.try_get_obj(0, "properties"_hk)) {
+          if (auto span = nested.try_get_bytes(*p_ofs, hk)) {
+              return format_bytes_hex(*span);
+          }
+      }
+  }
+  if (auto p_ofs = payload_->try_get_obj(0, "properties"_hk)) {
+      if (auto span = payload_->try_get_bytes(*p_ofs, hk)) {
           return format_bytes_hex(*span);
       }
   }

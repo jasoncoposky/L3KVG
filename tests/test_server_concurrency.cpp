@@ -1177,4 +1177,139 @@ TEST(ServerConcurrencyTest, SynchronousClientParallelismWithoutGlobalSocketLock)
     ctx.close();
 }
 
+TEST(ServerConcurrencyTest, TimeoutInvalidatesTlsSocketPreventingStaleReplyDesync) {
+    uint16_t port = g_test_port.fetch_add(1);
+    std::atomic<bool> running{true};
+    std::atomic<int> req_num{0};
+
+    // Server delays 250ms on request #1 (exceeding client's 100ms rcvtimeo), then STILL sends "STALE_REPLY_1",
+    // and replies immediately with "FRESH_REPLY_2" on request #2.
+    // Without socket invalidation on timeout, request #2 would pop "STALE_REPLY_1" (off-by-one corruption)!
+    zmq::context_t ctx(1);
+    zmq::socket_t router(ctx, zmq::socket_type::router);
+    router.set(zmq::sockopt::linger, 0);
+    router.set(zmq::sockopt::rcvtimeo, 50);
+    router.bind("tcp://127.0.0.1:" + std::to_string(port));
+
+    std::thread srv([&]() {
+        while (running.load(std::memory_order_relaxed)) {
+            std::vector<zmq::message_t> msgs;
+            try {
+                if (!zmq::recv_multipart(router, std::back_inserter(msgs)) || msgs.size() < 4) continue;
+            } catch (...) { break; }
+            int n = req_num.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n == 1) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(220));
+                router.send(msgs[0], zmq::send_flags::sndmore);
+                router.send(zmq::message_t(), zmq::send_flags::sndmore);
+                router.send(zmq::message_t("STALE_REPLY_1", 13), zmq::send_flags::none);
+            } else {
+                router.send(msgs[0], zmq::send_flags::sndmore);
+                router.send(zmq::message_t(), zmq::send_flags::sndmore);
+                router.send(zmq::message_t("FRESH_REPLY_2", 13), zmq::send_flags::none);
+            }
+        }
+    });
+
+    l3kvg::Settings csettings;
+    csettings.fed_timeout_ms = 100;
+    csettings.breaker_failure_threshold = 5;
+    l3kvg::RemoteL3KVClient client(csettings);
+    client.add_peer(1, "tcp://127.0.0.1:" + std::to_string(port));
+
+    // Request #1 times out at ~100ms
+    EXPECT_THROW((void)client.get_raw_key(1, "k1"), l3kvg::FederationTimeoutException);
+
+    // Wait until server has sent the late "STALE_REPLY_1"
+    std::this_thread::sleep_for(std::chrono::milliseconds(180));
+
+    // Request #2 on the SAME thread MUST receive "FRESH_REPLY_2", NOT "STALE_REPLY_1"!
+    EXPECT_EQ(client.get_raw_key(1, "k2"), "FRESH_REPLY_2");
+
+    running.store(false, std::memory_order_relaxed);
+    srv.join();
+    router.close();
+    ctx.close();
+}
+
+TEST(ServerConcurrencyTest, RealServerRestartAutoReauthAndPrincipalAclEnforcement) {
+    uint16_t zmq_port = g_test_port.fetch_add(2);
+    uint16_t http_port = zmq_port + 1;
+    std::string db = "test_real_svr_reauth_acl_" + std::to_string(zmq_port);
+    const std::string secret = "reauth-acl-secret";
+
+    auto server = std::make_unique<RealServerProcess>(zmq_port, http_port, db, secret);
+    server->start();
+
+    l3kvg::Settings csettings;
+    csettings.node_id = 2;
+    csettings.fed_timeout_ms = 3000;
+    l3kvg::RemoteL3KVClient client(csettings);
+    auto pool = std::make_shared<l3kvg::ThreadPool>(2);
+    client.set_thread_pool(pool);
+    client.set_auth_secret(secret);
+    client.add_peer(1, "tcp://127.0.0.1:" + std::to_string(zmq_port));
+
+    // 1. Authenticate & write initial data on this thread's socket
+    l3kvg::MutationBatch seed;
+    seed.put_node(0x6001, R"({"n":"protected_node"})");
+    seed.add_edge(0x6001, "SECRET_EDGE", 1.0, 0x6002);
+    ASSERT_TRUE(client.execute_batch(1, seed.get_buffer()));
+    ASSERT_EQ(client.get_neighbors(1, 0x6001, "SECRET_EDGE").size(), 1u);
+
+    // 2. Restart real l3kvg_server on the SAME port (clears server AuthRegistry while client TLS socket was authenticated)
+    server->stop();
+    server = std::make_unique<RealServerProcess>(zmq_port, http_port, db, secret);
+    server->start();
+
+    // Client MUST automatically re-authenticate on "ERR_UNAUTH" and succeed without manual intervention!
+    l3kvg::MutationBatch post_restart;
+    post_restart.put_node(0x6001, R"({"n":"after_restart"})");
+    post_restart.add_edge(0x6001, "SECRET_EDGE", 1.0, 0x6002);
+    ASSERT_TRUE(client.execute_batch(1, post_restart.get_buffer()));
+    EXPECT_FALSE(client.get_node_payload(1, 0x6001).empty());
+
+    // Register restricted user 901 with READ/WRITE ONLY on n:{0000000000006099}, NOT 0x6001!
+    ASSERT_TRUE(client.put_raw_async(1, "sys:u:901", R"({"name":"user901","public_key":"pk901"})").get());
+    ASSERT_TRUE(client.put_raw_async(1, "sys:acl:901:n:{0000000000006099}", "READ|WRITE").get());
+
+    // 3. Principal ACL enforcement across "G" (Multi-Read OutNeighbors/InNeighbors/NodePayload), "N", "P", "D"
+    const uint32_t restricted_uid = 901;
+
+    // Unauthorized "P" (put_node) and "D" (del_node) on 0x6001 as UID 901 MUST be rejected
+    EXPECT_FALSE(client.put_node_async(1, 0x6001, R"({"n":"tampered"})", restricted_uid).get());
+    EXPECT_FALSE(client.del_node_async(1, 0x6001, restricted_uid).get());
+
+    // Authorized "P" on 0x6099 as UID 901 MUST succeed
+    EXPECT_TRUE(client.put_node_async(1, 0x6099, R"({"n":"allowed_901"})", restricted_uid).get());
+
+    // Unauthorized "N" (get_neighbors) on 0x6001 as UID 901 MUST return empty (and NOT trip circuit breaker!)
+    EXPECT_TRUE(client.get_neighbors(1, 0x6001, "SECRET_EDGE", 0.0, restricted_uid).empty());
+    EXPECT_EQ(client.get_circuit_state(1), l3kvg::CircuitState::CLOSED);
+
+    // Unauthorized "G" Multi-Read on 0x6001 vs authorized 0x6099 as UID 901
+    std::vector<l3kvg::GraphReadOp> acl_ops = {
+        {l3kvg::GraphReadKind::NodePayload, 0x6001, "", 0.0},
+        {l3kvg::GraphReadKind::OutNeighbors, 0x6001, "SECRET_EDGE", 0.0},
+        {l3kvg::GraphReadKind::InNeighbors, 0x6002, "SECRET_EDGE", 0.0},
+        {l3kvg::GraphReadKind::NodePayload, 0x6099, "", 0.0}
+    };
+    auto acl_res = client.execute_multi_read(1, acl_ops, restricted_uid);
+    ASSERT_EQ(acl_res.size(), 4u);
+    EXPECT_FALSE(acl_res[0].found);
+    EXPECT_FALSE(acl_res[1].found);
+    EXPECT_TRUE(acl_res[1].neighbors.empty());
+    EXPECT_FALSE(acl_res[2].found);
+    EXPECT_TRUE(acl_res[2].neighbors.empty());
+    EXPECT_TRUE(acl_res[3].found);
+
+    // Admin still sees 0x6001 intact (not deleted or tampered)
+    auto admin_neigh = client.get_neighbors(1, 0x6001, "SECRET_EDGE");
+    ASSERT_EQ(admin_neigh.size(), 1u);
+    EXPECT_EQ(admin_neigh[0], 0x6002u);
+
+    server->stop();
+}
+
+
 

@@ -53,6 +53,7 @@ public:
      */
     void parallel_for(size_t first, size_t last, std::function<void(size_t, size_t)> fn);
     size_t size() const noexcept;
+    static bool is_worker_thread() noexcept;
 
 private:
     void push_task_internal(std::function<void()> task);

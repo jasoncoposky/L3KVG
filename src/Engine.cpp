@@ -405,10 +405,13 @@ std::vector<std::shared_ptr<Node>> Engine::fetch_nodes(const std::vector<uint64_
     for (size_t i = first; i < last; ++i) {
       uint64_t id = ids[i];
       auto node = get_node(id);
-      if (node && !node->is_loaded()) {
-        node->try_load_local(principal_id);
+      if (node) {
+        if (node->try_load_local(principal_id)) {
+          result[i] = std::move(node);
+        } else if (!resolver_.is_local(id)) {
+          result[i] = std::move(node);
+        }
       }
-      result[i] = std::move(node);
     }
   });
 
@@ -441,7 +444,8 @@ std::vector<std::shared_ptr<Node>> Engine::fetch_nodes(const std::vector<uint64_
 
   for (size_t i = 0; i < ids.size(); ++i) {
     if (result[i] && !result[i]->is_loaded()) {
-      result[i] = get_node(ids[i]);
+      auto refreshed = get_node(ids[i]);
+      result[i] = (refreshed && refreshed->is_loaded()) ? std::move(refreshed) : nullptr;
     }
   }
 

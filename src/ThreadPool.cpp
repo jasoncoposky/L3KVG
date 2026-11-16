@@ -10,6 +10,10 @@
 
 namespace l3kvg {
 
+namespace {
+thread_local bool tl_in_pool_worker = false;
+} // namespace
+
 struct ThreadPool::Impl {
     std::vector<std::thread> workers;
     std::queue<std::function<void()>> tasks;
@@ -23,6 +27,7 @@ struct ThreadPool::Impl {
         workers.reserve(num_threads);
         for (size_t i = 0; i < num_threads; ++i) {
             workers.emplace_back([this] {
+                tl_in_pool_worker = true;
                 while (true) {
                     std::function<void()> task;
                     {
@@ -79,7 +84,7 @@ struct ThreadPool::Impl {
     void parallel_for(size_t first, size_t last, std::function<void(size_t, size_t)> fn) {
         if (first >= last) return;
         size_t total = last - first;
-        if (workers.empty() || num_threads <= 1 || total < 64) {
+        if (tl_in_pool_worker || workers.empty() || num_threads <= 1 || total < 64) {
             fn(first, last);
             return;
         }
@@ -116,5 +121,6 @@ ThreadPool::~ThreadPool() = default;
 void ThreadPool::push_task_internal(std::function<void()> task) { pimpl_->push_task(std::move(task)); }
 void ThreadPool::parallel_for(size_t first, size_t last, std::function<void(size_t, size_t)> fn) { pimpl_->parallel_for(first, last, std::move(fn)); }
 size_t ThreadPool::size() const noexcept { return pimpl_->num_threads; }
+bool ThreadPool::is_worker_thread() noexcept { return tl_in_pool_worker; }
 
 } // namespace l3kvg

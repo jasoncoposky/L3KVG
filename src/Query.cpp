@@ -200,7 +200,7 @@ bool evaluate_filter(Node* node, const Query::Filter& f, Engine* engine) {
         }
     }
 
-    if (f.key == "id") {
+    if (f.key == "id" && (f.op == Query::Op::Eq || f.op == Query::Op::Ne)) {
         auto id_attr = node->try_get_attr("id"_hk);
         if (const auto* sv = std::get_if<std::string_view>(&id_attr); sv && !sv->empty()) {
             if (f.op == Query::Op::Eq && *sv == f.value) return true;
@@ -213,11 +213,7 @@ bool evaluate_filter(Node* node, const Query::Filter& f, Engine* engine) {
         }
         uint64_t target_id = engine->get_resolver().parse_uuid(f.value);
         uint64_t node_id = node->get_id();
-        switch (f.op) {
-            case Query::Op::Eq: return node_id == target_id;
-            case Query::Op::Ne: return node_id != target_id;
-            default: return false;
-        }
+        return (f.op == Query::Op::Eq) ? (node_id == target_id) : (node_id != target_id);
     }
 
     if (f.key == "_access_user") {
@@ -310,6 +306,11 @@ bool evaluate_filter(Node* node, const Query::Filter& f, Engine* engine) {
     const lite3cpp::HashedKey hk(f.key, key_hash);
     const Node::AttrValue attr = node->try_get_attr(hk);
     if (std::holds_alternative<std::monostate>(attr)) {
+        if (f.key == "id") {
+            char hex_id[17];
+            std::snprintf(hex_id, sizeof(hex_id), "%016llx", static_cast<unsigned long long>(node->get_id()));
+            return compare_string_filter(std::string_view(hex_id, 16), f, has_i64, f_i64, has_f64, f_f64);
+        }
         return false;
     }
 
@@ -955,7 +956,6 @@ std::vector<ResultRow> Query::execute() {
   }
 
   const bool needs_fields = (!sorts_.empty() || !groups_.empty() || has_agg);
-  const bool step0_populate_fields = needs_fields || (projections_.empty() && !flat_rows_);
   const bool should_populate_fields = needs_fields || ((!flat_rows_) && (populate_fields_ || projections_.empty()));
 
   std::vector<std::string> invariant_proj_names(projections_.size());
@@ -966,7 +966,7 @@ std::vector<ResultRow> Query::execute() {
   }
 
   std::vector<std::string> idx_names;
-  if (step0_populate_fields || (!steps_.empty() && should_populate_fields)) {
+  if (should_populate_fields) {
       idx_names.resize(projections_.size());
       for (size_t i = 0; i < projections_.size(); ++i) {
           idx_names[i] = "idx_" + std::to_string(i);
@@ -998,7 +998,9 @@ std::vector<ResultRow> Query::execute() {
   auto nodes = engine_->fetch_nodes(frontier, principal_id_);
   if (nodes.empty()) return results;
 
-  const size_t pool_threads = std::max<size_t>(1, engine_->get_thread_pool().size());
+  const size_t pool_threads = ThreadPool::is_worker_thread()
+                              ? 1
+                              : std::max<size_t>(1, engine_->get_thread_pool().size());
 
   if (steps_.empty()) {
       const size_t num_chunks = (nodes.size() < 64 || pool_threads <= 1)
@@ -1037,7 +1039,7 @@ std::vector<ResultRow> Query::execute() {
                   for (size_t i = 0; i < projections_.size(); ++i) {
                       if (projections_[i].alias == root_alias_ || projections_[i].alias.empty() || root_alias_.empty()) {
                           std::string& dst_val = row.projected_values[i];
-                          if (format_node_attr_into(raw_node, proj_hks[i], dst_val) && step0_populate_fields) {
+                          if (format_node_attr_into(raw_node, proj_hks[i], dst_val) && should_populate_fields) {
                               row.fields[invariant_proj_names[i]] = dst_val;
                               row.fields[idx_names[i]] = dst_val;
                           }

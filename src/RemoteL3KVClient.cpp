@@ -44,7 +44,55 @@ struct TlSocketKeyHash {
     }
 };
 
-using TlSocketMap = std::unordered_map<TlSocketKey, std::weak_ptr<void>, TlSocketKeyHash>;
+struct TlSocketEntry {
+    std::weak_ptr<RemoteL3KVClient::SocketRegistry> weak_registry;
+    std::shared_ptr<RemoteL3KVClient::TlSocketBox> box;
+
+    TlSocketEntry() = default;
+    TlSocketEntry(std::weak_ptr<RemoteL3KVClient::SocketRegistry> reg,
+                  std::shared_ptr<RemoteL3KVClient::TlSocketBox> b)
+        : weak_registry(std::move(reg)), box(std::move(b)) {}
+
+    TlSocketEntry(const TlSocketEntry&) = delete;
+    TlSocketEntry& operator=(const TlSocketEntry&) = delete;
+
+    TlSocketEntry(TlSocketEntry&& o) noexcept
+        : weak_registry(std::move(o.weak_registry)), box(std::move(o.box)) {}
+
+    TlSocketEntry& operator=(TlSocketEntry&& o) noexcept {
+        if (this != &o) {
+            cleanup();
+            weak_registry = std::move(o.weak_registry);
+            box = std::move(o.box);
+        }
+        return *this;
+    }
+
+    ~TlSocketEntry() {
+        cleanup();
+    }
+
+    void cleanup() noexcept {
+        if (!box) return;
+        if (auto reg = weak_registry.lock()) {
+            bool should_close = false;
+            {
+                std::lock_guard<std::mutex> lk(reg->mu);
+                if (!reg->client_closed) {
+                    reg->active.erase(box);
+                    should_close = true;
+                }
+            }
+            if (should_close) {
+                box->close_socket();
+            }
+        }
+        box.reset();
+        weak_registry.reset();
+    }
+};
+
+using TlSocketMap = std::unordered_map<TlSocketKey, TlSocketEntry, TlSocketKeyHash>;
 
 TlSocketMap& get_tl_socket_map() {
     thread_local TlSocketMap s_tl_map;
@@ -64,8 +112,23 @@ lite3cpp::Buffer clone_or_copy_buffer(const lite3cpp::Buffer& src) {
     return src;
 }
 
+bool is_unauth_frame(const zmq::message_t& msg) noexcept {
+    return msg.size() == 10 && std::memcmp(msg.data(), "ERR_UNAUTH", 10) == 0;
+}
+
+bool is_acl_err_frame(const zmq::message_t& msg) noexcept {
+    return (msg.size() == 13 && std::memcmp(msg.data(), "ERR_FORBIDDEN", 13) == 0) ||
+           (msg.size() == 8 && std::memcmp(msg.data(), "ERR_AUTH", 8) == 0) ||
+           is_unauth_frame(msg);
+}
+
+bool is_server_err_frame(const zmq::message_t& msg) noexcept {
+    return msg.size() == 3 && std::memcmp(msg.data(), "ERR", 3) == 0;
+}
+
 bool is_err_frame(const zmq::message_t& msg) noexcept {
-    return msg.size() >= 3 && std::memcmp(msg.data(), "ERR", 3) == 0;
+    return is_server_err_frame(msg) ||
+           (msg.size() >= 4 && std::memcmp(msg.data(), "ERR_", 4) == 0);
 }
 
 bool is_json_sv(std::string_view data) noexcept {
@@ -135,6 +198,7 @@ std::vector<uint64_t> parse_neighbors_message(const zmq::message_t& msg) {
 RemoteL3KVClient::RemoteL3KVClient(const Settings& settings)
     : client_instance_id_(s_next_client_instance_id.fetch_add(1, std::memory_order_relaxed)),
       settings_(settings),
+      socket_registry_(std::make_shared<SocketRegistry>()),
       zmq_sndhwm_(settings.zmq_sndhwm),
       zmq_ctx_(1),
       creator_pid_(getpid()) {
@@ -158,19 +222,20 @@ RemoteL3KVClient::~RemoteL3KVClient() {
     // 1. Join async worker pool before closing ZMQ sockets
     task_pool_.reset();
 
-    // 2. Close all per-thread ZMQ sockets registered with this client
+    // 2. Close all active per-thread ZMQ sockets registered with this client
+    std::unordered_set<std::shared_ptr<TlSocketBox>> to_close;
+    if (socket_registry_) {
+        std::lock_guard<std::mutex> reg_lk(socket_registry_->mu);
+        socket_registry_->client_closed = true;
+        to_close.swap(socket_registry_->active);
+    }
+    for (auto& box : to_close) {
+        if (box) {
+            box->close_socket();
+        }
+    }
     {
         std::lock_guard<std::mutex> lock(endpoints_mutex_);
-        for (auto& box : tls_sockets_) {
-            if (box && box->socket) {
-                try {
-                    box->socket->set(zmq::sockopt::linger, 0);
-                    box->socket->close();
-                } catch (...) {}
-                box->socket.reset();
-            }
-        }
-        tls_sockets_.clear();
         peers_.clear();
     }
 
@@ -187,6 +252,11 @@ void RemoteL3KVClient::set_auth_secret(const std::string& secret) {
         auth_secret_ = secret;
         config_epoch_.fetch_add(1, std::memory_order_release);
     }
+}
+
+bool RemoteL3KVClient::has_auth_secret() {
+    std::lock_guard<std::mutex> lock(endpoints_mutex_);
+    return !auth_secret_.empty();
 }
 
 void RemoteL3KVClient::add_peer(lite3::NodeID node_id, const std::string& endpoint_url) {
@@ -230,6 +300,14 @@ void RemoteL3KVClient::check_circuit(PeerState& peer) {
     }
 }
 
+void RemoteL3KVClient::invalidate_tl_socket(lite3::NodeID node_id, TlSocketBox* box) noexcept {
+    if (box) {
+        box->close_socket();
+    }
+    auto& tl_map = get_tl_socket_map();
+    tl_map.erase(TlSocketKey{client_instance_id_, node_id});
+}
+
 void RemoteL3KVClient::ensure_socket_authenticated(TlSocketBox& box, lite3::NodeID node_id) {
     if (box.authenticated) return;
 
@@ -265,6 +343,7 @@ void RemoteL3KVClient::ensure_socket_authenticated(TlSocketBox& box, lite3::Node
         std::string err = (res && recv_msgs.size() >= 2) ? recv_msgs[1].to_string() : "TIMEOUT";
         throw std::runtime_error("Authentication failed: " + err);
     } catch (...) {
+        invalidate_tl_socket(node_id, &box);
         report_failure(node_id);
         throw;
     }
@@ -280,40 +359,35 @@ RemoteL3KVClient::TlSocketBox* RemoteL3KVClient::get_or_create_tl_socket(
 
     // Fast path: thread_local lookup without locking endpoints_mutex_
     if (auto it = tl_map.find(key); it != tl_map.end()) {
-        if (auto sp_void = it->second.lock()) {
-            auto* box = static_cast<TlSocketBox*>(sp_void.get());
-            if (box->socket && box->config_epoch == curr_epoch) {
-                auto peer = get_peer_state(node_id);
-                if (!peer) return nullptr;
-                if (out_peer) *out_peer = peer;
-                check_circuit(*peer);
-                if (require_auth && !box->authenticated) {
-                    ensure_socket_authenticated(*box, node_id);
-                }
-                return box;
+        auto* box = it->second.box.get();
+        if (box && box->socket && box->config_epoch == curr_epoch && !it->second.weak_registry.expired()) {
+            auto peer = get_peer_state(node_id);
+            if (!peer) {
+                tl_map.erase(it);
+                return nullptr;
             }
-            // Stale config epoch on this thread's socket: close on owning thread
-            if (box->socket) {
-                try {
-                    box->socket->set(zmq::sockopt::linger, 0);
-                    box->socket->close();
-                } catch (...) {}
-                box->socket.reset();
+            if (out_peer) *out_peer = peer;
+            check_circuit(*peer);
+            if (require_auth && !box->authenticated) {
+                ensure_socket_authenticated(*box, node_id);
             }
+            return box;
         }
         tl_map.erase(it);
     }
 
-    // Periodic pruning of expired entries in thread_local map
+    // Prune any entries belonging to destroyed clients
     if (tl_map.size() > 64) {
         for (auto it = tl_map.begin(); it != tl_map.end();) {
-            if (it->second.expired()) it = tl_map.erase(it);
-            else ++it;
+            if (it->second.weak_registry.expired() || !it->second.box || !it->second.box->socket) {
+                it = tl_map.erase(it);
+            } else {
+                ++it;
+            }
         }
     }
 
     std::shared_ptr<PeerState> peer;
-    std::shared_ptr<TlSocketBox> new_box;
     {
         std::lock_guard<std::mutex> lock(endpoints_mutex_);
         auto pit = peers_.find(node_id);
@@ -321,28 +395,74 @@ RemoteL3KVClient::TlSocketBox* RemoteL3KVClient::get_or_create_tl_socket(
             return nullptr;
         }
         peer = pit->second;
-
-        new_box = std::make_shared<TlSocketBox>();
-        new_box->endpoint = peer->endpoint;
-        new_box->config_epoch = config_epoch_.load(std::memory_order_relaxed);
-        new_box->socket = std::make_unique<zmq::socket_t>(zmq_ctx_, ZMQ_DEALER);
-        new_box->socket->set(zmq::sockopt::sndhwm, zmq_sndhwm_);
-        new_box->socket->set(zmq::sockopt::linger, 0);
-        new_box->socket->set(zmq::sockopt::rcvtimeo, settings_.fed_timeout_ms);
-        new_box->socket->set(zmq::sockopt::sndtimeo, settings_.fed_timeout_ms);
-        new_box->socket->connect(new_box->endpoint);
-
-        tls_sockets_.push_back(new_box);
     }
 
-    tl_map[key] = std::static_pointer_cast<void>(new_box);
     if (out_peer) *out_peer = peer;
-
     check_circuit(*peer);
-    if (require_auth) {
-        ensure_socket_authenticated(*new_box, node_id);
+
+    auto new_box = std::make_shared<TlSocketBox>();
+    new_box->endpoint = peer->endpoint;
+    new_box->config_epoch = config_epoch_.load(std::memory_order_acquire);
+    new_box->socket = std::make_unique<zmq::socket_t>(zmq_ctx_, ZMQ_DEALER);
+    new_box->socket->set(zmq::sockopt::sndhwm, zmq_sndhwm_);
+    new_box->socket->set(zmq::sockopt::linger, 0);
+    new_box->socket->set(zmq::sockopt::rcvtimeo, settings_.fed_timeout_ms);
+    new_box->socket->set(zmq::sockopt::sndtimeo, settings_.fed_timeout_ms);
+    new_box->socket->connect(new_box->endpoint);
+
+    {
+        std::lock_guard<std::mutex> reg_lk(socket_registry_->mu);
+        if (socket_registry_->client_closed) {
+            new_box->close_socket();
+            return nullptr;
+        }
+        socket_registry_->active.insert(new_box);
     }
-    return new_box.get();
+
+    TlSocketBox* raw_box = new_box.get();
+    tl_map.emplace(key, TlSocketEntry(socket_registry_, std::move(new_box)));
+
+    if (require_auth) {
+        ensure_socket_authenticated(*raw_box, node_id);
+    }
+    return raw_box;
+}
+
+template <typename SendFn>
+std::vector<zmq::message_t>& RemoteL3KVClient::send_and_recv_rpc(
+    lite3::NodeID peer_id,
+    SendFn&& send_fn,
+    const char* timeout_msg) {
+    const bool can_reauth = has_auth_secret();
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        TlSocketBox* box = get_or_create_tl_socket(peer_id);
+        if (!box || !box->socket) {
+            throw std::runtime_error("Peer not connected");
+        }
+        auto& recv_msgs = get_tl_recv_msgs();
+        bool io_ok = false;
+        try {
+            send_fn(*box->socket);
+            auto res = zmq::recv_multipart(*box->socket, std::back_inserter(recv_msgs));
+            io_ok = (res.has_value() && recv_msgs.size() >= 2);
+        } catch (...) {
+            invalidate_tl_socket(peer_id, box);
+            report_failure(peer_id);
+            throw;
+        }
+        if (!io_ok) {
+            invalidate_tl_socket(peer_id, box);
+            report_failure(peer_id);
+            throw FederationTimeoutException(timeout_msg);
+        }
+        if (attempt == 0 && can_reauth && is_unauth_frame(recv_msgs[1])) {
+            box->authenticated = false;
+            ensure_socket_authenticated(*box, peer_id);
+            continue;
+        }
+        return recv_msgs;
+    }
+    throw FederationTimeoutException(timeout_msg);
 }
 
 void RemoteL3KVClient::run_health_check_loop() {
@@ -396,31 +516,26 @@ void RemoteL3KVClient::run_health_check_loop() {
 // ============================================================================
 
 std::string RemoteL3KVClient::get_raw_key(lite3::NodeID owner_id, std::string_view key, uint32_t principal_id) {
-    auto* box = get_or_create_tl_socket(owner_id);
-    if (!box) return {};
+    if (!get_peer_state(owner_id)) return {};
 
-    try {
-        box->socket->send(zmq::message_t(), zmq::send_flags::sndmore);
-        uint32_t pid = principal_id;
-        box->socket->send(zmq::message_t(&pid, 4), zmq::send_flags::sndmore);
-        box->socket->send(zmq::message_t("G", 1), zmq::send_flags::sndmore);
-        box->socket->send(zmq::message_t(key.data(), key.size()), zmq::send_flags::none);
+    auto& recv_msgs = send_and_recv_rpc(
+        owner_id,
+        [&](zmq::socket_t& sock) {
+            sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+            uint32_t pid = principal_id;
+            sock.send(zmq::message_t(&pid, 4), zmq::send_flags::sndmore);
+            sock.send(zmq::message_t("G", 1), zmq::send_flags::sndmore);
+            sock.send(zmq::message_t(key.data(), key.size()), zmq::send_flags::none);
+        },
+        "Raw key fetch timed out");
 
-        auto& recv_msgs = get_tl_recv_msgs();
-        auto res = zmq::recv_multipart(*box->socket, std::back_inserter(recv_msgs));
-        if (res && recv_msgs.size() >= 2) {
-            const auto& msg = recv_msgs[1];
-            if (msg.size() >= 4 && std::memcmp(msg.data(), "ERR_", 4) == 0) {
-                return {};
-            }
-            report_success(owner_id);
-            return std::string(static_cast<const char*>(msg.data()), msg.size());
-        }
-        throw FederationTimeoutException("Raw key fetch timed out");
-    } catch (...) {
-        report_failure(owner_id);
-        throw;
+    const auto& msg = recv_msgs[1];
+    if (is_err_frame(msg)) {
+        if (is_server_err_frame(msg)) report_failure(owner_id);
+        return {};
     }
+    report_success(owner_id);
+    return std::string(static_cast<const char*>(msg.data()), msg.size());
 }
 
 std::string RemoteL3KVClient::get_node_payload(lite3::NodeID owner_id, uint64_t target_node_id, uint32_t principal_id) {
@@ -428,44 +543,39 @@ std::string RemoteL3KVClient::get_node_payload(lite3::NodeID owner_id, uint64_t 
 }
 
 lite3cpp::Buffer RemoteL3KVClient::get_node_buffer(lite3::NodeID owner_id, uint64_t target_node_id, uint32_t principal_id) {
-    auto* box = get_or_create_tl_socket(owner_id);
-    if (!box) return {};
+    if (!get_peer_state(owner_id)) return {};
+    std::string_view key = KeyBuilder::node_key(target_node_id);
 
-    try {
-        std::string_view key = KeyBuilder::node_key(target_node_id);
-        box->socket->send(zmq::message_t(), zmq::send_flags::sndmore);
-        uint32_t pid = principal_id;
-        box->socket->send(zmq::message_t(&pid, 4), zmq::send_flags::sndmore);
-        box->socket->send(zmq::message_t("G", 1), zmq::send_flags::sndmore);
-        box->socket->send(zmq::message_t(key.data(), key.size()), zmq::send_flags::none);
+    auto& recv_msgs = send_and_recv_rpc(
+        owner_id,
+        [&](zmq::socket_t& sock) {
+            sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+            uint32_t pid = principal_id;
+            sock.send(zmq::message_t(&pid, 4), zmq::send_flags::sndmore);
+            sock.send(zmq::message_t("G", 1), zmq::send_flags::sndmore);
+            sock.send(zmq::message_t(key.data(), key.size()), zmq::send_flags::none);
+        },
+        "Node buffer fetch timed out");
 
-        auto& recv_msgs = get_tl_recv_msgs();
-        auto res = zmq::recv_multipart(*box->socket, std::back_inserter(recv_msgs));
-        if (res && recv_msgs.size() >= 2) {
-            const auto& msg = recv_msgs[1];
-            if (msg.size() == 0) {
-                report_success(owner_id);
-                return {};
-            }
-            if (msg.size() >= 4 && std::memcmp(msg.data(), "ERR_", 4) == 0) {
-                return {};
-            }
-            report_success(owner_id);
-            const uint8_t* ptr = static_cast<const uint8_t*>(msg.data());
-            if (msg.size() >= sizeof(lite3cpp::PackedNodeLayout) && (ptr[0] == 0x06 || ptr[0] == 0x07)) {
-                return lite3cpp::Buffer(ptr, msg.size());
-            }
-            std::string_view sv(reinterpret_cast<const char*>(ptr), msg.size());
-            if (is_json_sv(sv)) {
-                return lite3cpp::lite3_json::from_json_string(sv);
-            }
-            return lite3cpp::Buffer(ptr, msg.size());
-        }
-        throw FederationTimeoutException("Node buffer fetch timed out");
-    } catch (...) {
-        report_failure(owner_id);
-        throw;
+    const auto& msg = recv_msgs[1];
+    if (msg.size() == 0) {
+        report_success(owner_id);
+        return {};
     }
+    if (is_err_frame(msg)) {
+        if (is_server_err_frame(msg)) report_failure(owner_id);
+        return {};
+    }
+    report_success(owner_id);
+    const uint8_t* ptr = static_cast<const uint8_t*>(msg.data());
+    if (msg.size() >= sizeof(lite3cpp::PackedNodeLayout) && (ptr[0] == 0x06 || ptr[0] == 0x07)) {
+        return lite3cpp::Buffer(ptr, msg.size());
+    }
+    std::string_view sv(reinterpret_cast<const char*>(ptr), msg.size());
+    if (is_json_sv(sv)) {
+        return lite3cpp::lite3_json::from_json_string(sv);
+    }
+    return lite3cpp::Buffer(ptr, msg.size());
 }
 
 std::vector<uint64_t> RemoteL3KVClient::get_neighbors(
@@ -474,40 +584,34 @@ std::vector<uint64_t> RemoteL3KVClient::get_neighbors(
     std::string_view label,
     double min_weight,
     uint32_t principal_id) {
-    auto* box = get_or_create_tl_socket(owner_id);
-    if (!box) return {};
+    if (!get_peer_state(owner_id)) return {};
 
-    try {
-        char id_buf[17];
-        std::snprintf(id_buf, sizeof(id_buf), "%016llx", static_cast<unsigned long long>(target_node_id));
-        char w_buf[32];
-        int w_len = std::snprintf(w_buf, sizeof(w_buf), "%.6f", min_weight);
-        if (w_len < 0) w_len = 0;
+    char id_buf[17];
+    std::snprintf(id_buf, sizeof(id_buf), "%016llx", static_cast<unsigned long long>(target_node_id));
+    char w_buf[32];
+    int w_len = std::snprintf(w_buf, sizeof(w_buf), "%.6f", min_weight);
+    if (w_len < 0) w_len = 0;
 
-        box->socket->send(zmq::message_t(), zmq::send_flags::sndmore);
-        uint32_t pid = principal_id;
-        box->socket->send(zmq::message_t(&pid, 4), zmq::send_flags::sndmore);
-        box->socket->send(zmq::message_t("N", 1), zmq::send_flags::sndmore);
-        box->socket->send(zmq::message_t(id_buf, 16), zmq::send_flags::sndmore);
-        box->socket->send(zmq::message_t(label.data(), label.size()), zmq::send_flags::sndmore);
-        box->socket->send(zmq::message_t(w_buf, static_cast<size_t>(w_len)), zmq::send_flags::none);
+    auto& recv_msgs = send_and_recv_rpc(
+        owner_id,
+        [&](zmq::socket_t& sock) {
+            sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+            uint32_t pid = principal_id;
+            sock.send(zmq::message_t(&pid, 4), zmq::send_flags::sndmore);
+            sock.send(zmq::message_t("N", 1), zmq::send_flags::sndmore);
+            sock.send(zmq::message_t(id_buf, 16), zmq::send_flags::sndmore);
+            sock.send(zmq::message_t(label.data(), label.size()), zmq::send_flags::sndmore);
+            sock.send(zmq::message_t(w_buf, static_cast<size_t>(w_len)), zmq::send_flags::none);
+        },
+        "Neighbor fetch timed out");
 
-        auto& recv_msgs = get_tl_recv_msgs();
-        auto res = zmq::recv_multipart(*box->socket, std::back_inserter(recv_msgs));
-        if (res && recv_msgs.size() >= 2) {
-            const auto& msg = recv_msgs[1];
-            if (is_err_frame(msg)) {
-                report_failure(owner_id);
-                return {};
-            }
-            report_success(owner_id);
-            return parse_neighbors_message(msg);
-        }
-        throw FederationTimeoutException("Neighbor fetch timed out");
-    } catch (...) {
-        report_failure(owner_id);
-        throw;
+    const auto& msg = recv_msgs[1];
+    if (is_err_frame(msg)) {
+        if (!is_acl_err_frame(msg)) report_failure(owner_id);
+        return {};
     }
+    report_success(owner_id);
+    return parse_neighbors_message(msg);
 }
 
 std::vector<uint64_t> RemoteL3KVClient::get_in_neighbors(
@@ -515,36 +619,30 @@ std::vector<uint64_t> RemoteL3KVClient::get_in_neighbors(
     uint64_t target_node_id,
     std::string_view label,
     uint32_t principal_id) {
-    auto* box = get_or_create_tl_socket(owner_id);
-    if (!box) return {};
+    if (!get_peer_state(owner_id)) return {};
 
-    try {
-        char id_buf[17];
-        std::snprintf(id_buf, sizeof(id_buf), "%016llx", static_cast<unsigned long long>(target_node_id));
+    char id_buf[17];
+    std::snprintf(id_buf, sizeof(id_buf), "%016llx", static_cast<unsigned long long>(target_node_id));
 
-        box->socket->send(zmq::message_t(), zmq::send_flags::sndmore);
-        uint32_t pid = principal_id;
-        box->socket->send(zmq::message_t(&pid, 4), zmq::send_flags::sndmore);
-        box->socket->send(zmq::message_t("I", 1), zmq::send_flags::sndmore);
-        box->socket->send(zmq::message_t(id_buf, 16), zmq::send_flags::sndmore);
-        box->socket->send(zmq::message_t(label.data(), label.size()), zmq::send_flags::none);
+    auto& recv_msgs = send_and_recv_rpc(
+        owner_id,
+        [&](zmq::socket_t& sock) {
+            sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+            uint32_t pid = principal_id;
+            sock.send(zmq::message_t(&pid, 4), zmq::send_flags::sndmore);
+            sock.send(zmq::message_t("I", 1), zmq::send_flags::sndmore);
+            sock.send(zmq::message_t(id_buf, 16), zmq::send_flags::sndmore);
+            sock.send(zmq::message_t(label.data(), label.size()), zmq::send_flags::none);
+        },
+        "In-Neighbor fetch timed out");
 
-        auto& recv_msgs = get_tl_recv_msgs();
-        auto res = zmq::recv_multipart(*box->socket, std::back_inserter(recv_msgs));
-        if (res && recv_msgs.size() >= 2) {
-            const auto& msg = recv_msgs[1];
-            if (is_err_frame(msg)) {
-                report_failure(owner_id);
-                return {};
-            }
-            report_success(owner_id);
-            return parse_neighbors_message(msg);
-        }
-        throw FederationTimeoutException("In-Neighbor fetch timed out");
-    } catch (...) {
-        report_failure(owner_id);
-        throw;
+    const auto& msg = recv_msgs[1];
+    if (is_err_frame(msg)) {
+        if (!is_acl_err_frame(msg)) report_failure(owner_id);
+        return {};
     }
+    report_success(owner_id);
+    return parse_neighbors_message(msg);
 }
 
 std::vector<std::pair<std::string, std::string>> RemoteL3KVClient::get_prefix_entries(
@@ -552,51 +650,46 @@ std::vector<std::pair<std::string, std::string>> RemoteL3KVClient::get_prefix_en
     std::string_view prefix,
     uint32_t principal_id) {
     using namespace lite3cpp::literals;
-    auto* box = get_or_create_tl_socket(owner_id);
-    if (!box) return {};
+    if (!get_peer_state(owner_id)) return {};
 
-    try {
-        box->socket->send(zmq::message_t(), zmq::send_flags::sndmore);
-        uint32_t pid = principal_id;
-        box->socket->send(zmq::message_t(&pid, 4), zmq::send_flags::sndmore);
-        box->socket->send(zmq::message_t("K", 1), zmq::send_flags::sndmore);
-        box->socket->send(zmq::message_t(prefix.data(), prefix.size()), zmq::send_flags::none);
+    auto& recv_msgs = send_and_recv_rpc(
+        owner_id,
+        [&](zmq::socket_t& sock) {
+            sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+            uint32_t pid = principal_id;
+            sock.send(zmq::message_t(&pid, 4), zmq::send_flags::sndmore);
+            sock.send(zmq::message_t("K", 1), zmq::send_flags::sndmore);
+            sock.send(zmq::message_t(prefix.data(), prefix.size()), zmq::send_flags::none);
+        },
+        "Prefix scan timed out");
 
-        auto& recv_msgs = get_tl_recv_msgs();
-        auto res = zmq::recv_multipart(*box->socket, std::back_inserter(recv_msgs));
-        if (res && recv_msgs.size() >= 2) {
-            const auto& msg = recv_msgs[1];
-            if (is_err_frame(msg)) {
-                return {};
-            }
-            report_success(owner_id);
+    const auto& msg = recv_msgs[1];
+    if (is_err_frame(msg)) {
+        if (is_server_err_frame(msg)) report_failure(owner_id);
+        return {};
+    }
+    report_success(owner_id);
 
-            std::vector<std::pair<std::string, std::string>> entries;
-            if (msg.size() >= sizeof(lite3cpp::PackedNodeLayout)) {
-                auto buf = lite3cpp::Buffer::from_view(static_cast<const uint8_t*>(msg.data()), msg.size());
-                lite3cpp::NodeView nv(reinterpret_cast<const lite3cpp::PackedNodeLayout*>(buf.data()));
-                if (nv.type() == lite3cpp::Type::Array) {
-                    entries.reserve(nv.size());
-                    for (auto it = buf.begin(0), end = buf.end(0); it != end; ++it) {
-                        if (it->value_type == lite3cpp::Type::Object) {
-                            const size_t obj_ofs = it->value_offset + 1;
-                            if (obj_ofs + sizeof(lite3cpp::PackedNodeLayout) > buf.size()) continue;
-                            std::string k(buf.try_get_str(obj_ofs, "k"_hk).value_or(""));
-                            std::string v(buf.try_get_str(obj_ofs, "v"_hk).value_or(""));
-                            entries.emplace_back(std::move(k), std::move(v));
-                        } else if (it->value_type == lite3cpp::Type::String) {
-                            entries.emplace_back(std::string(read_iter_string(buf, *it)), std::string{});
-                        }
-                    }
+    std::vector<std::pair<std::string, std::string>> entries;
+    if (msg.size() >= sizeof(lite3cpp::PackedNodeLayout)) {
+        auto buf = lite3cpp::Buffer::from_view(static_cast<const uint8_t*>(msg.data()), msg.size());
+        lite3cpp::NodeView nv(reinterpret_cast<const lite3cpp::PackedNodeLayout*>(buf.data()));
+        if (nv.type() == lite3cpp::Type::Array) {
+            entries.reserve(nv.size());
+            for (auto it = buf.begin(0), end = buf.end(0); it != end; ++it) {
+                if (it->value_type == lite3cpp::Type::Object) {
+                    const size_t obj_ofs = it->value_offset + 1;
+                    if (obj_ofs + sizeof(lite3cpp::PackedNodeLayout) > buf.size()) continue;
+                    std::string k(buf.try_get_str(obj_ofs, "k"_hk).value_or(""));
+                    std::string v(buf.try_get_str(obj_ofs, "v"_hk).value_or(""));
+                    entries.emplace_back(std::move(k), std::move(v));
+                } else if (it->value_type == lite3cpp::Type::String) {
+                    entries.emplace_back(std::string(read_iter_string(buf, *it)), std::string{});
                 }
             }
-            return entries;
         }
-        throw FederationTimeoutException("Prefix scan timed out");
-    } catch (...) {
-        report_failure(owner_id);
-        throw;
     }
+    return entries;
 }
 
 std::vector<std::string> RemoteL3KVClient::get_prefix_keys(
@@ -604,77 +697,72 @@ std::vector<std::string> RemoteL3KVClient::get_prefix_keys(
     std::string_view prefix,
     uint32_t principal_id) {
     using namespace lite3cpp::literals;
-    auto* box = get_or_create_tl_socket(owner_id);
-    if (!box) return {};
+    if (!get_peer_state(owner_id)) return {};
 
-    try {
-        box->socket->send(zmq::message_t(), zmq::send_flags::sndmore);
-        uint32_t pid = principal_id;
-        box->socket->send(zmq::message_t(&pid, 4), zmq::send_flags::sndmore);
-        box->socket->send(zmq::message_t("K", 1), zmq::send_flags::sndmore);
-        box->socket->send(zmq::message_t(prefix.data(), prefix.size()), zmq::send_flags::none);
+    auto& recv_msgs = send_and_recv_rpc(
+        owner_id,
+        [&](zmq::socket_t& sock) {
+            sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+            uint32_t pid = principal_id;
+            sock.send(zmq::message_t(&pid, 4), zmq::send_flags::sndmore);
+            sock.send(zmq::message_t("K", 1), zmq::send_flags::sndmore);
+            sock.send(zmq::message_t(prefix.data(), prefix.size()), zmq::send_flags::none);
+        },
+        "Prefix scan timed out");
 
-        auto& recv_msgs = get_tl_recv_msgs();
-        auto res = zmq::recv_multipart(*box->socket, std::back_inserter(recv_msgs));
-        if (res && recv_msgs.size() >= 2) {
-            const auto& msg = recv_msgs[1];
-            if (is_err_frame(msg)) {
-                return {};
-            }
-            report_success(owner_id);
+    const auto& msg = recv_msgs[1];
+    if (is_err_frame(msg)) {
+        if (is_server_err_frame(msg)) report_failure(owner_id);
+        return {};
+    }
+    report_success(owner_id);
 
-            std::vector<std::string> keys;
-            if (msg.size() >= sizeof(lite3cpp::PackedNodeLayout)) {
-                auto buf = lite3cpp::Buffer::from_view(static_cast<const uint8_t*>(msg.data()), msg.size());
-                lite3cpp::NodeView nv(reinterpret_cast<const lite3cpp::PackedNodeLayout*>(buf.data()));
-                if (nv.type() == lite3cpp::Type::Array) {
-                    keys.reserve(nv.size());
-                    for (auto it = buf.begin(0), end = buf.end(0); it != end; ++it) {
-                        if (it->value_type == lite3cpp::Type::Object) {
-                            const size_t obj_ofs = it->value_offset + 1;
-                            if (obj_ofs + sizeof(lite3cpp::PackedNodeLayout) > buf.size()) continue;
-                            if (auto k = buf.try_get_str(obj_ofs, "k"_hk)) {
-                                keys.emplace_back(*k);
-                            }
-                        } else if (it->value_type == lite3cpp::Type::String) {
-                            keys.emplace_back(read_iter_string(buf, *it));
-                        }
+    std::vector<std::string> keys;
+    if (msg.size() >= sizeof(lite3cpp::PackedNodeLayout)) {
+        auto buf = lite3cpp::Buffer::from_view(static_cast<const uint8_t*>(msg.data()), msg.size());
+        lite3cpp::NodeView nv(reinterpret_cast<const lite3cpp::PackedNodeLayout*>(buf.data()));
+        if (nv.type() == lite3cpp::Type::Array) {
+            keys.reserve(nv.size());
+            for (auto it = buf.begin(0), end = buf.end(0); it != end; ++it) {
+                if (it->value_type == lite3cpp::Type::Object) {
+                    const size_t obj_ofs = it->value_offset + 1;
+                    if (obj_ofs + sizeof(lite3cpp::PackedNodeLayout) > buf.size()) continue;
+                    if (auto k = buf.try_get_str(obj_ofs, "k"_hk)) {
+                        keys.emplace_back(*k);
                     }
+                } else if (it->value_type == lite3cpp::Type::String) {
+                    keys.emplace_back(read_iter_string(buf, *it));
                 }
             }
-            return keys;
         }
-        throw FederationTimeoutException("Prefix scan timed out");
-    } catch (...) {
-        report_failure(owner_id);
-        throw;
     }
+    return keys;
 }
 
 bool RemoteL3KVClient::execute_batch(
     lite3::NodeID owner_id,
     const lite3cpp::Buffer& batch_buffer,
     uint32_t principal_id) {
-    auto* box = get_or_create_tl_socket(owner_id);
-    if (!box) return false;
+    if (!get_peer_state(owner_id)) return false;
 
     try {
-        box->socket->send(zmq::message_t(), zmq::send_flags::sndmore);
-        uint32_t pid = principal_id;
-        box->socket->send(zmq::message_t(&pid, 4), zmq::send_flags::sndmore);
-        box->socket->send(zmq::message_t("B", 1), zmq::send_flags::sndmore);
-        box->socket->send(zmq::message_t(batch_buffer.data(), batch_buffer.size()), zmq::send_flags::none);
+        auto& recv_msgs = send_and_recv_rpc(
+            owner_id,
+            [&](zmq::socket_t& sock) {
+                sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                uint32_t pid = principal_id;
+                sock.send(zmq::message_t(&pid, 4), zmq::send_flags::sndmore);
+                sock.send(zmq::message_t("B", 1), zmq::send_flags::sndmore);
+                sock.send(zmq::message_t(batch_buffer.data(), batch_buffer.size()), zmq::send_flags::none);
+            },
+            "Batch execution timed out");
 
-        auto& recv_msgs = get_tl_recv_msgs();
-        auto res = zmq::recv_multipart(*box->socket, std::back_inserter(recv_msgs));
-        if (res && recv_msgs.size() >= 2 &&
-            recv_msgs[1].size() == 2 && std::memcmp(recv_msgs[1].data(), "OK", 2) == 0) {
+        if (recv_msgs[1].size() == 2 && std::memcmp(recv_msgs[1].data(), "OK", 2) == 0) {
             report_success(owner_id);
             return true;
         }
         return false;
     } catch (...) {
-        report_failure(owner_id);
         return false;
     }
 }
@@ -691,38 +779,32 @@ lite3cpp::Buffer RemoteL3KVClient::resume_query_buffer(
     const std::vector<uint64_t>& starting_nodes,
     const lite3cpp::Buffer& query_buf,
     uint32_t principal_id) {
-    auto* box = get_or_create_tl_socket(cluster_id);
-    if (!box) return {};
+    if (!get_peer_state(cluster_id)) return {};
 
-    try {
-        box->socket->send(zmq::message_t(), zmq::send_flags::sndmore);
-        uint32_t pid = principal_id;
-        box->socket->send(zmq::message_t(&pid, 4), zmq::send_flags::sndmore);
-        box->socket->send(zmq::message_t("R", 1), zmq::send_flags::sndmore);
-        box->socket->send(zmq::message_t(starting_nodes.data(), starting_nodes.size() * sizeof(uint64_t)), zmq::send_flags::sndmore);
-        box->socket->send(zmq::message_t(query_buf.data(), query_buf.size()), zmq::send_flags::none);
+    auto& recv_msgs = send_and_recv_rpc(
+        cluster_id,
+        [&](zmq::socket_t& sock) {
+            sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+            uint32_t pid = principal_id;
+            sock.send(zmq::message_t(&pid, 4), zmq::send_flags::sndmore);
+            sock.send(zmq::message_t("R", 1), zmq::send_flags::sndmore);
+            sock.send(zmq::message_t(starting_nodes.data(), starting_nodes.size() * sizeof(uint64_t)), zmq::send_flags::sndmore);
+            sock.send(zmq::message_t(query_buf.data(), query_buf.size()), zmq::send_flags::none);
+        },
+        "Remote query timed out");
 
-        auto& recv_msgs = get_tl_recv_msgs();
-        auto res = zmq::recv_multipart(*box->socket, std::back_inserter(recv_msgs));
-        if (res && recv_msgs.size() >= 2) {
-            const auto& resp_msg = recv_msgs[1];
-            if (is_err_frame(resp_msg)) {
-                report_failure(cluster_id);
-                return {};
-            }
-            report_success(cluster_id);
-            const uint8_t* ptr = static_cast<const uint8_t*>(resp_msg.data());
-            if (resp_msg.size() >= sizeof(lite3cpp::PackedNodeLayout) && (ptr[0] == 0x06 || ptr[0] == 0x07)) {
-                return lite3cpp::Buffer(ptr, resp_msg.size());
-            }
-            std::string_view raw_json(reinterpret_cast<const char*>(ptr), resp_msg.size());
-            return lite3cpp::lite3_json::from_json_string(raw_json.empty() ? "[]" : raw_json);
-        }
-        throw FederationTimeoutException("Remote query timed out");
-    } catch (...) {
-        report_failure(cluster_id);
-        throw;
+    const auto& resp_msg = recv_msgs[1];
+    if (is_err_frame(resp_msg)) {
+        if (!is_acl_err_frame(resp_msg)) report_failure(cluster_id);
+        return {};
     }
+    report_success(cluster_id);
+    const uint8_t* ptr = static_cast<const uint8_t*>(resp_msg.data());
+    if (resp_msg.size() >= sizeof(lite3cpp::PackedNodeLayout) && (ptr[0] == 0x06 || ptr[0] == 0x07)) {
+        return lite3cpp::Buffer(ptr, resp_msg.size());
+    }
+    std::string_view raw_json(reinterpret_cast<const char*>(ptr), resp_msg.size());
+    return lite3cpp::lite3_json::from_json_string(raw_json.empty() ? "[]" : raw_json);
 }
 
 std::vector<GraphReadResult> RemoteL3KVClient::execute_multi_read(
@@ -730,10 +812,7 @@ std::vector<GraphReadResult> RemoteL3KVClient::execute_multi_read(
     std::span<const GraphReadOp> ops,
     uint32_t principal_id) {
     using namespace lite3cpp::literals;
-    if (ops.empty()) return {};
-
-    auto* box = get_or_create_tl_socket(owner_id);
-    if (!box) return {};
+    if (ops.empty() || !get_peer_state(owner_id)) return {};
 
     thread_local lite3cpp::Buffer tl_req_buf;
     tl_req_buf.clear();
@@ -754,61 +833,56 @@ std::vector<GraphReadResult> RemoteL3KVClient::execute_multi_read(
         }
     }
 
-    try {
-        box->socket->send(zmq::message_t(), zmq::send_flags::sndmore);
-        uint32_t pid = principal_id;
-        box->socket->send(zmq::message_t(&pid, 4), zmq::send_flags::sndmore);
-        box->socket->send(zmq::message_t("G", 1), zmq::send_flags::sndmore);
-        box->socket->send(zmq::message_t(tl_req_buf.data(), tl_req_buf.size()), zmq::send_flags::none);
+    auto& recv_msgs = send_and_recv_rpc(
+        owner_id,
+        [&](zmq::socket_t& sock) {
+            sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+            uint32_t pid = principal_id;
+            sock.send(zmq::message_t(&pid, 4), zmq::send_flags::sndmore);
+            sock.send(zmq::message_t("G", 1), zmq::send_flags::sndmore);
+            sock.send(zmq::message_t(tl_req_buf.data(), tl_req_buf.size()), zmq::send_flags::none);
+        },
+        "Graph multi-read timed out");
 
-        auto& recv_msgs = get_tl_recv_msgs();
-        auto res = zmq::recv_multipart(*box->socket, std::back_inserter(recv_msgs));
-        if (res && recv_msgs.size() >= 2) {
-            const auto& msg = recv_msgs[1];
-            if (is_err_frame(msg)) {
-                report_failure(owner_id);
-                return {};
-            }
-            report_success(owner_id);
+    const auto& msg = recv_msgs[1];
+    if (is_err_frame(msg)) {
+        if (!is_acl_err_frame(msg)) report_failure(owner_id);
+        return {};
+    }
+    report_success(owner_id);
 
-            std::vector<GraphReadResult> out;
-            if (msg.size() >= sizeof(lite3cpp::PackedNodeLayout)) {
-                auto resp_buf = lite3cpp::Buffer::from_view(static_cast<const uint8_t*>(msg.data()), msg.size());
-                lite3cpp::NodeView nv(reinterpret_cast<const lite3cpp::PackedNodeLayout*>(resp_buf.data()));
-                if (nv.type() == lite3cpp::Type::Array) {
-                    out.reserve(nv.size());
-                    for (auto it = resp_buf.begin(0), end = resp_buf.end(0); it != end; ++it) {
-                        GraphReadResult gr;
-                        if (it->value_type == lite3cpp::Type::Object) {
-                            const size_t r_ofs = it->value_offset + 1;
-                            if (r_ofs + sizeof(lite3cpp::PackedNodeLayout) <= resp_buf.size()) {
-                                gr.found = resp_buf.try_get_bool(r_ofs, "f"_hk).value_or(false);
-                                if (auto p = resp_buf.try_get_bytes(r_ofs, "p"_hk)) {
-                                    gr.payload.assign(reinterpret_cast<const char*>(p->data()), p->size());
-                                } else if (auto ps = resp_buf.try_get_str(r_ofs, "p"_hk)) {
-                                    gr.payload.assign(ps->data(), ps->size());
-                                }
-                                if (auto n = resp_buf.try_get_bytes(r_ofs, "n"_hk);
-                                    n && n->size() % sizeof(uint64_t) == 0) {
-                                    size_t cnt = n->size() / sizeof(uint64_t);
-                                    gr.neighbors.resize(cnt);
-                                    if (cnt > 0) {
-                                        std::memcpy(gr.neighbors.data(), n->data(), n->size());
-                                    }
-                                }
+    std::vector<GraphReadResult> out;
+    if (msg.size() >= sizeof(lite3cpp::PackedNodeLayout)) {
+        auto resp_buf = lite3cpp::Buffer::from_view(static_cast<const uint8_t*>(msg.data()), msg.size());
+        lite3cpp::NodeView nv(reinterpret_cast<const lite3cpp::PackedNodeLayout*>(resp_buf.data()));
+        if (nv.type() == lite3cpp::Type::Array) {
+            out.reserve(nv.size());
+            for (auto it = resp_buf.begin(0), end = resp_buf.end(0); it != end; ++it) {
+                GraphReadResult gr;
+                if (it->value_type == lite3cpp::Type::Object) {
+                    const size_t r_ofs = it->value_offset + 1;
+                    if (r_ofs + sizeof(lite3cpp::PackedNodeLayout) <= resp_buf.size()) {
+                        gr.found = resp_buf.try_get_bool(r_ofs, "f"_hk).value_or(false);
+                        if (auto p = resp_buf.try_get_bytes(r_ofs, "p"_hk)) {
+                            gr.payload.assign(reinterpret_cast<const char*>(p->data()), p->size());
+                        } else if (auto ps = resp_buf.try_get_str(r_ofs, "p"_hk)) {
+                            gr.payload.assign(ps->data(), ps->size());
+                        }
+                        if (auto n = resp_buf.try_get_bytes(r_ofs, "n"_hk);
+                            n && n->size() % sizeof(uint64_t) == 0) {
+                            size_t cnt = n->size() / sizeof(uint64_t);
+                            gr.neighbors.resize(cnt);
+                            if (cnt > 0) {
+                                std::memcpy(gr.neighbors.data(), n->data(), n->size());
                             }
                         }
-                        out.push_back(std::move(gr));
                     }
                 }
+                out.push_back(std::move(gr));
             }
-            return out;
         }
-        throw FederationTimeoutException("Graph multi-read timed out");
-    } catch (...) {
-        report_failure(owner_id);
-        throw;
     }
+    return out;
 }
 
 bool RemoteL3KVClient::put_key_bytes_sync(
@@ -817,52 +891,52 @@ bool RemoteL3KVClient::put_key_bytes_sync(
     const void* data,
     size_t len,
     uint32_t principal_id) {
-    auto* box = get_or_create_tl_socket(owner_id);
-    if (!box) return false;
+    if (!get_peer_state(owner_id)) return false;
 
     try {
-        box->socket->send(zmq::message_t(), zmq::send_flags::sndmore);
-        uint32_t pid = principal_id;
-        box->socket->send(zmq::message_t(&pid, 4), zmq::send_flags::sndmore);
-        box->socket->send(zmq::message_t("P", 1), zmq::send_flags::sndmore);
-        box->socket->send(zmq::message_t(key.data(), key.size()), zmq::send_flags::sndmore);
-        box->socket->send(zmq::message_t(data, len), zmq::send_flags::none);
+        auto& recv_msgs = send_and_recv_rpc(
+            owner_id,
+            [&](zmq::socket_t& sock) {
+                sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                uint32_t pid = principal_id;
+                sock.send(zmq::message_t(&pid, 4), zmq::send_flags::sndmore);
+                sock.send(zmq::message_t("P", 1), zmq::send_flags::sndmore);
+                sock.send(zmq::message_t(key.data(), key.size()), zmq::send_flags::sndmore);
+                sock.send(zmq::message_t(data, len), zmq::send_flags::none);
+            },
+            "Put key timed out");
 
-        auto& recv_msgs = get_tl_recv_msgs();
-        auto res = zmq::recv_multipart(*box->socket, std::back_inserter(recv_msgs));
-        if (res && recv_msgs.size() >= 2 &&
-            recv_msgs[1].size() == 2 && std::memcmp(recv_msgs[1].data(), "OK", 2) == 0) {
+        if (recv_msgs[1].size() == 2 && std::memcmp(recv_msgs[1].data(), "OK", 2) == 0) {
             report_success(owner_id);
             return true;
         }
         return false;
     } catch (...) {
-        report_failure(owner_id);
         return false;
     }
 }
 
 bool RemoteL3KVClient::del_key_sync(lite3::NodeID owner_id, std::string_view key, uint32_t principal_id) {
-    auto* box = get_or_create_tl_socket(owner_id);
-    if (!box) return false;
+    if (!get_peer_state(owner_id)) return false;
 
     try {
-        box->socket->send(zmq::message_t(), zmq::send_flags::sndmore);
-        uint32_t pid = principal_id;
-        box->socket->send(zmq::message_t(&pid, 4), zmq::send_flags::sndmore);
-        box->socket->send(zmq::message_t("D", 1), zmq::send_flags::sndmore);
-        box->socket->send(zmq::message_t(key.data(), key.size()), zmq::send_flags::none);
+        auto& recv_msgs = send_and_recv_rpc(
+            owner_id,
+            [&](zmq::socket_t& sock) {
+                sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                uint32_t pid = principal_id;
+                sock.send(zmq::message_t(&pid, 4), zmq::send_flags::sndmore);
+                sock.send(zmq::message_t("D", 1), zmq::send_flags::sndmore);
+                sock.send(zmq::message_t(key.data(), key.size()), zmq::send_flags::none);
+            },
+            "Delete key timed out");
 
-        auto& recv_msgs = get_tl_recv_msgs();
-        auto res = zmq::recv_multipart(*box->socket, std::back_inserter(recv_msgs));
-        if (res && recv_msgs.size() >= 2 &&
-            recv_msgs[1].size() == 2 && std::memcmp(recv_msgs[1].data(), "OK", 2) == 0) {
+        if (recv_msgs[1].size() == 2 && std::memcmp(recv_msgs[1].data(), "OK", 2) == 0) {
             report_success(owner_id);
             return true;
         }
         return false;
     } catch (...) {
-        report_failure(owner_id);
         return false;
     }
 }
@@ -872,51 +946,68 @@ bool RemoteL3KVClient::ping_peer_sync(lite3::NodeID node_id) {
         auto peer = get_peer_state(node_id);
         if (!peer) return false;
 
-        auto& tl_map = get_tl_socket_map();
-        const uint64_t curr_epoch = config_epoch_.load(std::memory_order_acquire);
-        const TlSocketKey key{client_instance_id_, node_id};
-        TlSocketBox* box = nullptr;
+        const bool can_reauth = has_auth_secret();
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            auto& tl_map = get_tl_socket_map();
+            const uint64_t curr_epoch = config_epoch_.load(std::memory_order_acquire);
+            const TlSocketKey key{client_instance_id_, node_id};
+            TlSocketBox* box = nullptr;
 
-        if (auto it = tl_map.find(key); it != tl_map.end()) {
-            if (auto sp_void = it->second.lock()) {
-                auto* cand = static_cast<TlSocketBox*>(sp_void.get());
-                if (cand->socket && cand->config_epoch == curr_epoch) {
+            if (auto it = tl_map.find(key); it != tl_map.end()) {
+                auto* cand = it->second.box.get();
+                if (cand && cand->socket && cand->config_epoch == curr_epoch && !it->second.weak_registry.expired()) {
                     box = cand;
+                } else {
+                    tl_map.erase(it);
                 }
             }
-        }
-        if (!box) {
-            std::shared_ptr<TlSocketBox> new_box;
-            {
-                std::lock_guard<std::mutex> lock(endpoints_mutex_);
-                auto pit = peers_.find(node_id);
-                if (pit == peers_.end()) return false;
-                new_box = std::make_shared<TlSocketBox>();
-                new_box->endpoint = pit->second->endpoint;
-                new_box->config_epoch = config_epoch_.load(std::memory_order_relaxed);
+            if (!box) {
+                auto new_box = std::make_shared<TlSocketBox>();
+                new_box->endpoint = peer->endpoint;
+                new_box->config_epoch = curr_epoch;
                 new_box->socket = std::make_unique<zmq::socket_t>(zmq_ctx_, ZMQ_DEALER);
                 new_box->socket->set(zmq::sockopt::sndhwm, zmq_sndhwm_);
                 new_box->socket->set(zmq::sockopt::linger, 0);
                 new_box->socket->set(zmq::sockopt::rcvtimeo, settings_.fed_timeout_ms);
                 new_box->socket->set(zmq::sockopt::sndtimeo, settings_.fed_timeout_ms);
                 new_box->socket->connect(new_box->endpoint);
-                tls_sockets_.push_back(new_box);
+                {
+                    std::lock_guard<std::mutex> reg_lk(socket_registry_->mu);
+                    if (socket_registry_->client_closed) {
+                        new_box->close_socket();
+                        return false;
+                    }
+                    socket_registry_->active.insert(new_box);
+                }
+                box = new_box.get();
+                tl_map.emplace(key, TlSocketEntry(socket_registry_, std::move(new_box)));
             }
-            tl_map[key] = std::static_pointer_cast<void>(new_box);
-            box = new_box.get();
-        }
 
-        ensure_socket_authenticated(*box, node_id);
+            ensure_socket_authenticated(*box, node_id);
 
-        box->socket->send(zmq::message_t(), zmq::send_flags::sndmore);
-        uint32_t internal_uid = INTERNAL_UID;
-        box->socket->send(zmq::message_t(&internal_uid, 4), zmq::send_flags::sndmore);
-        box->socket->send(zmq::message_t("H", 1), zmq::send_flags::sndmore);
-        box->socket->send(zmq::message_t(), zmq::send_flags::none);
+            auto& recv_msgs = get_tl_recv_msgs();
+            bool io_ok = false;
+            try {
+                box->socket->send(zmq::message_t(), zmq::send_flags::sndmore);
+                uint32_t internal_uid = INTERNAL_UID;
+                box->socket->send(zmq::message_t(&internal_uid, 4), zmq::send_flags::sndmore);
+                box->socket->send(zmq::message_t("H", 1), zmq::send_flags::sndmore);
+                box->socket->send(zmq::message_t(), zmq::send_flags::none);
 
-        auto& recv_msgs = get_tl_recv_msgs();
-        auto res = zmq::recv_multipart(*box->socket, std::back_inserter(recv_msgs));
-        if (res && recv_msgs.size() >= 2) {
+                auto res = zmq::recv_multipart(*box->socket, std::back_inserter(recv_msgs));
+                io_ok = (res.has_value() && recv_msgs.size() >= 2);
+            } catch (...) {
+                invalidate_tl_socket(node_id, box);
+                return false;
+            }
+            if (!io_ok) {
+                invalidate_tl_socket(node_id, box);
+                return false;
+            }
+            if (attempt == 0 && can_reauth && is_unauth_frame(recv_msgs[1])) {
+                box->authenticated = false;
+                continue;
+            }
             std::string_view sv(static_cast<const char*>(recv_msgs[1].data()), recv_msgs[1].size());
             return sv == "PONG" || sv == "OK";
         }
@@ -932,115 +1023,108 @@ std::vector<ResultRow> RemoteL3KVClient::resume_query_rows_sync(
     const lite3cpp::Buffer& query_buf,
     uint32_t principal_id) {
     using namespace lite3cpp::literals;
-    auto* box = get_or_create_tl_socket(cluster_id);
-    if (!box) return {};
+    if (!get_peer_state(cluster_id)) return {};
 
-    try {
-        box->socket->send(zmq::message_t(), zmq::send_flags::sndmore);
-        uint32_t pid = principal_id;
-        box->socket->send(zmq::message_t(&pid, 4), zmq::send_flags::sndmore);
-        box->socket->send(zmq::message_t("R", 1), zmq::send_flags::sndmore);
-        box->socket->send(zmq::message_t(starting_nodes.data(), starting_nodes.size() * sizeof(uint64_t)), zmq::send_flags::sndmore);
-        box->socket->send(zmq::message_t(query_buf.data(), query_buf.size()), zmq::send_flags::none);
+    auto& recv_msgs = send_and_recv_rpc(
+        cluster_id,
+        [&](zmq::socket_t& sock) {
+            sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+            uint32_t pid = principal_id;
+            sock.send(zmq::message_t(&pid, 4), zmq::send_flags::sndmore);
+            sock.send(zmq::message_t("R", 1), zmq::send_flags::sndmore);
+            sock.send(zmq::message_t(starting_nodes.data(), starting_nodes.size() * sizeof(uint64_t)), zmq::send_flags::sndmore);
+            sock.send(zmq::message_t(query_buf.data(), query_buf.size()), zmq::send_flags::none);
+        },
+        "Remote query timed out");
 
-        auto& recv_msgs = get_tl_recv_msgs();
-        auto res = zmq::recv_multipart(*box->socket, std::back_inserter(recv_msgs));
-        if (!res || recv_msgs.size() < 2) {
-            throw FederationTimeoutException("Remote query timed out");
-        }
+    const auto& resp_msg = recv_msgs[1];
+    if (is_err_frame(resp_msg)) {
+        if (!is_acl_err_frame(resp_msg)) report_failure(cluster_id);
+        return {};
+    }
+    report_success(cluster_id);
 
-        const auto& resp_msg = recv_msgs[1];
-        if (is_err_frame(resp_msg)) {
-            report_failure(cluster_id);
-            return {};
-        }
-        report_success(cluster_id);
+    lite3cpp::Buffer owned_json_buf;
+    lite3cpp::Buffer resp_buf;
+    const uint8_t* ptr = static_cast<const uint8_t*>(resp_msg.data());
+    if (resp_msg.size() >= sizeof(lite3cpp::PackedNodeLayout) && (ptr[0] == 0x06 || ptr[0] == 0x07)) {
+        resp_buf = lite3cpp::Buffer::from_view(ptr, resp_msg.size());
+    } else {
+        std::string_view raw_json(reinterpret_cast<const char*>(ptr), resp_msg.size());
+        owned_json_buf = lite3cpp::lite3_json::from_json_string(raw_json.empty() ? "[]" : raw_json);
+        resp_buf = lite3cpp::Buffer::from_view(owned_json_buf.data(), owned_json_buf.size());
+    }
 
-        lite3cpp::Buffer owned_json_buf;
-        lite3cpp::Buffer resp_buf;
-        const uint8_t* ptr = static_cast<const uint8_t*>(resp_msg.data());
-        if (resp_msg.size() >= sizeof(lite3cpp::PackedNodeLayout) && (ptr[0] == 0x06 || ptr[0] == 0x07)) {
-            resp_buf = lite3cpp::Buffer::from_view(ptr, resp_msg.size());
-        } else {
-            std::string_view raw_json(reinterpret_cast<const char*>(ptr), resp_msg.size());
-            owned_json_buf = lite3cpp::lite3_json::from_json_string(raw_json.empty() ? "[]" : raw_json);
-            resp_buf = lite3cpp::Buffer::from_view(owned_json_buf.data(), owned_json_buf.size());
-        }
-
-        std::vector<ResultRow> results;
-        if (resp_buf.size() >= sizeof(lite3cpp::PackedNodeLayout)) {
-            lite3cpp::NodeView root_nv(reinterpret_cast<const lite3cpp::PackedNodeLayout*>(resp_buf.data()));
-            if (root_nv.type() == lite3cpp::Type::Array) {
-                results.reserve(root_nv.size());
-                std::vector<std::string> cols;
-                uint32_t r = 0;
-                for (auto rit = resp_buf.begin(0), rend = resp_buf.end(0); rit != rend; ++rit, ++r) {
-                    if (rit->value_type == lite3cpp::Type::Array) {
-                        const size_t arr_ofs = rit->value_offset + 1;
-                        if (arr_ofs + sizeof(lite3cpp::PackedNodeLayout) > resp_buf.size()) continue;
-                        ResultRow row;
-                        for (auto cit = resp_buf.begin(arr_ofs), cend = resp_buf.end(arr_ofs); cit != cend; ++cit) {
-                            row.projected_values.emplace_back(read_iter_string(resp_buf, *cit));
-                        }
-                        results.push_back(std::move(row));
-                        continue;
-                    }
-                    if (rit->value_type != lite3cpp::Type::Object) continue;
-                    const size_t row_ofs = rit->value_offset + 1;
-                    if (row_ofs + sizeof(lite3cpp::PackedNodeLayout) > resp_buf.size()) continue;
-
+    std::vector<ResultRow> results;
+    if (resp_buf.size() >= sizeof(lite3cpp::PackedNodeLayout)) {
+        lite3cpp::NodeView root_nv(reinterpret_cast<const lite3cpp::PackedNodeLayout*>(resp_buf.data()));
+        if (root_nv.type() == lite3cpp::Type::Array) {
+            results.reserve(root_nv.size());
+            std::vector<std::string> cols;
+            uint32_t r = 0;
+            for (auto rit = resp_buf.begin(0), rend = resp_buf.end(0); rit != rend; ++rit, ++r) {
+                if (rit->value_type == lite3cpp::Type::Array) {
+                    const size_t arr_ofs = rit->value_offset + 1;
+                    if (arr_ofs + sizeof(lite3cpp::PackedNodeLayout) > resp_buf.size()) continue;
                     ResultRow row;
-                    if (auto cols_ofs_opt = resp_buf.try_get_arr(row_ofs, "cols"_hk)) {
-                        const size_t cols_ofs = *cols_ofs_opt;
-                        cols.clear();
-                        for (auto cit = resp_buf.begin(cols_ofs), cend = resp_buf.end(cols_ofs); cit != cend; ++cit) {
-                            cols.emplace_back(read_iter_string(resp_buf, *cit));
-                        }
-                    }
-                    if (r == 0 && !cols.empty()) {
-                        row.projected_names = cols;
-                    }
-                    if (auto proj_ofs_opt = resp_buf.try_get_arr(row_ofs, "proj"_hk)) {
-                        const size_t proj_ofs = *proj_ofs_opt;
-                        size_t pi = 0;
-                        for (auto pit = resp_buf.begin(proj_ofs), pend = resp_buf.end(proj_ofs); pit != pend; ++pit, ++pi) {
-                            std::string val(read_iter_string(resp_buf, *pit));
-                            if (pi < cols.size() && !cols[pi].empty()) {
-                                row.fields[cols[pi]] = val;
-                            }
-                            row.projected_values.push_back(std::move(val));
-                        }
-                    } else if (auto fields_ofs_opt = resp_buf.try_get_obj(row_ofs, "fields"_hk)) {
-                        const size_t fields_ofs = *fields_ofs_opt;
-                        for (auto fit = resp_buf.begin(fields_ofs), fend = resp_buf.end(fields_ofs); fit != fend; ++fit) {
-                            std::string_view k = fit->key;
-                            if (fit->value_type == lite3cpp::Type::String) {
-                                row.fields.emplace(k, read_iter_string(resp_buf, *fit));
-                            } else if (fit->value_type == lite3cpp::Type::Int64 && fit->value_offset + 9 <= resp_buf.size()) {
-                                int64_t iv = 0;
-                                std::memcpy(&iv, resp_buf.data() + fit->value_offset + 1, 8);
-                                row.fields.emplace(k, std::to_string(iv));
-                            } else if (fit->value_type == lite3cpp::Type::Float64 && fit->value_offset + 9 <= resp_buf.size()) {
-                                double fv = 0.0;
-                                std::memcpy(&fv, resp_buf.data() + fit->value_offset + 1, 8);
-                                row.fields.emplace(k, std::to_string(fv));
-                            } else if (fit->value_type == lite3cpp::Type::Bool && fit->value_offset + 2 <= resp_buf.size()) {
-                                bool bv = resp_buf.data()[fit->value_offset + 1] != 0;
-                                row.fields.emplace(k, bv ? "true" : "false");
-                            } else {
-                                row.fields.emplace(k, "");
-                            }
-                        }
+                    for (auto cit = resp_buf.begin(arr_ofs), cend = resp_buf.end(arr_ofs); cit != cend; ++cit) {
+                        row.projected_values.emplace_back(read_iter_string(resp_buf, *cit));
                     }
                     results.push_back(std::move(row));
+                    continue;
                 }
+                if (rit->value_type != lite3cpp::Type::Object) continue;
+                const size_t row_ofs = rit->value_offset + 1;
+                if (row_ofs + sizeof(lite3cpp::PackedNodeLayout) > resp_buf.size()) continue;
+
+                ResultRow row;
+                if (auto cols_ofs_opt = resp_buf.try_get_arr(row_ofs, "cols"_hk)) {
+                    const size_t cols_ofs = *cols_ofs_opt;
+                    cols.clear();
+                    for (auto cit = resp_buf.begin(cols_ofs), cend = resp_buf.end(cols_ofs); cit != cend; ++cit) {
+                        cols.emplace_back(read_iter_string(resp_buf, *cit));
+                    }
+                }
+                if (r == 0 && !cols.empty()) {
+                    row.projected_names = cols;
+                }
+                if (auto proj_ofs_opt = resp_buf.try_get_arr(row_ofs, "proj"_hk)) {
+                    const size_t proj_ofs = *proj_ofs_opt;
+                    size_t pi = 0;
+                    for (auto pit = resp_buf.begin(proj_ofs), pend = resp_buf.end(proj_ofs); pit != pend; ++pit, ++pi) {
+                        std::string val(read_iter_string(resp_buf, *pit));
+                        if (pi < cols.size() && !cols[pi].empty()) {
+                            row.fields[cols[pi]] = val;
+                        }
+                        row.projected_values.push_back(std::move(val));
+                    }
+                } else if (auto fields_ofs_opt = resp_buf.try_get_obj(row_ofs, "fields"_hk)) {
+                    const size_t fields_ofs = *fields_ofs_opt;
+                    for (auto fit = resp_buf.begin(fields_ofs), fend = resp_buf.end(fields_ofs); fit != fend; ++fit) {
+                        std::string_view k = fit->key;
+                        if (fit->value_type == lite3cpp::Type::String) {
+                            row.fields.emplace(k, read_iter_string(resp_buf, *fit));
+                        } else if (fit->value_type == lite3cpp::Type::Int64 && fit->value_offset + 9 <= resp_buf.size()) {
+                            int64_t iv = 0;
+                            std::memcpy(&iv, resp_buf.data() + fit->value_offset + 1, 8);
+                            row.fields.emplace(k, std::to_string(iv));
+                        } else if (fit->value_type == lite3cpp::Type::Float64 && fit->value_offset + 9 <= resp_buf.size()) {
+                            double fv = 0.0;
+                            std::memcpy(&fv, resp_buf.data() + fit->value_offset + 1, 8);
+                            row.fields.emplace(k, std::to_string(fv));
+                        } else if (fit->value_type == lite3cpp::Type::Bool && fit->value_offset + 2 <= resp_buf.size()) {
+                            bool bv = resp_buf.data()[fit->value_offset + 1] != 0;
+                            row.fields.emplace(k, bv ? "true" : "false");
+                        } else {
+                            row.fields.emplace(k, "");
+                        }
+                    }
+                }
+                results.push_back(std::move(row));
             }
         }
-        return results;
-    } catch (...) {
-        report_failure(cluster_id);
-        throw;
     }
+    return results;
 }
 
 // ============================================================================
@@ -1092,31 +1176,30 @@ std::future<bool> RemoteL3KVClient::replicate_async(
 
     return task_pool_->enqueue([this, cluster_id, key, payload, origin_cluster_id, principal_id]() -> bool {
         try {
-            auto* box = get_or_create_tl_socket(cluster_id);
-            if (!box) return false;
-
             char orig_buf[16];
             auto [optr, oec] = std::to_chars(orig_buf, orig_buf + sizeof(orig_buf), origin_cluster_id);
             size_t orig_len = (oec == std::errc{}) ? static_cast<size_t>(optr - orig_buf) : 0;
 
-            box->socket->send(zmq::message_t(), zmq::send_flags::sndmore);
-            uint32_t pid = principal_id;
-            box->socket->send(zmq::message_t(&pid, 4), zmq::send_flags::sndmore);
-            box->socket->send(zmq::message_t("S", 1), zmq::send_flags::sndmore);
-            box->socket->send(zmq::message_t(key.data(), key.size()), zmq::send_flags::sndmore);
-            box->socket->send(zmq::message_t(payload.data(), payload.size()), zmq::send_flags::sndmore);
-            box->socket->send(zmq::message_t(orig_buf, orig_len), zmq::send_flags::none);
+            auto& recv_msgs = send_and_recv_rpc(
+                cluster_id,
+                [&](zmq::socket_t& sock) {
+                    sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                    uint32_t pid = principal_id;
+                    sock.send(zmq::message_t(&pid, 4), zmq::send_flags::sndmore);
+                    sock.send(zmq::message_t("S", 1), zmq::send_flags::sndmore);
+                    sock.send(zmq::message_t(key.data(), key.size()), zmq::send_flags::sndmore);
+                    sock.send(zmq::message_t(payload.data(), payload.size()), zmq::send_flags::sndmore);
+                    sock.send(zmq::message_t(orig_buf, orig_len), zmq::send_flags::none);
+                },
+                "Replication sync timed out");
 
-            auto& recv_msgs = get_tl_recv_msgs();
-            auto res = zmq::recv_multipart(*box->socket, std::back_inserter(recv_msgs));
-            if (res && recv_msgs.size() >= 2 && !is_err_frame(recv_msgs[1])) {
+            if (!is_err_frame(recv_msgs[1])) {
                 report_success(cluster_id);
                 return true;
             }
-            report_failure(cluster_id);
+            if (is_server_err_frame(recv_msgs[1])) report_failure(cluster_id);
             return false;
         } catch (...) {
-            report_failure(cluster_id);
             return false;
         }
     });
@@ -1274,24 +1357,25 @@ std::future<uint64_t> RemoteL3KVClient::atomic_incr_async(
     }
 
     return task_pool_->enqueue([this, owner_id, key, delta, principal_id]() -> uint64_t {
+        if (!get_peer_state(owner_id)) return 0;
         try {
-            auto* box = get_or_create_tl_socket(owner_id);
-            if (!box) return 0;
-
             char d_buf[32];
             auto [dptr, dec] = std::to_chars(d_buf, d_buf + sizeof(d_buf), delta);
             size_t d_len = (dec == std::errc{}) ? static_cast<size_t>(dptr - d_buf) : 0;
 
-            box->socket->send(zmq::message_t(), zmq::send_flags::sndmore);
-            uint32_t pid = principal_id;
-            box->socket->send(zmq::message_t(&pid, 4), zmq::send_flags::sndmore);
-            box->socket->send(zmq::message_t("+", 1), zmq::send_flags::sndmore);
-            box->socket->send(zmq::message_t(key.data(), key.size()), zmq::send_flags::sndmore);
-            box->socket->send(zmq::message_t(d_buf, d_len), zmq::send_flags::none);
+            auto& recv_msgs = send_and_recv_rpc(
+                owner_id,
+                [&](zmq::socket_t& sock) {
+                    sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                    uint32_t pid = principal_id;
+                    sock.send(zmq::message_t(&pid, 4), zmq::send_flags::sndmore);
+                    sock.send(zmq::message_t("+", 1), zmq::send_flags::sndmore);
+                    sock.send(zmq::message_t(key.data(), key.size()), zmq::send_flags::sndmore);
+                    sock.send(zmq::message_t(d_buf, d_len), zmq::send_flags::none);
+                },
+                "Atomic increment timed out");
 
-            auto& recv_msgs = get_tl_recv_msgs();
-            auto res = zmq::recv_multipart(*box->socket, std::back_inserter(recv_msgs));
-            if (res && recv_msgs.size() >= 2 && !is_err_frame(recv_msgs[1])) {
+            if (!is_err_frame(recv_msgs[1])) {
                 std::string_view sv(static_cast<const char*>(recv_msgs[1].data()), recv_msgs[1].size());
                 uint64_t parsed = 0;
                 auto [p, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), parsed);
@@ -1423,57 +1507,53 @@ std::future<std::unordered_map<uint64_t, std::string>> RemoteL3KVClient::get_nod
     return task_pool_->enqueue([this, owner_id, node_ids, principal_id]() -> std::unordered_map<uint64_t, std::string> {
         std::unordered_map<uint64_t, std::string> results;
         try {
-            auto* box = get_or_create_tl_socket(owner_id);
-            if (!box) return results;
+            auto& recv_msgs = send_and_recv_rpc(
+                owner_id,
+                [&](zmq::socket_t& sock) {
+                    sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                    uint32_t pid = principal_id;
+                    sock.send(zmq::message_t(&pid, 4), zmq::send_flags::sndmore);
+                    sock.send(zmq::message_t("M", 1), zmq::send_flags::sndmore);
+                    for (size_t i = 0; i < node_ids.size(); ++i) {
+                        std::string_view key = KeyBuilder::node_key(node_ids[i]);
+                        sock.send(
+                            zmq::message_t(key.data(), key.size()),
+                            (i == node_ids.size() - 1) ? zmq::send_flags::none : zmq::send_flags::sndmore);
+                    }
+                },
+                "Nodes batch fetch timed out");
 
-            box->socket->send(zmq::message_t(), zmq::send_flags::sndmore);
-            uint32_t pid = principal_id;
-            box->socket->send(zmq::message_t(&pid, 4), zmq::send_flags::sndmore);
-            box->socket->send(zmq::message_t("M", 1), zmq::send_flags::sndmore);
-
-            for (size_t i = 0; i < node_ids.size(); ++i) {
-                std::string_view key = KeyBuilder::node_key(node_ids[i]);
-                box->socket->send(
-                    zmq::message_t(key.data(), key.size()),
-                    (i == node_ids.size() - 1) ? zmq::send_flags::none : zmq::send_flags::sndmore);
+            const auto& body = recv_msgs[1];
+            if (is_err_frame(body)) {
+                if (!is_acl_err_frame(body)) report_failure(owner_id);
+                return results;
             }
+            report_success(owner_id);
+            if (body.size() >= sizeof(lite3cpp::PackedNodeLayout)) {
+                auto buf = lite3cpp::Buffer::from_view(static_cast<const uint8_t*>(body.data()), body.size());
+                results.reserve(node_ids.size());
+                for (auto it = buf.begin(0), end = buf.end(0); it != end; ++it) {
+                    std::string_view key = it->key;
+                    if (key.starts_with("n:{") && key.ends_with("}") && key.size() > 4) {
+                        std::string_view hex_sv = key.substr(3, key.size() - 4);
+                        uint64_t id = 0;
+                        auto [ptr, ec] = std::from_chars(hex_sv.data(), hex_sv.data() + hex_sv.size(), id, 16);
+                        if (ec != std::errc{} || ptr != hex_sv.data() + hex_sv.size()) continue;
 
-            auto& recv_msgs = get_tl_recv_msgs();
-            auto res = zmq::recv_multipart(*box->socket, std::back_inserter(recv_msgs));
-            if (res && recv_msgs.size() >= 2) {
-                const auto& body = recv_msgs[1];
-                if (is_err_frame(body)) {
-                    report_failure(owner_id);
-                    return results;
-                }
-                report_success(owner_id);
-                if (body.size() >= sizeof(lite3cpp::PackedNodeLayout)) {
-                    auto buf = lite3cpp::Buffer::from_view(static_cast<const uint8_t*>(body.data()), body.size());
-                    results.reserve(node_ids.size());
-                    for (auto it = buf.begin(0), end = buf.end(0); it != end; ++it) {
-                        std::string_view key = it->key;
-                        if (key.starts_with("n:{") && key.ends_with("}") && key.size() > 4) {
-                            std::string_view hex_sv = key.substr(3, key.size() - 4);
-                            uint64_t id = 0;
-                            auto [ptr, ec] = std::from_chars(hex_sv.data(), hex_sv.data() + hex_sv.size(), id, 16);
-                            if (ec != std::errc{} || ptr != hex_sv.data() + hex_sv.size()) continue;
-
-                            if (it->value_type == lite3cpp::Type::Bytes && it->value_offset + 5 <= buf.size()) {
-                                uint32_t sz = 0;
-                                std::memcpy(&sz, buf.data() + it->value_offset + 1, 4);
-                                if (it->value_offset + 5 + sz <= buf.size()) {
-                                    results.emplace(id, std::string(reinterpret_cast<const char*>(buf.data() + it->value_offset + 5), sz));
-                                }
-                            } else if (it->value_type == lite3cpp::Type::String) {
-                                results.emplace(id, std::string(read_iter_string(buf, *it)));
+                        if (it->value_type == lite3cpp::Type::Bytes && it->value_offset + 5 <= buf.size()) {
+                            uint32_t sz = 0;
+                            std::memcpy(&sz, buf.data() + it->value_offset + 1, 4);
+                            if (it->value_offset + 5 + sz <= buf.size()) {
+                                results.emplace(id, std::string(reinterpret_cast<const char*>(buf.data() + it->value_offset + 5), sz));
                             }
+                        } else if (it->value_type == lite3cpp::Type::String) {
+                            results.emplace(id, std::string(read_iter_string(buf, *it)));
                         }
                     }
                 }
             }
             return results;
         } catch (...) {
-            report_failure(owner_id);
             return {};
         }
     });

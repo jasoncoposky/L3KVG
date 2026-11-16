@@ -11,6 +11,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <zmq.hpp>
@@ -273,6 +274,32 @@ public:
     void report_failure(lite3::NodeID node_id);
     void report_success(lite3::NodeID node_id);
 
+    struct TlSocketBox {
+        std::mutex close_mu;
+        std::unique_ptr<zmq::socket_t> socket;
+        std::string endpoint;
+        uint64_t config_epoch{0};
+        bool authenticated{false};
+
+        void close_socket() noexcept {
+            std::lock_guard<std::mutex> lk(close_mu);
+            if (socket) {
+                try {
+                    socket->set(zmq::sockopt::linger, 0);
+                    socket->close();
+                } catch (...) {}
+                socket.reset();
+            }
+            authenticated = false;
+        }
+    };
+
+    struct SocketRegistry {
+        std::mutex mu;
+        bool client_closed{false};
+        std::unordered_set<std::shared_ptr<TlSocketBox>> active;
+    };
+
 private:
     struct PeerState {
         std::string endpoint;
@@ -282,18 +309,16 @@ private:
         std::atomic<int64_t> last_failure_ns{0};
     };
 
-    struct TlSocketBox {
-        std::unique_ptr<zmq::socket_t> socket;
-        std::string endpoint;
-        uint64_t config_epoch{0};
-        bool authenticated{false};
-    };
-
+    bool has_auth_secret();
     std::shared_ptr<PeerState> get_peer_state(lite3::NodeID node_id);
     TlSocketBox* get_or_create_tl_socket(lite3::NodeID node_id, std::shared_ptr<PeerState>* out_peer = nullptr, bool require_auth = true);
+    void invalidate_tl_socket(lite3::NodeID node_id, TlSocketBox* box) noexcept;
     void ensure_socket_authenticated(TlSocketBox& box, lite3::NodeID node_id);
     void check_circuit(PeerState& peer);
     void run_health_check_loop();
+
+    template <typename SendFn>
+    std::vector<zmq::message_t>& send_and_recv_rpc(lite3::NodeID peer_id, SendFn&& send_fn, const char* timeout_msg);
 
     bool put_key_bytes_sync(lite3::NodeID owner_id, std::string_view key, const void* data, size_t len, uint32_t principal_id);
     bool del_key_sync(lite3::NodeID owner_id, std::string_view key, uint32_t principal_id);
@@ -306,7 +331,7 @@ private:
     Settings settings_;
     std::string auth_secret_;
     std::unordered_map<lite3::NodeID, std::shared_ptr<PeerState>> peers_;
-    std::vector<std::shared_ptr<TlSocketBox>> tls_sockets_;
+    std::shared_ptr<SocketRegistry> socket_registry_;
     std::mutex endpoints_mutex_;
     int zmq_sndhwm_;
     zmq::context_t zmq_ctx_;

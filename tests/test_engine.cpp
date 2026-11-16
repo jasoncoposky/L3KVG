@@ -298,6 +298,66 @@ TEST(EngineTest, QueryStartIndexPrefixFlatRowsAndNumericFilters) {
   EXPECT_EQ(str_gt_rows[0].projected_values[0], "obj2");
 }
 
+TEST(EngineTest, ZeroHopQueryPopulatesFieldsAndUnauthorizedFetchDoesNotPoisonCache) {
+  ScopedTestDir dir("test_wave2b_review_reg_db");
+  l3kvg::Settings settings;
+  l3kvg::Engine engine(dir.path, 1, nullptr, 4, settings);
+
+  const uint64_t nid1 = 0x3101;
+  const uint64_t nid2 = 0x3102;
+  engine.put_node(nid1, R"({"id":"item_01","entity_type":"data_object","n":"secret_doc","s":42})");
+  engine.put_node(nid2, R"({"id":"item_02","entity_type":"data_object","n":"public_doc","s":84})");
+
+  // Register restricted user 701 who only has READ on nid2, NOT nid1
+  const uint32_t restricted_uid = 701;
+  engine.get_store()->credentials().register_user(restricted_uid, "restricted", "rk");
+  engine.get_store()->credentials().set_acl(
+      restricted_uid, std::string(l3kvg::KeyBuilder::node_key(nid2)), l3kv::Permission::READ);
+
+  // 1. Cold cache: restricted_uid attempts fetch_nodes({nid1}) FIRST -> must be denied AND must NOT poison Engine cache!
+  auto unauth_nodes = engine.fetch_nodes({nid1}, restricted_uid);
+  ASSERT_EQ(unauth_nodes.size(), 1u);
+  EXPECT_TRUE(unauth_nodes[0] == nullptr || !unauth_nodes[0]->is_loaded());
+
+  // Subsequent admin get_node / fetch_nodes on nid1 MUST still load full attributes cleanly!
+  auto admin_node = engine.get_node(nid1);
+  ASSERT_NE(admin_node, nullptr);
+  EXPECT_EQ(admin_node->get_attribute<std::string>("n"), "secret_doc");
+  EXPECT_EQ(admin_node->get_attribute<int64_t>("s"), 42);
+
+  // Warm cache: restricted_uid attempting fetch_nodes({nid1}) AFTER admin loaded it MUST still be denied!
+  auto unauth_warm = engine.fetch_nodes({nid1}, restricted_uid);
+  ASSERT_EQ(unauth_warm.size(), 1u);
+  EXPECT_EQ(unauth_warm[0], nullptr);
+
+  // 2. Direct C++ 0-hop Query::execute() MUST populate row.fields["alias.prop"] and row.fields["idx_i"],
+  //    and non-Eq filter on "id" (Like / Gt) MUST work on the typed "id" attribute!
+  l3kvg::MutationBatch idx_batch;
+  char hex1[17], hex2[17];
+  std::snprintf(hex1, sizeof(hex1), "%016llx", static_cast<unsigned long long>(nid1));
+  std::snprintf(hex2, sizeof(hex2), "%016llx", static_cast<unsigned long long>(nid2));
+  idx_batch.put_raw(std::string("idx:DataObject:id:") + hex1, hex1);
+  idx_batch.put_raw(std::string("idx:DataObject:id:") + hex2, hex2);
+  ASSERT_TRUE(engine.apply_batch(idx_batch.get_buffer()));
+
+  auto rows = engine.query()
+      .match("DataObject")
+      .where("DataObject", "id", l3kvg::Query::Op::Gt, "item_01")
+      .return_("DataObject", "n")
+      .return_("DataObject", "s")
+      .execute();
+
+  ASSERT_EQ(rows.size(), 1u);
+  EXPECT_EQ(rows[0].projected_values[0], "public_doc");
+  EXPECT_EQ(rows[0].projected_values[1], "84");
+  ASSERT_TRUE(rows[0].fields.contains("DataObject.n"));
+  EXPECT_EQ(rows[0].fields.at("DataObject.n"), "public_doc");
+  ASSERT_TRUE(rows[0].fields.contains("idx_0"));
+  EXPECT_EQ(rows[0].fields.at("idx_0"), "public_doc");
+  ASSERT_TRUE(rows[0].fields.contains("DataObject.s"));
+  EXPECT_EQ(rows[0].fields.at("DataObject.s"), "84");
+}
+
 int main(int argc, char **argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

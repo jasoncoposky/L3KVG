@@ -70,6 +70,18 @@ inline void send_reply(zmq::socket_t& sock, zmq::message_t& identity, const void
     sock.send(zmq::message_t(data, size), zmq::send_flags::none);
 }
 
+inline bool has_read_acl(l3kvg::Engine* engine, uint32_t uid, std::string_view key) {
+    if (uid == l3kvg::INTERNAL_UID || uid == l3kvg::ADMIN_UID) return true;
+    auto perm = engine->get_store()->credentials().check_permission(uid, key);
+    return (perm & l3kv::Permission::READ) || (perm & l3kv::Permission::ADMIN);
+}
+
+inline bool has_write_acl(l3kvg::Engine* engine, uint32_t uid, std::string_view key) {
+    if (uid == l3kvg::INTERNAL_UID || uid == l3kvg::ADMIN_UID) return true;
+    auto perm = engine->get_store()->credentials().check_permission(uid, key);
+    return (perm & l3kv::Permission::WRITE) || (perm & l3kv::Permission::ADMIN);
+}
+
 } // namespace
 
 Config load_config(const std::string &path) {
@@ -360,6 +372,11 @@ static void process_request(
             std::string key = recv_msgs[data_idx].to_string(); data_idx++;
             std::string payload = recv_msgs[data_idx].to_string();
 
+            if (!has_write_acl(engine, principal_id, key)) {
+                send_reply(sock, identity, "ERR_FORBIDDEN", 13);
+                return;
+            }
+
             if (key.starts_with("e:out:{")) {
                 uint64_t src = 0, dst = 0; double weight = 0; char label_buf[256] = {0};
                 int parsed = std::sscanf(key.c_str(), "e:out:{%llx\x7d:%255[^:]:%lf:{%llx\x7d",
@@ -483,6 +500,10 @@ static void process_request(
                                 break;
                             }
                             case l3kvg::GraphReadKind::OutNeighbors: {
+                                if (!has_read_acl(engine, eff_uid, l3kvg::KeyBuilder::node_key(nid))) {
+                                    resp_buf.set_bool(r_ofs, "f"_hk, false);
+                                    break;
+                                }
                                 double min_w = req_buf.try_get_f64(item_ofs, "w"_hk).value_or(-999999.0);
                                 auto node = engine->get_node(nid);
                                 std::vector<uint64_t> neighs = node
@@ -497,6 +518,10 @@ static void process_request(
                                 break;
                             }
                             case l3kvg::GraphReadKind::InNeighbors: {
+                                if (!has_read_acl(engine, eff_uid, l3kvg::KeyBuilder::node_key(nid))) {
+                                    resp_buf.set_bool(r_ofs, "f"_hk, false);
+                                    break;
+                                }
                                 auto node = engine->get_node(nid);
                                 std::vector<uint64_t> neighs = node
                                     ? node->get_in_neighbors(str_arg, eff_uid)
@@ -541,6 +566,10 @@ static void process_request(
         }
         try {
             std::string key = recv_msgs[data_idx].to_string();
+            if (!has_write_acl(engine, principal_id, key)) {
+                send_reply(sock, identity, "ERR_FORBIDDEN", 13);
+                return;
+            }
             if (key.starts_with("n:{")) {
                 size_t end_pos = key.find('}', 3);
                 if (end_pos != std::string::npos && end_pos > 3) {
@@ -616,6 +645,11 @@ static void process_request(
                 send_reply(sock, identity, "ERR", 3);
                 return;
             }
+            if (!has_write_acl(engine, principal_id, l3kvg::KeyBuilder::edge_out_key(src, label_sv, weight, dst)) ||
+                !has_write_acl(engine, principal_id, l3kvg::KeyBuilder::edge_in_key(dst, label_sv, src))) {
+                send_reply(sock, identity, "ERR_FORBIDDEN", 13);
+                return;
+            }
             engine->add_edge(src, label_sv, weight, dst);
             send_reply(sock, identity, "OK", 2);
         } catch (...) {
@@ -642,6 +676,10 @@ static void process_request(
                 send_reply(sock, identity, "ERR", 3);
                 return;
             }
+            if (!has_read_acl(engine, principal_id, l3kvg::KeyBuilder::node_key(target_node_id))) {
+                send_reply(sock, identity, "ERR_FORBIDDEN", 13);
+                return;
+            }
 
             auto node = engine->get_node(target_node_id);
             std::vector<uint64_t> neighs;
@@ -666,6 +704,10 @@ static void process_request(
             auto [pi, eci] = std::from_chars(id_sv.data(), id_sv.data() + id_sv.size(), target_node_id, 16);
             if (eci != std::errc{}) {
                 send_reply(sock, identity, "ERR", 3);
+                return;
+            }
+            if (!has_read_acl(engine, principal_id, l3kvg::KeyBuilder::node_key(target_node_id))) {
+                send_reply(sock, identity, "ERR_FORBIDDEN", 13);
                 return;
             }
 
