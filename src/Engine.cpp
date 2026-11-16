@@ -239,6 +239,11 @@ Engine::Engine(const std::string &db_path, uint32_t node_id, std::shared_ptr<lit
           edge_wal_.reset();
       }
   }
+
+  if (adjacency_store_.total_active_edges() == 0 &&
+      !store_->get_prefix_keys_all_shards("e:", "", 1).empty()) {
+      has_legacy_kv_edges_.store(true, std::memory_order_relaxed);
+  }
 }
 
 Engine::~Engine() {
@@ -401,7 +406,7 @@ std::vector<std::shared_ptr<Node>> Engine::fetch_nodes(const std::vector<uint64_
       uint64_t id = ids[i];
       auto node = get_node(id);
       if (node && !node->is_loaded()) {
-        node->ensure_loaded();
+        node->try_load_local(principal_id);
       }
       result[i] = std::move(node);
     }
@@ -446,11 +451,15 @@ std::vector<std::shared_ptr<Node>> Engine::fetch_nodes(const std::vector<uint64_
 std::vector<std::shared_ptr<Node>> Engine::get_nodes_by_prefix(const std::string& prefix, uint32_t principal_id) {
   auto keys = store_->get_prefix_keys_all_shards(prefix, "", settings_.prefix_scan_limit);
   std::vector<uint64_t> ids;
+  ids.reserve(keys.size());
   for (auto& k : keys) {
-      // Keys are n:{%016llx}
-      if (k.starts_with("n:{") && k.ends_with("}")) {
-          std::string id_str = k.substr(3, k.size() - 4);
-          ids.push_back(std::stoull(id_str, nullptr, 16));
+      if (k.starts_with("n:{") && k.ends_with("}") && k.size() > 4) {
+          std::string_view hex_sv(k.data() + 3, k.size() - 4);
+          uint64_t parsed_id = 0;
+          auto [ptr, ec] = std::from_chars(hex_sv.data(), hex_sv.data() + hex_sv.size(), parsed_id, 16);
+          if (ec == std::errc{} && ptr == hex_sv.data() + hex_sv.size()) {
+              ids.push_back(parsed_id);
+          }
       }
   }
   return fetch_nodes(ids, principal_id);
@@ -508,6 +517,9 @@ void Engine::put_node(std::string_view uuid, std::string payload) {
 }
 
 void Engine::replicate_key(const std::string& key, std::string payload, uint16_t origin_cluster_id) {
+    if (key.starts_with("e:out:") || key.starts_with("e:in:")) {
+        has_legacy_kv_edges_.store(true, std::memory_order_relaxed);
+    }
     if (key.starts_with("sys:")) {
         store_->put(key, std::move(payload));
         return;
@@ -523,20 +535,21 @@ void Engine::replicate_key(const std::string& key, std::string payload, uint16_t
           return;
         }
 
-        uint64_t id;
+        uint64_t id = 0;
         lite3::NodeID owner;
-        try {
-          std::string id_str = key.substr(start + 1, end - start - 1);
-          id = std::stoull(id_str, nullptr, 16);
+        {
+          std::string_view id_sv(key.data() + start + 1, end - start - 1);
+          auto [ptr, ec] = std::from_chars(id_sv.data(), id_sv.data() + id_sv.size(), id, 16);
+          if (ec != std::errc{} || ptr != id_sv.data() + id_sv.size()) {
+            store_->put(key, payload);
+            return;
+          }
           owner = resolver_.get_local_shard_owner(id);
 
           if (owner != resolver_.get_local_node_id()) {
             remote_client_->replicate_async(owner, key, payload, origin_cluster_id);
             return;
           }
-        } catch (...) {
-          store_->put(key, payload);
-          return;
         }
 
         // Conflict Resolution: Last-Writer-Wins using HLC
@@ -546,11 +559,9 @@ void Engine::replicate_key(const std::string& key, std::string payload, uint16_t
             bool is_binary = false;
             const uint8_t* in_ptr = reinterpret_cast<const uint8_t*>(payload.data());
             if (payload.size() >= sizeof(lite3cpp::PackedNodeLayout) && (in_ptr[0] == 0x06 || in_ptr[0] == 0x07)) {
-                try {
-                    in_buf = lite3cpp::Buffer(in_ptr, payload.size());
-                    is_binary = true;
-                    binary_payload = payload;
-                } catch (...) {}
+                in_buf = lite3cpp::Buffer::from_view(in_ptr, payload.size());
+                is_binary = true;
+                binary_payload = payload;
             }
             if (!is_binary) {
                 try {
@@ -568,8 +579,10 @@ void Engine::replicate_key(const std::string& key, std::string payload, uint16_t
             if (remote_ts.wall_time > 0) {
                 hlc_.update(remote_ts);
 
-                auto local_data = store_->get(key);
-                if (local_data.size() > 0) {
+                auto local_blob = store_->get_blob(key);
+                if (local_blob && local_blob->view().size() >= sizeof(lite3cpp::PackedNodeLayout)) {
+                    auto lv = local_blob->view();
+                    auto local_data = lite3cpp::Buffer::from_view(lv.data(), lv.size());
                     HLCTimestamp local_ts = HLCTimestamp::read_from_buffer(local_data, 0, "_hlc");
                     if (local_ts.wall_time == 0) {
                         local_ts = HLCTimestamp::read_from_buffer(local_data, 0, "ts");
@@ -610,6 +623,9 @@ void Engine::put_system_key(const std::string& key, const std::string& payload, 
     // Authorization: only ADMIN can write system keys
     if (principal_id != ADMIN_UID) {
         throw std::runtime_error("Unauthorized: Only ADMIN can modify system metadata");
+    }
+    if (key.starts_with("e:out:") || key.starts_with("e:in:")) {
+        has_legacy_kv_edges_.store(true, std::memory_order_relaxed);
     }
 
     // System keys (sys:) are special. We want them on ALL nodes eventually.
@@ -904,6 +920,9 @@ bool Engine::apply_batch(const lite3cpp::Buffer& buffer, uint32_t principal_id) 
         for (const MutationItem& item : items) {
             switch (item.op) {
                 case MutationOp::PutRaw: {
+                    if (item.key.starts_with("e:out:") || item.key.starts_with("e:in:")) {
+                        has_legacy_kv_edges_.store(true, std::memory_order_relaxed);
+                    }
                     stage_kv_put(item.key, item.value);
                     break;
                 }

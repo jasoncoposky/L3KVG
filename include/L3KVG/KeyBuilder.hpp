@@ -86,10 +86,10 @@ public:
 
 private:
     static char* get_buffer() {
-        static thread_local std::array<std::array<char, MAX_KEY_SIZE>, 2> buffers;
+        static thread_local std::array<std::array<char, MAX_KEY_SIZE>, 8> buffers;
         static thread_local size_t index = 0;
         char* buf = buffers[index].data();
-        index = (index + 1) % 2;
+        index = (index + 1) & 7;
         return buf;
     }
 };

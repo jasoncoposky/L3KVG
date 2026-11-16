@@ -22,7 +22,7 @@ CypherParser::execute(std::string_view query_text) {
   // WHERE e.weight >= 0.5
   // RETURN ally.name
 
-  std::regex match_rx(
+  static const std::regex match_rx(
       R"(MATCH\s*\(([^ {}]+)(?:\s*\{([^}]+)\})?\)\s*-\[\s*([^ :]+)\s*:\s*([^ \]]+)\s*\]->\s*\(([^ {}]+)(?:\s*\{([^}]+)\})?\))");
   std::smatch match_ast;
 
@@ -44,7 +44,7 @@ CypherParser::execute(std::string_view query_text) {
   auto parse_props = [&](const std::string &props, const std::string &alias) {
     if (props.empty())
       return;
-    std::regex extract_rx(R"(([^:, ']+)\s*:\s*'([^']+)')");
+    static const std::regex extract_rx(R"(([^:, ']+)\s*:\s*'([^']+)')");
     auto words_begin =
         std::sregex_iterator(props.begin(), props.end(), extract_rx);
     auto words_end = std::sregex_iterator();
@@ -58,7 +58,7 @@ CypherParser::execute(std::string_view query_text) {
 
   // Search for WHERE clause
   double min_weight = engine_->get_settings().default_min_weight;
-  std::regex where_rx(R"(WHERE\s+([^\.]+)\.([^ ]+)\s*(>=|>|=)\s*([0-9\.]+))");
+  static const std::regex where_rx(R"(WHERE\s+([^\.]+)\.([^ ]+)\s*(>=|>|=)\s*([0-9\.]+))");
   std::smatch where_ast;
   if (std::regex_search(query, where_ast, where_rx)) {
     std::string w_alias = where_ast[1];
@@ -74,14 +74,14 @@ CypherParser::execute(std::string_view query_text) {
   parse_props(tgt_props, tgt_alias);
 
   // Search for RETURN clause
-  std::regex return_rx(R"(RETURN\s+([^\n\r;]+))");
+  static const std::regex return_rx(R"(RETURN\s+([^\n\r;]+))");
   std::smatch return_ast;
   if (!std::regex_search(query, return_ast, return_rx)) {
     throw std::runtime_error("Cypher Syntax Error: Missing RETURN clause.");
   }
 
   std::string ret_clause = return_ast[1];
-  std::regex item_rx(R"(([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+))");
+  static const std::regex item_rx(R"(([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+))");
   auto items_begin = std::sregex_iterator(ret_clause.begin(), ret_clause.end(), item_rx);
   auto items_end = std::sregex_iterator();
   if (items_begin == items_end) {

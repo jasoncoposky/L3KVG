@@ -3,17 +3,23 @@
 #include "L3KVG/Node.hpp"
 #include "L3KVG/Edge.hpp"
 #include "L3KVG/FederationID.hpp"
-#include <iostream>
-#include <iomanip>
-#include <unordered_set>
-#include <set>
-#include <algorithm>
-#include <mutex>
-#include <sstream>
-#include <regex>
 #include "engine/store.hpp"
 
+#include <algorithm>
+#include <array>
+#include <charconv>
 #include <cstdio>
+#include <cstring>
+#include <iomanip>
+#include <iostream>
+#include <mutex>
+#include <numeric>
+#include <regex>
+#include <set>
+#include <sstream>
+#include <strings.h>
+#include <unordered_set>
+
 #define L3_LOG(level, ...) do { \
     static const bool s_l3_debug = (std::getenv("L3_DEBUG") != nullptr); \
     if (s_l3_debug) { \
@@ -28,47 +34,215 @@ namespace l3kvg {
 template<class... Ts> struct overloaded : Ts... { using Ts::operator()...; };
 template<class... Ts> overloaded(Ts...) -> overloaded<Ts...>;
 
-static bool evaluate_filter(Node* node, const Query::Filter& f, Engine* engine) {
+namespace {
+
+Query::Filter make_filter(std::string_view alias, std::string_view key, Query::Op op, std::string_view value) {
+    Query::Filter f;
+    f.alias.assign(alias.data(), alias.size());
+    f.key.assign(key.data(), key.size());
+    f.op = op;
+    f.value.assign(value.data(), value.size());
+    f.key_hash = lite3cpp::utils::djb2_hash(key);
+    f.numeric_ready = true;
+    if (!value.empty()) {
+        int64_t iv = 0;
+        auto [p_i, ec_i] = std::from_chars(value.data(), value.data() + value.size(), iv);
+        if (ec_i == std::errc{} && p_i == value.data() + value.size()) {
+            f.has_i64 = true;
+            f.i64_val = iv;
+            f.has_f64 = true;
+            f.f64_val = static_cast<double>(iv);
+        } else {
+            double fv = 0.0;
+            auto [p_f, ec_f] = std::from_chars(value.data(), value.data() + value.size(), fv);
+            if (ec_f == std::errc{} && p_f == value.data() + value.size()) {
+                f.has_f64 = true;
+                f.f64_val = fv;
+            }
+        }
+    }
+    return f;
+}
+
+inline bool icase_eq(std::string_view a, std::string_view b) noexcept {
+    return a.size() == b.size() && (a.empty() || ::strncasecmp(a.data(), b.data(), a.size()) == 0);
+}
+
+bool match_like_sv(std::string_view sv, const std::string& pattern) {
+    const bool has_underscore = (pattern.find('_') != std::string::npos);
+    const size_t first_pct = pattern.find('%');
+    const size_t last_pct = pattern.rfind('%');
+
+    if (!has_underscore) {
+        if (first_pct == std::string::npos) {
+            return icase_eq(sv, pattern);
+        }
+        if (first_pct == pattern.size() - 1 && last_pct == first_pct) {
+            std::string_view pfx(pattern.data(), first_pct);
+            return sv.size() >= pfx.size() &&
+                   (pfx.empty() || ::strncasecmp(sv.data(), pfx.data(), pfx.size()) == 0);
+        }
+        if (first_pct == 0 && last_pct == 0) {
+            std::string_view sfx(pattern.data() + 1, pattern.size() - 1);
+            return sv.size() >= sfx.size() &&
+                   (sfx.empty() || ::strncasecmp(sv.data() + sv.size() - sfx.size(), sfx.data(), sfx.size()) == 0);
+        }
+        if (first_pct == 0 && last_pct == pattern.size() - 1 && pattern.size() >= 2) {
+            size_t mid_pct = pattern.find('%', 1);
+            if (mid_pct == last_pct) {
+                std::string_view sub(pattern.data() + 1, last_pct - 1);
+                if (sub.empty()) return true;
+                auto it = std::search(
+                    sv.begin(), sv.end(), sub.begin(), sub.end(),
+                    [](unsigned char a, unsigned char b) { return std::tolower(a) == std::tolower(b); });
+                return it != sv.end();
+            }
+        }
+    }
+
+    thread_local static std::unordered_map<std::string, std::regex> s_regex_cache;
+    auto it = s_regex_cache.find(pattern);
+    if (it == s_regex_cache.end()) {
+        std::string regex_str;
+        regex_str.reserve(pattern.size() * 2 + 4);
+        regex_str.push_back('^');
+        for (char c : pattern) {
+            if (c == '%') regex_str += ".*";
+            else if (c == '_') regex_str.push_back('.');
+            else if (c == '.' || c == '*' || c == '+' || c == '?' || c == '(' || c == ')' ||
+                     c == '[' || c == ']' || c == '{' || c == '}' || c == '|' || c == '\\' ||
+                     c == '^' || c == '$') {
+                regex_str.push_back('\\');
+                regex_str.push_back(c);
+            } else {
+                regex_str.push_back(c);
+            }
+        }
+        regex_str.push_back('$');
+        try {
+            it = s_regex_cache.emplace(pattern, std::regex(regex_str, std::regex_constants::icase)).first;
+        } catch (...) {
+            return false;
+        }
+    }
+    try {
+        return std::regex_match(sv.begin(), sv.end(), it->second);
+    } catch (...) {
+        return false;
+    }
+}
+
+bool compare_string_filter(std::string_view sv, const Query::Filter& f,
+                           bool has_i64, int64_t f_i64, bool has_f64, double f_f64) {
+    switch (f.op) {
+        case Query::Op::Eq: return sv == f.value;
+        case Query::Op::Ne: return sv != f.value;
+        case Query::Op::Gt:
+        case Query::Op::Ge:
+        case Query::Op::Lt:
+        case Query::Op::Le: {
+            if (has_i64 && !sv.empty()) {
+                int64_t lhs = 0;
+                auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), lhs);
+                if (ec == std::errc{} && ptr == sv.data() + sv.size()) {
+                    if (f.op == Query::Op::Gt) return lhs > f_i64;
+                    if (f.op == Query::Op::Ge) return lhs >= f_i64;
+                    if (f.op == Query::Op::Lt) return lhs < f_i64;
+                    return lhs <= f_i64;
+                }
+            }
+            if (has_f64 && !sv.empty()) {
+                double lhs = 0.0;
+                auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), lhs);
+                if (ec == std::errc{} && ptr == sv.data() + sv.size()) {
+                    if (f.op == Query::Op::Gt) return lhs > f_f64;
+                    if (f.op == Query::Op::Ge) return lhs >= f_f64;
+                    if (f.op == Query::Op::Lt) return lhs < f_f64;
+                    return lhs <= f_f64;
+                }
+            }
+            std::string_view rhs(f.value);
+            if (f.op == Query::Op::Gt) return sv > rhs;
+            if (f.op == Query::Op::Ge) return sv >= rhs;
+            if (f.op == Query::Op::Lt) return sv < rhs;
+            return sv <= rhs;
+        }
+        case Query::Op::Like:
+            return match_like_sv(sv, f.value);
+        case Query::Op::NotLike:
+            return !match_like_sv(sv, f.value);
+    }
+    return false;
+}
+
+bool evaluate_filter(Node* node, const Query::Filter& f, Engine* engine) {
+    using namespace lite3cpp::literals;
+
+    bool has_i64 = f.has_i64;
+    int64_t f_i64 = f.i64_val;
+    bool has_f64 = f.has_f64;
+    double f_f64 = f.f64_val;
+    uint32_t key_hash = f.key_hash;
+    if (!f.numeric_ready) {
+        key_hash = lite3cpp::utils::djb2_hash(f.key);
+        if (!f.value.empty()) {
+            auto [pi, eci] = std::from_chars(f.value.data(), f.value.data() + f.value.size(), f_i64);
+            if (eci == std::errc{} && pi == f.value.data() + f.value.size()) {
+                has_i64 = true;
+                has_f64 = true;
+                f_f64 = static_cast<double>(f_i64);
+            } else {
+                auto [pf, ecf] = std::from_chars(f.value.data(), f.value.data() + f.value.size(), f_f64);
+                if (ecf == std::errc{} && pf == f.value.data() + f.value.size()) {
+                    has_f64 = true;
+                }
+            }
+        }
+    }
+
     if (f.key == "id") {
-        if (node->has_attribute("id")) {
-            std::string s_val;
-            try { s_val = node->get_attribute_as_string("id"); } catch (...) {}
-            if (!s_val.empty()) {
-                if (f.op == Query::Op::Eq && s_val == f.value) return true;
-                if (f.op == Query::Op::Ne && s_val == f.value) return false;
+        auto id_attr = node->try_get_attr("id"_hk);
+        if (const auto* sv = std::get_if<std::string_view>(&id_attr); sv && !sv->empty()) {
+            if (f.op == Query::Op::Eq && *sv == f.value) return true;
+            if (f.op == Query::Op::Ne && *sv == f.value) return false;
+        } else if (const auto* iv = std::get_if<int64_t>(&id_attr)) {
+            if (has_i64) {
+                if (f.op == Query::Op::Eq && *iv == f_i64) return true;
+                if (f.op == Query::Op::Ne && *iv == f_i64) return false;
             }
         }
         uint64_t target_id = engine->get_resolver().parse_uuid(f.value);
         uint64_t node_id = node->get_id();
-        bool res = false;
         switch (f.op) {
-            case Query::Op::Eq: res = (node_id == target_id); break;
-            case Query::Op::Ne: res = (node_id != target_id); break;
-            default: res = false;
+            case Query::Op::Eq: return node_id == target_id;
+            case Query::Op::Ne: return node_id != target_id;
+            default: return false;
         }
-        return res;
     }
 
     if (f.key == "_access_user") {
-        std::string user_name = f.value;
+        std::string_view user_name(f.value);
         if (user_name.empty()) return true;
 
-        // 1. Check if node is owned by the user
-        std::string owner;
-        try { owner = node->get_attribute_as_string("o"); } catch (...) {}
-        if (!owner.empty() && owner == user_name) return true;
+        auto o_attr = node->try_get_attr("o"_hk);
+        if (const auto* owner = std::get_if<std::string_view>(&o_attr); owner && !owner->empty() && *owner == user_name) {
+            return true;
+        }
 
-        // 2. Check system root collections accessible to all users
-        std::string p;
-        try { p = node->get_attribute_as_string("p"); } catch (...) {}
-        if (p.empty()) try { p = node->get_attribute_as_string("n"); } catch (...) {}
+        std::string_view p;
+        auto p_attr = node->try_get_attr("p"_hk);
+        if (const auto* psv = std::get_if<std::string_view>(&p_attr)) p = *psv;
+        if (p.empty()) {
+            auto n_attr = node->try_get_attr("n"_hk);
+            if (const auto* nsv = std::get_if<std::string_view>(&n_attr)) p = *nsv;
+        }
         bool is_system_root = (p == "/");
         if (!is_system_root && !p.empty() && p[0] == '/') {
             size_t second_slash = p.find('/', 1);
-            if (second_slash == std::string::npos) {
+            if (second_slash == std::string_view::npos) {
                 is_system_root = true;
             } else {
-                std::string_view sub(p.data() + second_slash, p.size() - second_slash);
+                std::string_view sub = p.substr(second_slash);
                 if (sub == "/home" || sub == "/trash" || sub == "/trash/home" ||
                     sub == "/home/public" || sub == "/trash/home/public") {
                     is_system_root = true;
@@ -79,7 +253,7 @@ static bool evaluate_filter(Node* node, const Query::Filter& f, Engine* engine) 
             return true;
         }
 
-        static auto perm_rank = [](std::string_view lvl) -> int {
+        static constexpr auto perm_rank = [](std::string_view lvl) noexcept -> int {
             if (lvl.starts_with("admin:")) lvl = lvl.substr(6);
             if (lvl == "null") return 1000;
             if (lvl == "execute") return 1010;
@@ -106,31 +280,26 @@ static bool evaluate_filter(Node* node, const Query::Filter& f, Engine* engine) 
         for (auto aid : access_nodes) {
             auto a_node = engine->get_node(aid);
             if (!a_node) continue;
-            a_node->ensure_loaded();
-            if (!a_node->is_loaded()) continue;
-            std::string level;
-            try { level = a_node->get_attribute_as_string("l"); } catch (...) {}
+            auto lvl_attr = a_node->try_get_attr("l"_hk);
+            std::string_view level = std::holds_alternative<std::string_view>(lvl_attr)
+                                     ? std::get<std::string_view>(lvl_attr) : std::string_view{};
             if (perm_rank(level) < 1050) continue;
-            
+
             auto user_nodes = a_node->get_in_neighbors("HAS_ACCESS", INTERNAL_UID);
             for (auto uid : user_nodes) {
                 auto u_node = engine->get_node(uid);
                 if (!u_node) continue;
-                u_node->ensure_loaded();
-                if (!u_node->is_loaded()) continue;
-                std::string un;
-                try { un = u_node->get_attribute_as_string("n"); } catch (...) {}
+                auto un_attr = u_node->try_get_attr("n"_hk);
+                std::string_view un = std::holds_alternative<std::string_view>(un_attr)
+                                      ? std::get<std::string_view>(un_attr) : std::string_view{};
                 if (un == user_name || un == "public") return true;
                 auto mem_nodes = u_node->get_in_neighbors("MEMBER_OF", INTERNAL_UID);
                 for (auto m_uid : mem_nodes) {
                     auto m_node = engine->get_node(m_uid);
-                    if (m_node) {
-                        m_node->ensure_loaded();
-                        if (m_node->is_loaded()) {
-                            std::string mn;
-                            try { mn = m_node->get_attribute_as_string("n"); } catch (...) {}
-                            if (mn == user_name) return true;
-                        }
+                    if (!m_node) continue;
+                    auto mn_attr = m_node->try_get_attr("n"_hk);
+                    if (const auto* msv = std::get_if<std::string_view>(&mn_attr); msv && *msv == user_name) {
+                        return true;
                     }
                 }
             }
@@ -138,256 +307,435 @@ static bool evaluate_filter(Node* node, const Query::Filter& f, Engine* engine) 
         return false;
     }
 
-    L3_LOG(0, "evaluate_filter() key=%s, val=%s, op=%d", f.key.c_str(), f.value.c_str(), (int)f.op);
-    std::string s_val;
-    lite3cpp::Type type = lite3cpp::Type::String;
-    if (f.key == "id") {
-        char id_hex[24];
-        std::snprintf(id_hex, sizeof(id_hex), "%016llx", (unsigned long long)node->get_id());
-        if (f.op == Query::Op::Eq && f.value == id_hex) {
-            return true;
-        }
-        if (node->has_attribute("id")) {
-            try { s_val = node->get_attribute_as_string("id"); } catch (...) { s_val = std::string(id_hex); }
-            type = node->get_attribute_type("id");
-        } else {
-            s_val = std::string(id_hex);
-        }
-    } else {
-        if (!node->has_attribute(f.key)) {
-            L3_LOG(0, "evaluate_filter() node %016llx does NOT have attribute '%s'", (unsigned long long)node->get_id(), f.key.c_str());
-            return false;
-        }
-
-        try { s_val = node->get_attribute_as_string(f.key); } catch (...) { 
-            L3_LOG(0, "evaluate_filter() node %016llx failed to get attribute '%s' as string", (unsigned long long)node->get_id(), f.key.c_str());
-            return false; 
-        }
-        type = node->get_attribute_type(f.key);
+    const lite3cpp::HashedKey hk(f.key, key_hash);
+    const Node::AttrValue attr = node->try_get_attr(hk);
+    if (std::holds_alternative<std::monostate>(attr)) {
+        return false;
     }
 
-    bool res = false;
-    switch (f.op) {
-        case Query::Op::Eq: 
-            res = (s_val == f.value); 
-            L3_LOG(0, "evaluate_filter() [Filter] %s.%s: '%s' == '%s' ? %s", f.alias.c_str(), f.key.c_str(), s_val.c_str(), f.value.c_str(), res ? "YES" : "NO");
-            break;
-        case Query::Op::Ne: res = (s_val != f.value); break;
-        case Query::Op::Gt: {
-            bool compared = false;
-            try {
-                size_t p1 = 0, p2 = 0;
-                long long v1 = std::stoll(s_val, &p1);
-                long long v2 = std::stoll(f.value, &p2);
-                if (p1 == s_val.size() && p2 == f.value.size()) {
-                    res = (v1 > v2);
-                    compared = true;
-                }
-            } catch (...) {}
-            if (!compared) {
-                if (type == lite3cpp::Type::Float64) { try { res = (std::stod(s_val) > std::stod(f.value)); } catch(...) { res = false; } }
-                else res = (s_val > f.value);
-            }
-            break;
-        }
-        case Query::Op::Ge: {
-            bool compared = false;
-            try {
-                size_t p1 = 0, p2 = 0;
-                long long v1 = std::stoll(s_val, &p1);
-                long long v2 = std::stoll(f.value, &p2);
-                if (p1 == s_val.size() && p2 == f.value.size()) {
-                    res = (v1 >= v2);
-                    compared = true;
-                }
-            } catch (...) {}
-            if (!compared) {
-                if (type == lite3cpp::Type::Float64) { try { res = (std::stod(s_val) >= std::stod(f.value)); } catch(...) { res = false; } }
-                else res = (s_val >= f.value);
-            }
-            break;
-        }
-        case Query::Op::Lt: {
-            bool compared = false;
-            try {
-                size_t p1 = 0, p2 = 0;
-                long long v1 = std::stoll(s_val, &p1);
-                long long v2 = std::stoll(f.value, &p2);
-                if (p1 == s_val.size() && p2 == f.value.size()) {
-                    res = (v1 < v2);
-                    compared = true;
-                }
-            } catch (...) {}
-            if (!compared) {
-                if (type == lite3cpp::Type::Float64) { try { res = (std::stod(s_val) < std::stod(f.value)); } catch(...) { res = false; } }
-                else res = (s_val < f.value);
-            }
-            break;
-        }
-        case Query::Op::Le: {
-            bool compared = false;
-            try {
-                size_t p1 = 0, p2 = 0;
-                long long v1 = std::stoll(s_val, &p1);
-                long long v2 = std::stoll(f.value, &p2);
-                if (p1 == s_val.size() && p2 == f.value.size()) {
-                    res = (v1 <= v2);
-                    compared = true;
-                }
-            } catch (...) {}
-            if (!compared) {
-                if (type == lite3cpp::Type::Float64) { try { res = (std::stod(s_val) <= std::stod(f.value)); } catch(...) { res = false; } }
-                else res = (s_val <= f.value);
-            }
-            break;
-        }
-        case Query::Op::Like:
-        case Query::Op::NotLike: {
-            bool matches = false;
-            bool has_underscore = (f.value.find('_') != std::string::npos);
-            size_t first_pct = f.value.find('%');
-            size_t last_pct = f.value.rfind('%');
-
-            if (!has_underscore) {
-                if (first_pct == std::string::npos) {
-                    // Exact match (case-insensitive)
-                    matches = (strcasecmp(s_val.c_str(), f.value.c_str()) == 0);
-                } else if (first_pct == f.value.size() - 1 && last_pct == first_pct) {
-                    // Prefix match: "prefix%"
-                    std::string_view pfx(f.value.data(), first_pct);
-                    matches = (s_val.size() >= pfx.size() && strncasecmp(s_val.data(), pfx.data(), pfx.size()) == 0);
-                } else if (first_pct == 0 && last_pct == 0) {
-                    // Suffix match: "%suffix"
-                    std::string_view sfx(f.value.data() + 1, f.value.size() - 1);
-                    matches = (s_val.size() >= sfx.size() && strncasecmp(s_val.data() + s_val.size() - sfx.size(), sfx.data(), sfx.size()) == 0);
-                } else if (first_pct == 0 && last_pct == f.value.size() - 1 && f.value.size() >= 2) {
-                    // Substring match: "%substr%"
-                    size_t mid_pct = f.value.find('%', 1);
-                    if (mid_pct == last_pct) {
-                        std::string sub = f.value.substr(1, last_pct - 1);
-                        auto it = std::search(s_val.begin(), s_val.end(), sub.begin(), sub.end(),
-                                              [](char a, char b) { return ::tolower(a) == ::tolower(b); });
-                        matches = (it != s_val.end());
-                    }
-                }
-            }
-
-            if (!matches && (has_underscore || (first_pct != std::string::npos && !(first_pct == f.value.size() - 1 && last_pct == first_pct)))) {
-                thread_local static std::unordered_map<std::string, std::regex> s_regex_cache;
-                auto it = s_regex_cache.find(f.value);
-                if (it == s_regex_cache.end()) {
-                    std::string regex_str = "^";
-                    for (char c : f.value) {
-                        if (c == '%') regex_str += ".*";
-                        else if (c == '_') regex_str += ".";
-                        else if (c == '.' || c == '*' || c == '+' || c == '?' || c == '(' || c == ')' || c == '[' || c == ']' || c == '{' || c == '}' || c == '|') { regex_str += "\\"; regex_str += c; }
-                        else regex_str += c;
-                    }
-                    regex_str += "$";
-                    try {
-                        it = s_regex_cache.emplace(f.value, std::regex(regex_str, std::regex_constants::icase)).first;
-                    } catch (...) {
-                        it = s_regex_cache.end();
-                    }
-                }
-                if (it != s_regex_cache.end()) {
-                    try { matches = std::regex_match(s_val, it->second); } catch (...) { matches = false; }
-                }
-            }
-            res = (f.op == Query::Op::Like) ? matches : !matches;
-            break;
-        }
-        default: res = false;
+    if (const auto* sv = std::get_if<std::string_view>(&attr)) {
+        return compare_string_filter(*sv, f, has_i64, f_i64, has_f64, f_f64);
     }
-    return res;
+
+    if (const auto* iv = std::get_if<int64_t>(&attr)) {
+        const int64_t lhs = *iv;
+        if (has_i64 && f.op != Query::Op::Like && f.op != Query::Op::NotLike) {
+            switch (f.op) {
+                case Query::Op::Eq: return lhs == f_i64;
+                case Query::Op::Ne: return lhs != f_i64;
+                case Query::Op::Gt: return lhs > f_i64;
+                case Query::Op::Ge: return lhs >= f_i64;
+                case Query::Op::Lt: return lhs < f_i64;
+                case Query::Op::Le: return lhs <= f_i64;
+                default: break;
+            }
+        }
+        if (has_f64 && f.op != Query::Op::Like && f.op != Query::Op::NotLike) {
+            const double lhs_d = static_cast<double>(lhs);
+            switch (f.op) {
+                case Query::Op::Eq: return lhs_d == f_f64;
+                case Query::Op::Ne: return lhs_d != f_f64;
+                case Query::Op::Gt: return lhs_d > f_f64;
+                case Query::Op::Ge: return lhs_d >= f_f64;
+                case Query::Op::Lt: return lhs_d < f_f64;
+                case Query::Op::Le: return lhs_d <= f_f64;
+                default: break;
+            }
+        }
+        char buf[32];
+        auto [ptr, ec] = std::to_chars(buf, buf + sizeof(buf), lhs);
+        std::string_view num_sv(buf, (ec == std::errc{}) ? static_cast<size_t>(ptr - buf) : 0);
+        return compare_string_filter(num_sv, f, has_i64, f_i64, has_f64, f_f64);
+    }
+
+    if (const auto* fv = std::get_if<double>(&attr)) {
+        const double lhs = *fv;
+        if (has_f64 && f.op != Query::Op::Like && f.op != Query::Op::NotLike) {
+            switch (f.op) {
+                case Query::Op::Eq: return lhs == f_f64;
+                case Query::Op::Ne: return lhs != f_f64;
+                case Query::Op::Gt: return lhs > f_f64;
+                case Query::Op::Ge: return lhs >= f_f64;
+                case Query::Op::Lt: return lhs < f_f64;
+                case Query::Op::Le: return lhs <= f_f64;
+                default: break;
+            }
+        }
+        std::string num_s = std::to_string(lhs);
+        return compare_string_filter(num_s, f, has_i64, f_i64, has_f64, f_f64);
+    }
+
+    if (const auto* bv = std::get_if<bool>(&attr)) {
+        std::string_view b_sv = *bv ? std::string_view("true") : std::string_view("false");
+        return compare_string_filter(b_sv, f, has_i64, f_i64, has_f64, f_f64);
+    }
+
+    return false;
 }
 
-enum class TriBool {
+enum class TriBool : uint8_t {
     False = 0,
     True = 1,
     Unknown = 2
 };
 
-inline TriBool tb_and(TriBool a, TriBool b) {
+inline TriBool tb_and(TriBool a, TriBool b) noexcept {
     if (a == TriBool::False || b == TriBool::False) return TriBool::False;
     if (a == TriBool::True && b == TriBool::True) return TriBool::True;
     return TriBool::Unknown;
 }
 
-inline TriBool tb_or(TriBool a, TriBool b) {
+inline TriBool tb_or(TriBool a, TriBool b) noexcept {
     if (a == TriBool::True || b == TriBool::True) return TriBool::True;
     if (a == TriBool::False && b == TriBool::False) return TriBool::False;
     return TriBool::Unknown;
 }
 
-inline TriBool tb_not(TriBool a) {
-    if (a == TriBool::True) return TriBool::False;
-    if (a == TriBool::False) return TriBool::True;
-    return TriBool::Unknown;
-}
-
-static TriBool evaluate_group_tribool(const Query::FilterGroup& g, const std::unordered_map<std::string, std::shared_ptr<Node>>& available_nodes, std::string_view current_alias, Engine* engine) {
+template <typename NodeLookupFn>
+TriBool evaluate_group_tribool_fn(const Query::FilterGroup& g, NodeLookupFn&& lookup_node, Engine* engine) {
     if (g.nodes.empty()) return TriBool::True;
     TriBool result = TriBool::True;
     bool is_first = true;
     for (const auto& n : g.nodes) {
         TriBool val = std::visit(overloaded{
             [&](const Query::Filter& f) -> TriBool {
-                auto it = available_nodes.find(f.alias);
-                if (it != available_nodes.end()) return evaluate_filter(it->second.get(), f, engine) ? TriBool::True : TriBool::False;
-                return TriBool::Unknown; 
+                Node* node = lookup_node(f.alias);
+                if (node != nullptr) {
+                    return evaluate_filter(node, f, engine) ? TriBool::True : TriBool::False;
+                }
+                return TriBool::Unknown;
             },
-            [&](const std::shared_ptr<Query::FilterGroup>& sub) -> TriBool { return evaluate_group_tribool(*sub, available_nodes, current_alias, engine); }
+            [&](const std::shared_ptr<Query::FilterGroup>& sub) -> TriBool {
+                return sub ? evaluate_group_tribool_fn(*sub, lookup_node, engine) : TriBool::True;
+            }
         }, n.node);
         if (is_first) {
             result = val;
             is_first = false;
+        } else if (n.prepended_op == Query::LogicalOp::Or) {
+            result = tb_or(result, val);
         } else {
-            if (n.prepended_op == Query::LogicalOp::Or) {
-                result = tb_or(result, val);
-            } else {
-                result = tb_and(result, val);
-            }
+            result = tb_and(result, val);
         }
     }
     return result;
 }
 
-static bool evaluate_group(const Query::FilterGroup& g, const std::unordered_map<std::string, std::shared_ptr<Node>>& available_nodes, std::string_view current_alias, Engine* engine) {
-    TriBool res = evaluate_group_tribool(g, available_nodes, current_alias, engine);
-    return res != TriBool::False;
+struct AliasTable {
+    std::vector<std::string> names;
+
+    size_t intern(std::string_view alias) {
+        for (size_t i = 0; i < names.size(); ++i) {
+            if (names[i] == alias) return i;
+        }
+        names.emplace_back(alias);
+        return names.size() - 1;
+    }
+
+    size_t find(std::string_view alias) const noexcept {
+        for (size_t i = 0; i < names.size(); ++i) {
+            if (names[i] == alias) return i;
+        }
+        return SIZE_MAX;
+    }
+};
+
+struct TraversalPath {
+    static constexpr size_t INLINE_SLOTS = 16;
+    std::array<std::shared_ptr<Node>, INLINE_SLOTS> inline_nodes{};
+    std::vector<std::shared_ptr<Node>> overflow_nodes;
+    size_t last_slot = 0;
+
+    const std::shared_ptr<Node>& get(size_t slot) const noexcept {
+        static const std::shared_ptr<Node> kNullNode{};
+        if (slot < INLINE_SLOTS) return inline_nodes[slot];
+        size_t ext = slot - INLINE_SLOTS;
+        return ext < overflow_nodes.size() ? overflow_nodes[ext] : kNullNode;
+    }
+
+    void set(size_t slot, std::shared_ptr<Node> node) {
+        if (slot < INLINE_SLOTS) {
+            inline_nodes[slot] = std::move(node);
+        } else {
+            size_t ext = slot - INLINE_SLOTS;
+            if (overflow_nodes.size() <= ext) {
+                overflow_nodes.resize(ext + 1);
+            }
+            overflow_nodes[ext] = std::move(node);
+        }
+    }
+};
+
+bool is_entity_type_match(std::string_view alias, std::string_view et, std::string_view actual_type, bool has_v) noexcept {
+    if (!et.empty()) {
+        if (alias == "DataObject") return (et == "data_object" || et == "generic");
+        if (alias == "Collection" || alias == "ParentCollection") return (et == "collection");
+        if (alias == "Resource" || alias == "ChildResource" || alias == "ParentResource") {
+            return (et == "resource" || et == "unixfilesystem" || et == "passthru" || et == "replication" ||
+                    et == "compound" || et == "load_balanced" || et == "random" || et == "deferred" ||
+                    et == "structfile" || et == "s3" || et == "mockarchive");
+        }
+        if (alias == "User") return (et == "user" || et == "group" || et == "rodsuser" || et == "rodsadmin" || et == "groupadmin" || et == "rodsgroup");
+        if (alias == "Group") return (et == "group" || et == "rodsgroup" || et == "user");
+        if (alias == "Zone") return (et == "zone" || et == "local" || et == "remote");
+        if (alias == "Replica") return (et == "replica");
+        if (alias == "Metadata") return (et == "metadata");
+        if (alias == "Access" || alias == "CollAccess") return (et == "access" || et == "access_type");
+        if (alias == "Rule") return (et == "rule");
+        if (alias == "Ticket") return (et == "ticket");
+        return icase_eq(alias, et);
+    }
+    if (alias == "Zone") return (actual_type == "zone" || actual_type == "local" || actual_type == "remote");
+    if (alias == "User") return (actual_type == "user" || actual_type == "rodsuser" || actual_type == "rodsadmin" || actual_type == "groupadmin" || actual_type == "rodsgroup");
+    if (alias == "Group") return (actual_type == "rodsgroup" || actual_type == "group" || actual_type == "rodsuser" || actual_type == "rodsadmin" || actual_type == "groupadmin" || actual_type == "user");
+    if (alias == "Collection" || alias == "ParentCollection") {
+        return (!has_v && actual_type != "data_object" && actual_type != "generic" && actual_type != "replica" &&
+                actual_type != "resource" && actual_type != "unixfilesystem" && actual_type != "passthru" &&
+                actual_type != "replication" && actual_type != "compound" && actual_type != "load_balanced" &&
+                actual_type != "random" && actual_type != "deferred" && actual_type != "structfile" &&
+                actual_type != "s3" && actual_type != "mockarchive" && actual_type != "user" &&
+                actual_type != "rodsuser" && actual_type != "rodsadmin" && actual_type != "groupadmin" &&
+                actual_type != "rodsgroup" && actual_type != "zone" && actual_type != "local" &&
+                actual_type != "remote" && actual_type != "metadata" && actual_type != "access" &&
+                actual_type != "access_type" && actual_type != "rule" && actual_type != "ticket");
+    }
+    if (alias == "DataObject") return (actual_type == "data_object" || actual_type == "generic");
+    if (alias == "Replica") return (actual_type == "replica");
+    if (alias == "Resource" || alias == "ChildResource" || alias == "ParentResource") {
+        return (actual_type == "resource" || actual_type == "unixfilesystem" || actual_type == "passthru" ||
+                actual_type == "replication" || actual_type == "compound" || actual_type == "load_balanced" ||
+                actual_type == "random" || actual_type == "deferred" || actual_type == "structfile" ||
+                actual_type == "s3" || actual_type == "mockarchive");
+    }
+    if (alias == "Metadata") return (actual_type == "metadata");
+    if (alias == "Access" || alias == "CollAccess") return (actual_type == "access" || actual_type == "access_type");
+    if (alias == "Rule") return (actual_type == "rule");
+    if (alias == "Ticket") return (actual_type == "ticket");
+    return true;
 }
 
-Query::FilterGroup& Query::FilterGroup::where(std::string_view alias, std::string_view key, Op op, std::string_view value) { nodes.push_back({Filter{std::string(alias), std::string(key), op, std::string(value)}, LogicalOp::And}); return *this; }
-Query::FilterGroup& Query::FilterGroup::or_where(std::string_view alias, std::string_view key, Op op, std::string_view value) { nodes.push_back({Filter{std::string(alias), std::string(key), op, std::string(value)}, LogicalOp::Or}); return *this; }
-Query::FilterGroup& Query::FilterGroup::where_group(std::function<void(FilterGroup&)> cb) { auto sub = std::make_shared<FilterGroup>(); cb(*sub); nodes.push_back({sub, LogicalOp::And}); return *this; }
-Query::FilterGroup& Query::FilterGroup::or_where_group(std::function<void(FilterGroup&)> cb) { auto sub = std::make_shared<FilterGroup>(); cb(*sub); nodes.push_back({sub, LogicalOp::Or}); return *this; }
+bool check_node_entity_type(Node* node, std::string_view alias) {
+    using namespace lite3cpp::literals;
+    if (alias.empty() || alias == "__root") return true;
+    auto et_attr = node->try_get_attr("entity_type"_hk);
+    std::string_view et = std::holds_alternative<std::string_view>(et_attr)
+                          ? std::get<std::string_view>(et_attr) : std::string_view{};
+    auto t_attr = node->try_get_attr("t"_hk);
+    std::string_view actual_type = std::holds_alternative<std::string_view>(t_attr)
+                                   ? std::get<std::string_view>(t_attr) : std::string_view{};
+    bool has_v = !std::holds_alternative<std::monostate>(node->try_get_attr("v"_hk));
+    return is_entity_type_match(alias, et, actual_type, has_v);
+}
+
+bool format_node_attr_into(Node* node, lite3cpp::HashedKey hk, std::string& out) {
+    Node::AttrValue v = node->try_get_attr(hk);
+    if (std::holds_alternative<std::monostate>(v)) {
+        if (node->get_attribute_type(hk.key) == lite3cpp::Type::Bytes) {
+            out = node->get_attribute_as_string(hk.key);
+            return !out.empty();
+        }
+        return false;
+    }
+    if (const auto* sv = std::get_if<std::string_view>(&v)) {
+        out.assign(sv->data(), sv->size());
+        return true;
+    }
+    if (const auto* iv = std::get_if<int64_t>(&v)) {
+        char buf[32];
+        auto [ptr, ec] = std::to_chars(buf, buf + sizeof(buf), *iv);
+        if (ec == std::errc{}) {
+            out.assign(buf, static_cast<size_t>(ptr - buf));
+        } else {
+            out = std::to_string(*iv);
+        }
+        return true;
+    }
+    if (const auto* fv = std::get_if<double>(&v)) {
+        out = std::to_string(*fv);
+        return true;
+    }
+    if (const auto* bv = std::get_if<bool>(&v)) {
+        out = *bv ? "true" : "false";
+        return true;
+    }
+    return false;
+}
+
+inline bool parse_hex_id_sv(std::string_view sv, uint64_t& out_id) noexcept {
+    if (sv.empty()) return false;
+    auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), out_id, 16);
+    return ec == std::errc{} && ptr == sv.data() + sv.size();
+}
+
+bool has_or_or_like_filter(const Query::FilterGroup& g) {
+    for (const auto& n : g.nodes) {
+        if (n.prepended_op == Query::LogicalOp::Or) return true;
+        if (auto* f = std::get_if<Query::Filter>(&n.node)) {
+            if (f->op == Query::Op::Like || f->op == Query::Op::NotLike || f->op == Query::Op::Ne) return true;
+        } else if (auto* sub = std::get_if<std::shared_ptr<Query::FilterGroup>>(&n.node)) {
+            if (*sub && has_or_or_like_filter(**sub)) return true;
+        }
+    }
+    return false;
+}
+
+const Query::Filter* find_first_eq_filter(const Query::FilterGroup& g, std::string_view alias, std::string_view key = "") {
+    for (const auto& n : g.nodes) {
+        if (auto* f = std::get_if<Query::Filter>(&n.node)) {
+            if (f->alias == alias && f->op == Query::Op::Eq && (key.empty() || f->key == key)) return f;
+        } else if (auto* sub = std::get_if<std::shared_ptr<Query::FilterGroup>>(&n.node)) {
+            if (*sub) {
+                if (auto* res = find_first_eq_filter(**sub, alias, key)) return res;
+            }
+        }
+    }
+    return nullptr;
+}
+
+void serialize_filter_nodes(const Query::FilterGroup& group, lite3cpp::Buffer& buf, size_t arr_ofs, int depth = 0) {
+    using namespace lite3cpp::literals;
+    if (depth > 32) return;
+    for (const auto& n : group.nodes) {
+        size_t item_ofs = buf.arr_append_obj(arr_ofs);
+        std::string_view prep = (n.prepended_op == Query::LogicalOp::Or) ? "or" : "and";
+        buf.set_str(item_ofs, "prepended_op"_hk, prep);
+        std::visit(overloaded{
+            [&](const Query::Filter& f) {
+                buf.set_str(item_ofs, "alias"_hk, f.alias);
+                buf.set_str(item_ofs, "key"_hk, f.key);
+                buf.set_i64(item_ofs, "op"_hk, static_cast<int64_t>(f.op));
+                buf.set_str(item_ofs, "value"_hk, f.value);
+            },
+            [&](const std::shared_ptr<Query::FilterGroup>& sub) {
+                buf.set_bool(item_ofs, "group"_hk, true);
+                if (sub) {
+                    size_t sub_arr_ofs = buf.set_arr(item_ofs, "filters"_hk);
+                    serialize_filter_nodes(*sub, buf, sub_arr_ofs, depth + 1);
+                }
+            }
+        }, n.node);
+    }
+}
+
+void parse_filter_nodes(const lite3cpp::Buffer& buf, size_t filters_arr_ofs, Query::FilterGroup& group, int depth = 0) {
+    using namespace lite3cpp::literals;
+    if (depth > 32) return;
+    if (filters_arr_ofs + sizeof(lite3cpp::PackedNodeLayout) > buf.size()) return;
+    for (auto it = buf.begin(filters_arr_ofs), end = buf.end(filters_arr_ofs); it != end; ++it) {
+        if (it->value_type != lite3cpp::Type::Object) continue;
+        const size_t item_ofs = it->value_offset + 1;
+        if (item_ofs + sizeof(lite3cpp::PackedNodeLayout) > buf.size()) continue;
+
+        if (buf.get_type_noexcept(item_ofs, "group"_hk) != lite3cpp::Type::Invalid) {
+            std::string_view grp_prep = buf.try_get_str(item_ofs, "prepended_op"_hk).value_or("and");
+            auto sub_ofs_opt = buf.try_get_arr(item_ofs, "filters"_hk);
+            auto cb = [&buf, sub_ofs_opt, depth](Query::FilterGroup& sub) {
+                if (sub_ofs_opt) {
+                    parse_filter_nodes(buf, *sub_ofs_opt, sub, depth + 1);
+                }
+            };
+            if (grp_prep == "or") {
+                group.or_where_group(cb);
+            } else {
+                group.where_group(cb);
+            }
+        } else {
+            auto alias = buf.try_get_str(item_ofs, "alias"_hk);
+            auto key = buf.try_get_str(item_ofs, "key"_hk);
+            auto val = buf.try_get_str(item_ofs, "value"_hk);
+            std::optional<int64_t> op_i64 = buf.try_get_i64(item_ofs, "op"_hk);
+            if (!op_i64) {
+                if (auto op_f64 = buf.try_get_f64(item_ofs, "op"_hk)) {
+                    op_i64 = static_cast<int64_t>(*op_f64);
+                }
+            }
+            if (alias && key && val && op_i64) {
+                auto op = static_cast<Query::Op>(*op_i64);
+                std::string_view prep = buf.try_get_str(item_ofs, "prepended_op"_hk).value_or("and");
+                if (prep == "or") {
+                    group.or_where(*alias, *key, op, *val);
+                } else {
+                    group.where(*alias, *key, op, *val);
+                }
+            }
+        }
+    }
+}
+
+} // namespace
+
+Query::FilterGroup& Query::FilterGroup::where(std::string_view alias, std::string_view key, Op op, std::string_view value) {
+    nodes.push_back({make_filter(alias, key, op, value), LogicalOp::And});
+    return *this;
+}
+Query::FilterGroup& Query::FilterGroup::or_where(std::string_view alias, std::string_view key, Op op, std::string_view value) {
+    nodes.push_back({make_filter(alias, key, op, value), LogicalOp::Or});
+    return *this;
+}
+Query::FilterGroup& Query::FilterGroup::where_group(std::function<void(FilterGroup&)> cb) {
+    auto sub = std::make_shared<FilterGroup>();
+    cb(*sub);
+    nodes.push_back({std::move(sub), LogicalOp::And});
+    return *this;
+}
+Query::FilterGroup& Query::FilterGroup::or_where_group(std::function<void(FilterGroup&)> cb) {
+    auto sub = std::make_shared<FilterGroup>();
+    cb(*sub);
+    nodes.push_back({std::move(sub), LogicalOp::Or});
+    return *this;
+}
 
 Query::Query(Engine *engine) : engine_(engine) {}
 Query &Query::match(std::string_view node_alias) { initial_match_ = {std::string(node_alias)}; return *this; }
-Query &Query::match_id(uint64_t id, std::string_view alias) { initial_match_ = {std::string(alias)}; char buf[24]; std::snprintf(buf, sizeof(buf), "%016llx", (unsigned long long)id); root_filters_.where(alias, "id", Op::Eq, std::string(buf)); return *this; }
-Query &Query::match_id(std::string_view uuid, std::string_view alias) { initial_match_ = {std::string(alias)}; root_filters_.where(alias, "id", Op::Eq, std::string(uuid)); return *this; }
-Query &Query::where(std::string_view node_alias, std::string_view key, Op op, std::string_view value) { root_filters_.where(node_alias, key, op, value); return *this; }
-Query &Query::where_group(std::function<void(FilterGroup&)> cb) { root_filters_.where_group(cb); return *this; }
-Query &Query::or_where(std::string_view node_alias, std::string_view key, Op op, std::string_view value) { root_filters_.or_where(node_alias, key, op, value); return *this; }
-Query &Query::or_where_group(std::function<void(FilterGroup&)> cb) { root_filters_.or_where_group(cb); return *this; }
+Query &Query::match_id(uint64_t id, std::string_view alias) {
+    initial_match_ = {std::string(alias)};
+    char buf[24];
+    std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(id));
+    root_filters_.where(alias, "id", Op::Eq, buf);
+    return *this;
+}
+Query &Query::match_id(std::string_view uuid, std::string_view alias) {
+    initial_match_ = {std::string(alias)};
+    root_filters_.where(alias, "id", Op::Eq, uuid);
+    return *this;
+}
+Query &Query::where(std::string_view node_alias, std::string_view key, Op op, std::string_view value) {
+    root_filters_.where(node_alias, key, op, value);
+    return *this;
+}
+Query &Query::where_group(std::function<void(FilterGroup&)> cb) { root_filters_.where_group(std::move(cb)); return *this; }
+Query &Query::or_where(std::string_view node_alias, std::string_view key, Op op, std::string_view value) {
+    root_filters_.or_where(node_alias, key, op, value);
+    return *this;
+}
+Query &Query::or_where_group(std::function<void(FilterGroup&)> cb) { root_filters_.or_where_group(std::move(cb)); return *this; }
+Query &Query::where_has(std::string_view alias, std::string_view key, std::string_view value_type) {
+    filters_has_.push_back(FilterHas{std::string(alias), std::string(key), std::string(value_type)});
+    return *this;
+}
 
 Query::OutEdgeBuilder Query::out(std::string_view edge_label, double min_weight) { return OutEdgeBuilder(*this, edge_label, min_weight); }
 Query::InEdgeBuilder Query::in(std::string_view edge_label) { return InEdgeBuilder(*this, edge_label); }
-Query& Query::OutEdgeBuilder::as(std::string_view dest_alias) { 
-    q_.steps_.push_back(OutStep{label_, weight_, std::string(dest_alias), q_.current_source_alias_}); 
+Query& Query::OutEdgeBuilder::as(std::string_view dest_alias) {
+    q_.steps_.push_back(OutStep{label_, weight_, std::string(dest_alias), q_.current_source_alias_});
     q_.current_source_alias_.clear();
-    return q_; 
+    return q_;
 }
-Query& Query::InEdgeBuilder::as(std::string_view dest_alias) { 
-    q_.steps_.push_back(InStep{label_, std::string(dest_alias), q_.current_source_alias_}); 
+Query& Query::InEdgeBuilder::as(std::string_view dest_alias) {
+    q_.steps_.push_back(InStep{label_, std::string(dest_alias), q_.current_source_alias_});
     q_.current_source_alias_.clear();
-    return q_; 
+    return q_;
 }
-Query& Query::return_(std::string_view alias, std::string_view property, AggOp agg, bool distinct) { 
-    projections_.push_back(ReturnStep{std::string(alias), std::string(property), agg, distinct}); 
-    return *this; 
+Query& Query::return_(std::string_view alias, std::string_view property, AggOp agg, bool distinct) {
+    projections_.push_back(ReturnStep{std::string(alias), std::string(property), agg, distinct});
+    return *this;
 }
+Query& Query::order_by(std::string_view alias, std::string_view property, bool ascending) {
+    sorts_.push_back(SortStep{std::string(alias), std::string(property), ascending});
+    return *this;
+}
+Query& Query::limit(size_t lim) { limit_ = lim; return *this; }
+Query& Query::offset(size_t ofs) { offset_ = ofs; return *this; }
 Query& Query::group_by(std::string_view alias, std::string_view property, std::string_view func_name, const std::vector<std::string>& func_args) {
     groups_.push_back(GroupStep{std::string(alias), std::string(property), std::string(func_name), func_args});
     return *this;
@@ -397,278 +745,207 @@ Query& Query::distinct(bool enable) {
     return *this;
 }
 
-static bool has_or_or_like_filter(const Query::FilterGroup& g) {
-    for (const auto& n : g.nodes) {
-        if (n.prepended_op == Query::LogicalOp::Or) return true;
-        if (auto* f = std::get_if<Query::Filter>(&n.node)) {
-            if (f->op == Query::Op::Like || f->op == Query::Op::NotLike || f->op == Query::Op::Ne) return true;
-        } else if (auto* sub = std::get_if<std::shared_ptr<Query::FilterGroup>>(&n.node)) {
-            if (has_or_or_like_filter(**sub)) return true;
-        }
-    }
-    return false;
-}
-
-static const Query::Filter* find_first_eq_filter(const Query::FilterGroup& g, std::string_view alias, std::string_view key = "") {
-    for (const auto& n : g.nodes) {
-        if (auto* f = std::get_if<Query::Filter>(&n.node)) { if (f->alias == alias && f->op == Query::Op::Eq && (key.empty() || f->key == key)) return f; }
-        else if (auto* sub = std::get_if<std::shared_ptr<Query::FilterGroup>>(&n.node)) { if (auto* res = find_first_eq_filter(**sub, alias, key)) return res; }
-    }
-    return nullptr;
-}
-
-static void serialize_filter_nodes(const Query::FilterGroup& group, lite3cpp::Buffer& buf, size_t arr_ofs, int depth = 0) {
-    if (depth > 32) return;
-    for (const auto& n : group.nodes) {
-        size_t item_ofs = buf.arr_append_obj(arr_ofs);
-        std::string prep = (n.prepended_op == Query::LogicalOp::Or) ? "or" : "and";
-        buf.set_str(item_ofs, "prepended_op", prep);
-        std::visit(overloaded{
-            [&](const Query::Filter& f) {
-                buf.set_str(item_ofs, "alias", f.alias);
-                buf.set_str(item_ofs, "key", f.key);
-                buf.set_i64(item_ofs, "op", static_cast<int64_t>(f.op));
-                buf.set_str(item_ofs, "value", f.value);
-            },
-            [&](const std::shared_ptr<Query::FilterGroup>& sub) {
-                buf.set_bool(item_ofs, "group", true);
-                if (sub) {
-                    size_t sub_arr_ofs = buf.set_arr(item_ofs, "filters");
-                    serialize_filter_nodes(*sub, buf, sub_arr_ofs, depth + 1);
-                }
-            }
-        }, n.node);
-    }
-}
-
-static void parse_filter_nodes(const lite3cpp::Buffer& buf, size_t filters_arr_ofs, Query::FilterGroup& group, int depth = 0) {
-    if (depth > 32) return;
-    if (filters_arr_ofs + sizeof(lite3cpp::PackedNodeLayout) > buf.size()) return;
-    lite3cpp::NodeView fn(reinterpret_cast<const lite3cpp::PackedNodeLayout*>(buf.data() + filters_arr_ofs));
-    for (uint32_t i = 0; i < fn.size(); ++i) {
-        if (buf.arr_get_type(filters_arr_ofs, i) != lite3cpp::Type::Object) continue;
-        size_t item_ofs = buf.arr_get_obj(filters_arr_ofs, i);
-        if (buf.get_type(item_ofs, "group") != lite3cpp::Type::Invalid) {
-            std::string grp_prep = (buf.get_type(item_ofs, "prepended_op") == lite3cpp::Type::String) 
-                                   ? std::string(buf.get_str(item_ofs, "prepended_op")) : "and";
-            size_t sub_filters_ofs = 0;
-            bool has_sub = (buf.get_type(item_ofs, "filters") == lite3cpp::Type::Array);
-            if (has_sub) sub_filters_ofs = buf.get_arr(item_ofs, "filters");
-            auto cb = [&buf, has_sub, sub_filters_ofs, depth](Query::FilterGroup& sub) {
-                if (has_sub) {
-                    parse_filter_nodes(buf, sub_filters_ofs, sub, depth + 1);
-                }
-            };
-            if (grp_prep == "or") {
-                group.or_where_group(cb);
-            } else {
-                group.where_group(cb);
-            }
-        } else if (buf.get_type(item_ofs, "alias") == lite3cpp::Type::String &&
-                   buf.get_type(item_ofs, "key") == lite3cpp::Type::String &&
-                   (buf.get_type(item_ofs, "op") == lite3cpp::Type::Int64 || buf.get_type(item_ofs, "op") == lite3cpp::Type::Float64) &&
-                   buf.get_type(item_ofs, "value") == lite3cpp::Type::String) {
-            std::string alias = std::string(buf.get_str(item_ofs, "alias"));
-            std::string key = std::string(buf.get_str(item_ofs, "key"));
-            int op_val = (buf.get_type(item_ofs, "op") == lite3cpp::Type::Int64) 
-                         ? static_cast<int>(buf.get_i64(item_ofs, "op")) 
-                         : static_cast<int>(buf.get_f64(item_ofs, "op"));
-            auto op = static_cast<Query::Op>(op_val);
-            std::string val = std::string(buf.get_str(item_ofs, "value"));
-            std::string prep = (buf.get_type(item_ofs, "prepended_op") == lite3cpp::Type::String) 
-                               ? std::string(buf.get_str(item_ofs, "prepended_op")) : "and";
-            if (prep == "or") {
-                group.or_where(alias, key, op, val);
-            } else {
-                group.where(alias, key, op, val);
-            }
-        }
-    }
-}
-
-static bool is_entity_type_match(std::string_view alias, std::string_view et, std::string_view actual_type, bool has_v) {
-    if (!et.empty()) {
-        if (alias == "DataObject") return (et == "data_object" || et == "generic");
-        if (alias == "Collection" || alias == "ParentCollection") return (et == "collection");
-        if (alias == "Resource" || alias == "ChildResource" || alias == "ParentResource") return (et == "resource" || et == "unixfilesystem" || et == "passthru" || et == "replication" || et == "compound" || et == "load_balanced" || et == "random" || et == "deferred" || et == "structfile" || et == "s3" || et == "mockarchive");
-        if (alias == "User") return (et == "user" || et == "group" || et == "rodsuser" || et == "rodsadmin" || et == "groupadmin" || et == "rodsgroup");
-        if (alias == "Group") return (et == "group" || et == "rodsgroup" || et == "user");
-        if (alias == "Zone") return (et == "zone" || et == "local" || et == "remote");
-        if (alias == "Replica") return (et == "replica");
-        if (alias == "Metadata") return (et == "metadata");
-        if (alias == "Access" || alias == "CollAccess") return (et == "access" || et == "access_type");
-        if (alias == "Rule") return (et == "rule");
-        if (alias == "Ticket") return (et == "ticket");
-        if (strcasecmp(std::string(alias).c_str(), std::string(et).c_str()) == 0) return true;
-        return false;
-    }
-    // Fallback when entity_type is empty
-    if (alias == "Zone") return (actual_type == "zone" || actual_type == "local" || actual_type == "remote");
-    if (alias == "User") return (actual_type == "user" || actual_type == "rodsuser" || actual_type == "rodsadmin" || actual_type == "groupadmin" || actual_type == "rodsgroup");
-    if (alias == "Group") return (actual_type == "rodsgroup" || actual_type == "group" || actual_type == "rodsuser" || actual_type == "rodsadmin" || actual_type == "groupadmin" || actual_type == "user");
-    if (alias == "Collection" || alias == "ParentCollection") return (!has_v && actual_type != "data_object" && actual_type != "generic" && actual_type != "replica" && actual_type != "resource" && actual_type != "unixfilesystem" && actual_type != "passthru" && actual_type != "replication" && actual_type != "compound" && actual_type != "load_balanced" && actual_type != "random" && actual_type != "deferred" && actual_type != "structfile" && actual_type != "s3" && actual_type != "mockarchive" && actual_type != "user" && actual_type != "rodsuser" && actual_type != "rodsadmin" && actual_type != "groupadmin" && actual_type != "rodsgroup" && actual_type != "zone" && actual_type != "local" && actual_type != "remote" && actual_type != "metadata" && actual_type != "access" && actual_type != "access_type" && actual_type != "rule" && actual_type != "ticket");
-    if (alias == "DataObject") return (actual_type == "data_object" || actual_type == "generic");
-    if (alias == "Replica") return (actual_type == "replica");
-    if (alias == "Resource" || alias == "ChildResource" || alias == "ParentResource") return (actual_type == "resource" || actual_type == "unixfilesystem" || actual_type == "passthru" || actual_type == "replication" || actual_type == "compound" || actual_type == "load_balanced" || actual_type == "random" || actual_type == "deferred" || actual_type == "structfile" || actual_type == "s3" || actual_type == "mockarchive");
-    if (alias == "Metadata") return (actual_type == "metadata");
-    if (alias == "Access" || alias == "CollAccess") return (actual_type == "access" || actual_type == "access_type");
-    if (alias == "Rule") return (actual_type == "rule");
-    if (alias == "Ticket") return (actual_type == "ticket");
-    return true;
-}
-
 std::vector<ResultRow> Query::execute() {
+  using namespace lite3cpp::literals;
   std::vector<ResultRow> results;
-  L3_LOG(0, "Query::execute() ENTER: starting_nodes=%zu, root_filters=%zu, steps=%zu", starting_nodes_.size(), root_filters_.nodes.size(), steps_.size());
   std::vector<uint64_t> frontier;
+
   if (!starting_nodes_.empty()) {
       frontier = starting_nodes_;
-      std::sort(frontier.begin(), frontier.end());
-      frontier.erase(std::unique(frontier.begin(), frontier.end()), frontier.end());
+      if (frontier.size() > 1) {
+          std::sort(frontier.begin(), frontier.end());
+          frontier.erase(std::unique(frontier.begin(), frontier.end()), frontier.end());
+      }
+      if (initial_match_ && (root_alias_.empty() || root_alias_ == "__root")) {
+          root_alias_ = initial_match_->alias;
+      }
+  } else if (!start_index_prefix_.empty()) {
+      if (initial_match_) {
+          root_alias_ = initial_match_->alias;
+      }
+      auto idx_entries = engine_->get_store()->get_prefix_entries_all_shards(
+          start_index_prefix_, "", engine_->get_settings().prefix_scan_limit);
+      frontier.reserve(idx_entries.size());
+      for (const auto& [k, v] : idx_entries) {
+          if (k.ends_with(":meta")) continue;
+          uint64_t parsed_id = 0;
+          if (parse_hex_id_sv(v, parsed_id)) {
+              frontier.push_back(parsed_id);
+          }
+      }
+      if (frontier.size() > 1) {
+          std::sort(frontier.begin(), frontier.end());
+          frontier.erase(std::unique(frontier.begin(), frontier.end()), frontier.end());
+      }
   } else {
       if (!initial_match_) return results;
       root_alias_ = initial_match_->alias;
-      bool has_complex = has_or_or_like_filter(root_filters_);
+      const bool has_complex = has_or_or_like_filter(root_filters_);
       bool had_eq_filter = false;
-
-      std::set<uint64_t> frontier_set;
 
       if (auto* f = find_first_eq_filter(root_filters_, root_alias_, "id")) {
           had_eq_filter = true;
-          frontier_set.insert(engine_->get_resolver().parse_uuid(f->value));
+          frontier.push_back(engine_->get_resolver().parse_uuid(f->value));
       }
 
-      if (frontier_set.empty()) {
-        std::function<void(const FilterGroup&)> find_index_filters = [&](const FilterGroup& fg) {
-            for (const auto &n : fg.nodes) {
-                if (auto* f = std::get_if<Filter>(&n.node)) {
-                    if (f->alias == root_alias_) {
-                        if (f->op == Op::Eq) {
-                            if (f->key == "n" || f->key == "path" || f->key == "id") {
-                                had_eq_filter = true;
-                            }
-                            std::string idx_prefix = "idx:" + f->alias + ":" + f->key + ":" + f->value;
-                            auto idx_entries = engine_->get_store()->get_prefix_entries_all_shards(idx_prefix, "", 100000);
-                            for (const auto& [k, v] : idx_entries) {
-                                if (!v.empty()) {
-                                    try { frontier_set.insert(std::stoull(v, nullptr, 16)); } catch(...) {}
-                                }
-                            }
-                        } else if (f->op == Op::Like) {
-                            size_t first_wc = f->value.find_first_of("%_");
-                            std::string prefix_literal = (first_wc == std::string::npos) ? f->value : f->value.substr(0, first_wc);
-                            if (!prefix_literal.empty()) {
-                                std::string idx_prefix = "idx:" + f->alias + ":" + f->key + ":" + prefix_literal;
-                                auto idx_entries = engine_->get_store()->get_prefix_entries_all_shards(idx_prefix, "", 100000);
-                                for (const auto& [k, v] : idx_entries) {
-                                    if (!v.empty()) {
-                                        try { frontier_set.insert(std::stoull(v, nullptr, 16)); } catch(...) {}
-                                    }
-                                }
-                            } else {
-                                // Substring / trigram search
-                                std::vector<std::string> trigrams;
-                                std::string segment;
-                                for (char c : f->value) {
-                                    if (c == '%' || c == '_') {
-                                        if (segment.size() >= 3) {
-                                            for (size_t ti = 0; ti + 3 <= segment.size(); ++ti) {
-                                                trigrams.push_back(segment.substr(ti, 3));
-                                            }
-                                        }
-                                        segment.clear();
-                                    } else {
-                                        segment += c;
-                                    }
-                                }
-                                if (segment.size() >= 3) {
-                                    for (size_t ti = 0; ti + 3 <= segment.size(); ++ti) {
-                                        trigrams.push_back(segment.substr(ti, 3));
-                                    }
-                                }
-                                if (!trigrams.empty()) {
-                                    std::set<uint64_t> tri_candidates;
-                                    bool first_tri = true;
-                                    for (const auto& tri : trigrams) {
-                                        std::string tri_prefix = "idx:" + f->alias + ":tri:" + tri + ":";
-                                        auto idx_entries = engine_->get_store()->get_prefix_entries_all_shards(tri_prefix, "", 100000);
-                                        std::set<uint64_t> cur_tri_set;
-                                        for (const auto& [k, v] : idx_entries) {
-                                            if (!v.empty()) {
-                                                try { cur_tri_set.insert(std::stoull(v, nullptr, 16)); } catch(...) {}
-                                            }
-                                        }
-                                        if (first_tri) {
-                                            tri_candidates = std::move(cur_tri_set);
-                                            first_tri = false;
-                                        } else {
-                                            std::set<uint64_t> inter;
-                                            std::set_intersection(tri_candidates.begin(), tri_candidates.end(),
-                                                                  cur_tri_set.begin(), cur_tri_set.end(),
-                                                                  std::inserter(inter, inter.begin()));
-                                            tri_candidates = std::move(inter);
-                                        }
-                                    }
-                                    frontier_set.insert(tri_candidates.begin(), tri_candidates.end());
-                                }
-                            }
-                        }
-                    }
-                } else if (auto* sub = std::get_if<std::shared_ptr<FilterGroup>>(&n.node)) {
-                    if (*sub && n.prepended_op == LogicalOp::And) {
-                        find_index_filters(**sub);
-                    }
-                }
-            }
-        };
-        find_index_filters(root_filters_);
+      if (frontier.empty()) {
+          std::function<void(const FilterGroup&)> find_index_filters = [&](const FilterGroup& fg) {
+              for (const auto &n : fg.nodes) {
+                  if (auto* f = std::get_if<Filter>(&n.node)) {
+                      if (f->alias == root_alias_) {
+                          if (f->op == Op::Eq) {
+                              if (f->key == "n" || f->key == "path" || f->key == "id") {
+                                  had_eq_filter = true;
+                              }
+                              std::string idx_prefix = "idx:" + f->alias + ":" + f->key + ":" + f->value;
+                              auto idx_entries = engine_->get_store()->get_prefix_entries_all_shards(
+                                  idx_prefix, "", engine_->get_settings().prefix_scan_limit);
+                              for (const auto& [k, v] : idx_entries) {
+                                  if (k.ends_with(":meta")) continue;
+                                  uint64_t parsed_id = 0;
+                                  if (parse_hex_id_sv(v, parsed_id)) {
+                                      frontier.push_back(parsed_id);
+                                  }
+                              }
+                          } else if (f->op == Op::Like) {
+                              size_t first_wc = f->value.find_first_of("%_");
+                              std::string prefix_literal = (first_wc == std::string::npos) ? f->value : f->value.substr(0, first_wc);
+                              if (!prefix_literal.empty()) {
+                                  std::string idx_prefix = "idx:" + f->alias + ":" + f->key + ":" + prefix_literal;
+                                  auto idx_entries = engine_->get_store()->get_prefix_entries_all_shards(
+                                      idx_prefix, "", engine_->get_settings().prefix_scan_limit);
+                                  for (const auto& [k, v] : idx_entries) {
+                                      if (k.ends_with(":meta")) continue;
+                                      uint64_t parsed_id = 0;
+                                      if (parse_hex_id_sv(v, parsed_id)) {
+                                          frontier.push_back(parsed_id);
+                                      }
+                                  }
+                              } else {
+                                  std::vector<std::string> trigrams;
+                                  std::string segment;
+                                  for (char c : f->value) {
+                                      if (c == '%' || c == '_') {
+                                          if (segment.size() >= 3) {
+                                              for (size_t ti = 0; ti + 3 <= segment.size(); ++ti) {
+                                                  trigrams.push_back(segment.substr(ti, 3));
+                                              }
+                                          }
+                                          segment.clear();
+                                      } else {
+                                          segment += c;
+                                      }
+                                  }
+                                  if (segment.size() >= 3) {
+                                      for (size_t ti = 0; ti + 3 <= segment.size(); ++ti) {
+                                          trigrams.push_back(segment.substr(ti, 3));
+                                      }
+                                  }
+                                  if (!trigrams.empty()) {
+                                      std::vector<uint64_t> tri_candidates;
+                                      bool first_tri = true;
+                                      for (const auto& tri : trigrams) {
+                                          std::string tri_prefix = "idx:" + f->alias + ":tri:" + tri + ":";
+                                          auto idx_entries = engine_->get_store()->get_prefix_entries_all_shards(
+                                              tri_prefix, "", engine_->get_settings().prefix_scan_limit);
+                                          std::vector<uint64_t> cur_tri;
+                                          cur_tri.reserve(idx_entries.size());
+                                          for (const auto& [k, v] : idx_entries) {
+                                              if (k.ends_with(":meta")) continue;
+                                              uint64_t parsed_id = 0;
+                                              if (parse_hex_id_sv(v, parsed_id)) {
+                                                  cur_tri.push_back(parsed_id);
+                                              }
+                                          }
+                                          std::sort(cur_tri.begin(), cur_tri.end());
+                                          cur_tri.erase(std::unique(cur_tri.begin(), cur_tri.end()), cur_tri.end());
+                                          if (first_tri) {
+                                              tri_candidates = std::move(cur_tri);
+                                              first_tri = false;
+                                          } else {
+                                              std::vector<uint64_t> inter;
+                                              inter.reserve(std::min(tri_candidates.size(), cur_tri.size()));
+                                              std::set_intersection(tri_candidates.begin(), tri_candidates.end(),
+                                                                    cur_tri.begin(), cur_tri.end(),
+                                                                    std::back_inserter(inter));
+                                              tri_candidates = std::move(inter);
+                                          }
+                                          if (tri_candidates.empty()) break;
+                                      }
+                                      frontier.insert(frontier.end(), tri_candidates.begin(), tri_candidates.end());
+                                  }
+                              }
+                          }
+                      }
+                  } else if (auto* sub = std::get_if<std::shared_ptr<FilterGroup>>(&n.node)) {
+                      if (*sub && n.prepended_op == LogicalOp::And) {
+                          find_index_filters(**sub);
+                      }
+                  }
+              }
+          };
+          find_index_filters(root_filters_);
       }
-      if (frontier_set.empty()) {
-        if (had_eq_filter && !has_complex) {
-            return results;
-        }
-        if (!root_alias_.empty()) {
-            std::string entity_name = (root_alias_ == "Group" ? "User" : root_alias_);
-            std::string idx_id_prefix = "idx:" + entity_name + ":id:";
-            auto idx_entries = engine_->get_store()->get_prefix_entries_all_shards(idx_id_prefix, "", 10000);
-            for (const auto& [k, v] : idx_entries) {
-                if (!v.empty()) {
-                    try { frontier_set.insert(std::stoull(v, nullptr, 16)); } catch(...) {}
-                }
-            }
-            if (frontier_set.empty()) {
-                std::string idx_n_prefix = "idx:" + entity_name + ":n:";
-                auto idx_entries_n = engine_->get_store()->get_prefix_entries_all_shards(idx_n_prefix, "", 10000);
-                for (const auto& [k, v] : idx_entries_n) {
-                    if (!v.empty()) {
-                        try { frontier_set.insert(std::stoull(v, nullptr, 16)); } catch(...) {}
-                    }
-                }
-            }
-        }
-        if (frontier_set.empty() && root_alias_.empty()) {
-            std::string store_prefix = "n:{"; 
-            auto keys = engine_->get_store()->get_prefix_keys_all_shards(store_prefix, "", engine_->get_settings().prefix_scan_limit);
-            L3_LOG(0, "Query::execute() store_prefix scan returned keys=%zu", keys.size());
-            for (const auto& k : keys) {
-                if (k.starts_with("n:{") && !k.ends_with(":meta")) {
-                    size_t end_pos = k.find('}', 3);
-                    if (end_pos != std::string::npos) {
-                        try { frontier_set.insert(std::stoull(k.substr(3, end_pos - 3), nullptr, 16)); } catch(...) {}
-                    }
-                }
-            }
-        }
+
+      if (frontier.empty()) {
+          if (had_eq_filter && !has_complex) {
+              return results;
+          }
+          if (!root_alias_.empty() && root_alias_ != "__root") {
+              std::string entity_name = (root_alias_ == "Group" ? "User" : root_alias_);
+              std::string idx_id_prefix = "idx:" + entity_name + ":id:";
+              auto idx_entries = engine_->get_store()->get_prefix_entries_all_shards(idx_id_prefix, "", 10000);
+              for (const auto& [k, v] : idx_entries) {
+                  if (k.ends_with(":meta")) continue;
+                  uint64_t parsed_id = 0;
+                  if (parse_hex_id_sv(v, parsed_id)) {
+                      frontier.push_back(parsed_id);
+                  }
+              }
+              if (frontier.empty()) {
+                  std::string idx_n_prefix = "idx:" + entity_name + ":n:";
+                  auto idx_entries_n = engine_->get_store()->get_prefix_entries_all_shards(idx_n_prefix, "", 10000);
+                  for (const auto& [k, v] : idx_entries_n) {
+                      if (k.ends_with(":meta")) continue;
+                      uint64_t parsed_id = 0;
+                      if (parse_hex_id_sv(v, parsed_id)) {
+                          frontier.push_back(parsed_id);
+                      }
+                  }
+              }
+          }
+          if (frontier.empty() &&
+              (root_alias_.empty() || root_alias_ == "__root" ||
+               engine_->get_settings().fallback_to_full_scan_on_index_miss)) {
+              auto keys = engine_->get_store()->get_prefix_keys_all_shards(
+                  "n:{", "", engine_->get_settings().prefix_scan_limit);
+              frontier.reserve(keys.size());
+              for (const auto& k : keys) {
+                  if (k.starts_with("n:{") && !k.ends_with(":meta")) {
+                      size_t end_pos = k.find('}', 3);
+                      if (end_pos != std::string::npos && end_pos > 3) {
+                          uint64_t parsed_id = 0;
+                          if (parse_hex_id_sv(std::string_view(k.data() + 3, end_pos - 3), parsed_id)) {
+                              frontier.push_back(parsed_id);
+                          }
+                      }
+                  }
+              }
+          }
       }
-      frontier.assign(frontier_set.begin(), frontier_set.end());
+
+      if (frontier.size() > 1) {
+          std::sort(frontier.begin(), frontier.end());
+          frontier.erase(std::unique(frontier.begin(), frontier.end()), frontier.end());
+      }
   }
 
   if (initial_match_ && root_alias_.empty()) {
       root_alias_ = initial_match_->alias;
   }
 
-  L3_LOG(0, "Query::execute() root_alias=%s, frontier.size=%zu", root_alias_.c_str(), frontier.size());
   if (frontier.empty()) return results;
+
   bool has_agg = false;
   for (const auto& p : projections_) {
       if (p.agg != AggOp::None) {
@@ -676,227 +953,333 @@ std::vector<ResultRow> Query::execute() {
           break;
       }
   }
+
+  const bool needs_fields = (!sorts_.empty() || !groups_.empty() || has_agg);
+  const bool step0_populate_fields = needs_fields || (projections_.empty() && !flat_rows_);
+  const bool should_populate_fields = needs_fields || ((!flat_rows_) && (populate_fields_ || projections_.empty()));
+
   std::vector<std::string> invariant_proj_names(projections_.size());
+  std::vector<lite3cpp::HashedKey> proj_hks(projections_.size());
   for (size_t i = 0; i < projections_.size(); ++i) {
       invariant_proj_names[i] = projections_[i].alias + "." + projections_[i].property;
+      proj_hks[i] = lite3cpp::HashedKey(projections_[i].property);
   }
-  bool needs_fields = (!sorts_.empty() || !groups_.empty() || has_agg);
+
+  std::vector<std::string> idx_names;
+  if (step0_populate_fields || (!steps_.empty() && should_populate_fields)) {
+      idx_names.resize(projections_.size());
+      for (size_t i = 0; i < projections_.size(); ++i) {
+          idx_names[i] = "idx_" + std::to_string(i);
+      }
+  }
+
+  std::vector<std::string> sort_field_keys(sorts_.size());
+  std::vector<lite3cpp::HashedKey> sort_hks(sorts_.size());
+  for (size_t i = 0; i < sorts_.size(); ++i) {
+      sort_field_keys[i] = sorts_[i].alias + "." + sorts_[i].property;
+      sort_hks[i] = lite3cpp::HashedKey(sorts_[i].property);
+  }
+
+  std::vector<std::string> group_field_keys(groups_.size());
+  std::vector<lite3cpp::HashedKey> group_hks(groups_.size());
+  for (size_t i = 0; i < groups_.size(); ++i) {
+      group_field_keys[i] = groups_[i].alias + "." + groups_[i].property;
+      group_hks[i] = lite3cpp::HashedKey(groups_[i].property);
+  }
+
+  const bool is_privileged_principal = (principal_id_ == INTERNAL_UID || principal_id_ == ADMIN_UID || principal_id_ == 0);
+  auto has_node_read_perm = [&](uint64_t nid) -> bool {
+      if (is_privileged_principal) return true;
+      std::string_view key = KeyBuilder::node_key(nid);
+      auto perm = engine_->get_store()->credentials().check_permission(principal_id_, key);
+      return (perm & l3kv::Permission::READ) || (perm & l3kv::Permission::ADMIN);
+  };
 
   auto nodes = engine_->fetch_nodes(frontier, principal_id_);
   if (nodes.empty()) return results;
 
+  const size_t pool_threads = std::max<size_t>(1, engine_->get_thread_pool().size());
+
   if (steps_.empty()) {
-      std::mutex results_mu;
-      results.reserve(nodes.size());
+      const size_t num_chunks = (nodes.size() < 64 || pool_threads <= 1)
+                                ? 1
+                                : std::min(pool_threads, nodes.size() / 32);
+      std::vector<std::vector<ResultRow>> chunk_results(num_chunks);
 
-      engine_->get_thread_pool().parallel_for(0, nodes.size(), [&](size_t first, size_t last) {
-          std::vector<ResultRow> local_results;
-          std::unordered_map<std::string, std::shared_ptr<Node>> available;
-          for (size_t idx = first; idx < last; ++idx) {
-              auto& node = nodes[idx];
-              if (!node || !node->is_loaded()) continue;
-              if (!root_alias_.empty()) {
-                  std::string et;
-                  try { et = node->get_attribute_as_string("entity_type"); } catch (...) {}
-                  std::string actual_type;
-                  try { actual_type = node->get_attribute_as_string("t"); } catch (...) {}
-                  bool has_v = node->has_attribute("v");
-                  if (!is_entity_type_match(root_alias_, et, actual_type, has_v)) {
-                      continue;
-                  }
-              }
-              std::string key = std::string(KeyBuilder::node_key(node->get_id()));
-              auto perm = (principal_id_ == INTERNAL_UID || principal_id_ == 0) ? l3kv::Permission::ADMIN : engine_->get_store()->credentials().check_permission(principal_id_, key);
-              if (!(perm & l3kv::Permission::READ) && !(perm & l3kv::Permission::ADMIN)) continue;
-              available[root_alias_] = node;
-              bool eval_res = evaluate_group(root_filters_, available, root_alias_, engine_);
-              if (!eval_res) continue;
+      auto run_chunk = [&](size_t c_first, size_t c_last) {
+          for (size_t c = c_first; c < c_last; ++c) {
+              const size_t start = (nodes.size() * c) / num_chunks;
+              const size_t end = (nodes.size() * (c + 1)) / num_chunks;
+              auto& local_results = chunk_results[c];
+              local_results.reserve(end - start);
 
-              ResultRow row;
-              row.nodes.push_back(node);
-              row.projected_values.resize(projections_.size());
-
-              for (size_t i = 0; i < projections_.size(); ++i) {
-                  if (projections_[i].alias == root_alias_ || projections_[i].alias.empty() || root_alias_.empty()) {
-                      if (node->has_attribute(projections_[i].property)) {
-                          try {
-                              std::string val = node->get_attribute_as_string(projections_[i].property);
-                              row.projected_values[i] = val;
-                              if (needs_fields) {
-                                  row.fields[invariant_proj_names[i]] = val;
-                                  row.fields["idx_" + std::to_string(i)] = val;
-                              }
-                          } catch (...) {
-                          }
-                      }
-                  }
-              }
-              if (needs_fields) {
-                  for (const auto& s : sorts_) {
-                      if (s.alias == root_alias_ || s.alias.empty() || root_alias_.empty()) {
-                          std::string k = s.alias + "." + s.property;
-                          if (row.fields.find(k) == row.fields.end() && node->has_attribute(s.property)) {
-                              try { row.fields[k] = node->get_attribute_as_string(s.property); } catch (...) {}
-                          }
-                      }
-                  }
-                  for (const auto& g : groups_) {
-                      if (g.alias == root_alias_ || g.alias.empty() || root_alias_.empty()) {
-                          std::string k = g.alias + "." + g.property;
-                          if (row.fields.find(k) == row.fields.end() && node->has_attribute(g.property)) {
-                              try { row.fields[k] = node->get_attribute_as_string(g.property); } catch (...) {}
-                          }
-                      }
-                  }
-              }
-              local_results.push_back(std::move(row));
-          }
-          if (!local_results.empty()) {
-              std::lock_guard<std::mutex> lock(results_mu);
-              if (results.empty() && !local_results.empty()) {
-                  local_results[0].projected_names = invariant_proj_names;
-              }
-              results.insert(results.end(), std::make_move_iterator(local_results.begin()), std::make_move_iterator(local_results.end()));
-          }
-      });
-  } else {
-      struct Path { std::unordered_map<std::string, std::shared_ptr<Node>> alias_to_node; std::string last_alias; };
-      std::vector<Path> paths;
-      {
-          std::mutex paths_mu;
-          paths.reserve(nodes.size());
-
-          engine_->get_thread_pool().parallel_for(0, nodes.size(), [&](size_t first, size_t last) {
-              std::vector<Path> local_paths;
-              std::unordered_map<std::string, std::shared_ptr<Node>> available;
-              for (size_t idx = first; idx < last; ++idx) {
+              for (size_t idx = start; idx < end; ++idx) {
                   auto& node = nodes[idx];
                   if (!node || !node->is_loaded()) continue;
-                  if (!root_alias_.empty()) {
-                      std::string et;
-                      try { et = node->get_attribute_as_string("entity_type"); } catch (...) {}
-                      std::string actual_type;
-                      try { actual_type = node->get_attribute_as_string("t"); } catch (...) {}
-                      bool has_v = node->has_attribute("v");
-                      if (!is_entity_type_match(root_alias_, et, actual_type, has_v)) {
-                          continue;
+                  if (!check_node_entity_type(node.get(), root_alias_)) continue;
+                  if (!has_node_read_perm(node->get_id())) continue;
+
+                  Node* raw_node = node.get();
+                  TriBool tb = evaluate_group_tribool_fn(
+                      root_filters_,
+                      [&](std::string_view alias) -> Node* {
+                          return (alias == root_alias_) ? raw_node : nullptr;
+                      },
+                      engine_);
+                  if (tb == TriBool::False) continue;
+
+                  ResultRow row;
+                  if (!flat_rows_) {
+                      row.nodes.push_back(node);
+                  }
+                  row.projected_values.resize(projections_.size());
+
+                  for (size_t i = 0; i < projections_.size(); ++i) {
+                      if (projections_[i].alias == root_alias_ || projections_[i].alias.empty() || root_alias_.empty()) {
+                          std::string& dst_val = row.projected_values[i];
+                          if (format_node_attr_into(raw_node, proj_hks[i], dst_val) && step0_populate_fields) {
+                              row.fields[invariant_proj_names[i]] = dst_val;
+                              row.fields[idx_names[i]] = dst_val;
+                          }
                       }
                   }
-                  std::string key = std::string(KeyBuilder::node_key(node->get_id()));
-                  auto perm = (principal_id_ == INTERNAL_UID || principal_id_ == 0) ? l3kv::Permission::ADMIN : engine_->get_store()->credentials().check_permission(principal_id_, key);
-                  if (!(perm & l3kv::Permission::READ) && !(perm & l3kv::Permission::ADMIN)) continue;
-                  available[root_alias_] = node;
-                  bool eval_res = evaluate_group(root_filters_, available, root_alias_, engine_);
-                  if (eval_res) {
-                      Path p;
-                      p.alias_to_node[root_alias_] = node;
-                      p.last_alias = root_alias_;
-                      local_paths.push_back(std::move(p));
+                  if (needs_fields) {
+                      for (size_t si = 0; si < sorts_.size(); ++si) {
+                          const auto& s = sorts_[si];
+                          if (s.alias == root_alias_ || s.alias.empty() || root_alias_.empty()) {
+                              if (!row.fields.contains(sort_field_keys[si])) {
+                                  std::string val;
+                                  if (format_node_attr_into(raw_node, sort_hks[si], val)) {
+                                      row.fields[sort_field_keys[si]] = std::move(val);
+                                  }
+                              }
+                          }
+                      }
+                      for (size_t gi = 0; gi < groups_.size(); ++gi) {
+                          const auto& g = groups_[gi];
+                          if (g.alias == root_alias_ || g.alias.empty() || root_alias_.empty()) {
+                              if (!row.fields.contains(group_field_keys[gi])) {
+                                  std::string val;
+                                  if (format_node_attr_into(raw_node, group_hks[gi], val)) {
+                                      row.fields[group_field_keys[gi]] = std::move(val);
+                                  }
+                              }
+                          }
+                      }
                   }
+                  local_results.push_back(std::move(row));
               }
-              if (!local_paths.empty()) {
-                  std::lock_guard<std::mutex> lock(paths_mu);
-                  paths.insert(paths.end(), std::make_move_iterator(local_paths.begin()), std::make_move_iterator(local_paths.end()));
-              }
-          });
+          }
+      };
+
+      if (num_chunks == 1) {
+          run_chunk(0, 1);
+      } else {
+          // Dispatch chunk indices across thread pool
+          std::vector<std::future<void>> futs;
+          futs.reserve(num_chunks - 1);
+          for (size_t c = 0; c + 1 < num_chunks; ++c) {
+              futs.push_back(engine_->get_thread_pool().enqueue([&, c]() { run_chunk(c, c + 1); }));
+          }
+          run_chunk(num_chunks - 1, num_chunks);
+          for (auto& f : futs) f.get();
       }
 
-      L3_LOG(0, "Query::execute() initial paths count=%zu", paths.size());
+      size_t total_rows = 0;
+      for (const auto& cr : chunk_results) total_rows += cr.size();
+      results.reserve(total_rows);
+      for (auto& cr : chunk_results) {
+          for (auto& r : cr) {
+              results.push_back(std::move(r));
+          }
+      }
+  } else {
+      AliasTable aliases;
+      const size_t root_slot = aliases.intern(root_alias_);
+      struct ResolvedStep {
+          bool is_out = true;
+          std::string_view label;
+          double min_weight = 0.0;
+          std::string_view target_alias;
+          size_t source_slot = SIZE_MAX; // SIZE_MAX => path.last_slot
+          size_t target_slot = 0;
+      };
+      std::vector<ResolvedStep> resolved_steps;
+      resolved_steps.reserve(steps_.size());
+      for (const auto& st : steps_) {
+          std::visit(overloaded{
+              [&](const OutStep& s) {
+                  size_t src_slot = s.source_alias.empty() ? SIZE_MAX : aliases.intern(s.source_alias);
+                  size_t tgt_slot = aliases.intern(s.target_alias);
+                  resolved_steps.push_back(ResolvedStep{true, s.label, s.min_weight, s.target_alias, src_slot, tgt_slot});
+              },
+              [&](const InStep& s) {
+                  size_t src_slot = s.source_alias.empty() ? SIZE_MAX : aliases.intern(s.source_alias);
+                  size_t tgt_slot = aliases.intern(s.target_alias);
+                  resolved_steps.push_back(ResolvedStep{false, s.label, 0.0, s.target_alias, src_slot, tgt_slot});
+              }
+          }, st);
+      }
+
+      std::vector<size_t> proj_slots(projections_.size());
+      for (size_t i = 0; i < projections_.size(); ++i) {
+          proj_slots[i] = aliases.find(projections_[i].alias);
+      }
+      std::vector<size_t> sort_slots(sorts_.size());
+      for (size_t i = 0; i < sorts_.size(); ++i) {
+          sort_slots[i] = aliases.find(sorts_[i].alias);
+      }
+      std::vector<size_t> group_slots(groups_.size());
+      for (size_t i = 0; i < groups_.size(); ++i) {
+          group_slots[i] = aliases.find(groups_[i].alias);
+      }
+
+      std::vector<TraversalPath> paths;
+      {
+          const size_t num_chunks = (nodes.size() < 64 || pool_threads <= 1)
+                                    ? 1
+                                    : std::min(pool_threads, nodes.size() / 32);
+          std::vector<std::vector<TraversalPath>> chunk_paths(num_chunks);
+          auto seed_chunk = [&](size_t c_first, size_t c_last) {
+              for (size_t c = c_first; c < c_last; ++c) {
+                  const size_t start = (nodes.size() * c) / num_chunks;
+                  const size_t end = (nodes.size() * (c + 1)) / num_chunks;
+                  auto& local_paths = chunk_paths[c];
+                  for (size_t idx = start; idx < end; ++idx) {
+                      auto& node = nodes[idx];
+                      if (!node || !node->is_loaded()) continue;
+                      if (!check_node_entity_type(node.get(), root_alias_)) continue;
+                      if (!has_node_read_perm(node->get_id())) continue;
+
+                      Node* raw_node = node.get();
+                      TriBool tb = evaluate_group_tribool_fn(
+                          root_filters_,
+                          [&](std::string_view alias) -> Node* {
+                              return (alias == root_alias_) ? raw_node : nullptr;
+                          },
+                          engine_);
+                      if (tb != TriBool::False) {
+                          TraversalPath p;
+                          p.set(root_slot, node);
+                          p.last_slot = root_slot;
+                          local_paths.push_back(std::move(p));
+                      }
+                  }
+              }
+          };
+
+          if (num_chunks == 1) {
+              seed_chunk(0, 1);
+          } else {
+              std::vector<std::future<void>> futs;
+              futs.reserve(num_chunks - 1);
+              for (size_t c = 0; c + 1 < num_chunks; ++c) {
+                  futs.push_back(engine_->get_thread_pool().enqueue([&, c]() { seed_chunk(c, c + 1); }));
+              }
+              seed_chunk(num_chunks - 1, num_chunks);
+              for (auto& f : futs) f.get();
+          }
+
+          size_t total_paths = 0;
+          for (const auto& cp : chunk_paths) total_paths += cp.size();
+          paths.reserve(total_paths);
+          for (auto& cp : chunk_paths) {
+              for (auto& p : cp) paths.push_back(std::move(p));
+          }
+      }
+
       if (paths.empty()) return results;
 
-      std::unordered_map<uint16_t, std::vector<std::pair<uint64_t, std::pair<std::string, std::vector<Step>>>>> suspended_branches;
+      using SuspendedItem = std::pair<uint64_t, std::pair<std::string, std::vector<Step>>>;
+      std::unordered_map<uint16_t, std::vector<SuspendedItem>> suspended_branches;
 
-      for (size_t i = 0; i < steps_.size(); ++i) {
-        const auto& step = steps_[i];
-        std::vector<Path> next_paths;
-        std::mutex result_mu;
-        engine_->get_thread_pool().parallel_for(0, paths.size(), [&](size_t first, size_t last) {
-            std::vector<Path> local_next_paths;
-            std::unordered_map<uint16_t, std::vector<std::pair<uint64_t, std::pair<std::string, std::vector<Step>>>>> local_suspended;
-            for (size_t p_idx = first; p_idx < last; ++p_idx) {
-                const auto &path = paths[p_idx];
-                std::visit(overloaded{
-                    [&](const OutStep& s) {
-                        std::string src = s.source_alias.empty() ? path.last_alias : s.source_alias;
-                        auto it_src = path.alias_to_node.find(src);
-                        if (it_src == path.alias_to_node.end()) {
-                            if(0) std::fprintf(stderr, "[Query] Step %zu: Source alias [%s] not found in path!\n", i, src.c_str());
-                            return;
-                        }
-                        auto node = it_src->second;
-                        auto neighbors = node->get_neighbors(s.label, s.min_weight, principal_id_);
-                        std::unordered_set<uint64_t> unique_neighbors(neighbors.begin(), neighbors.end());
-                        for (const auto& neighbor_id : unique_neighbors) {
-                            try {
-                                uint16_t cluster_id = FederationID::get_cluster(neighbor_id);
-                                if (!engine_->get_resolver().is_local_cluster(cluster_id)) {
-                                    std::vector<Step> remaining(steps_.begin() + i + 1, steps_.end());
-                                    local_suspended[cluster_id].push_back({neighbor_id, {s.target_alias, remaining}});
-                                    continue;
-                                }
-                                auto neighbor_node = engine_->get_node(neighbor_id);
-                                if (!neighbor_node) continue;
-                                std::string et;
-                                try { et = neighbor_node->get_attribute_as_string("entity_type"); } catch (...) {}
-                                std::string actual_type;
-                                try { actual_type = neighbor_node->get_attribute_as_string("t"); } catch (...) {}
-                                bool has_v = neighbor_node->has_attribute("v");
-                                if (!is_entity_type_match(s.target_alias, et, actual_type, has_v)) continue;
-                                Path new_path = path; new_path.alias_to_node[s.target_alias] = neighbor_node; new_path.last_alias = s.target_alias;
-                                if (evaluate_group(root_filters_, new_path.alias_to_node, s.target_alias, engine_)) {
-                                    local_next_paths.push_back(std::move(new_path));
-                                } else {
-                                    if(0) std::fprintf(stderr, "  [Query] Neighbor %016llx filtered out\n", (unsigned long long)neighbor_id);
-                                }
-                            } catch (...) {}
-                        }
-                    },
-                    [&](const InStep& s) {
-                        std::string src = s.source_alias.empty() ? path.last_alias : s.source_alias;
-                        auto it_src = path.alias_to_node.find(src);
-                        if (it_src == path.alias_to_node.end()) {
-                            if(0) std::fprintf(stderr, "[Query] Step %zu: Source alias [%s] not found in path!\n", i, src.c_str());
-                            return;
-                        }
-                        auto node = it_src->second;
-                        auto neighbors = node->get_in_neighbors(s.label, principal_id_);
-                        std::unordered_set<uint64_t> unique_neighbors(neighbors.begin(), neighbors.end());
-                        for (const auto& neighbor_id : unique_neighbors) {
-                            try {
-                                uint16_t cluster_id = FederationID::get_cluster(neighbor_id);
-                                if (!engine_->get_resolver().is_local_cluster(cluster_id)) {
-                                    std::vector<Step> remaining(steps_.begin() + i + 1, steps_.end());
-                                    local_suspended[cluster_id].push_back({neighbor_id, {s.target_alias, remaining}});
-                                    continue;
-                                }
-                                auto neighbor_node = engine_->get_node(neighbor_id);
-                                if (!neighbor_node) continue;
-                                std::string et;
-                                try { et = neighbor_node->get_attribute_as_string("entity_type"); } catch (...) {}
-                                std::string actual_type;
-                                try { actual_type = neighbor_node->get_attribute_as_string("t"); } catch (...) {}
-                                bool has_v = neighbor_node->has_attribute("v");
-                                if (!is_entity_type_match(s.target_alias, et, actual_type, has_v)) continue;
-                                Path new_path = path; new_path.alias_to_node[s.target_alias] = neighbor_node; new_path.last_alias = s.target_alias;
-                                if (evaluate_group(root_filters_, new_path.alias_to_node, s.target_alias, engine_)) {
-                                    local_next_paths.push_back(std::move(new_path));
-                                } else {
-                                    if(0) std::fprintf(stderr, "  [Query] Neighbor %016llx filtered out\n", (unsigned long long)neighbor_id);
-                                }
-                            } catch (...) {}
-                        }
-                    }
-                }, step);
-            }
-            std::lock_guard<std::mutex> lock(result_mu);
-            next_paths.insert(next_paths.end(), std::make_move_iterator(local_next_paths.begin()), std::make_move_iterator(local_next_paths.end()));
-            for (auto& [cluster_id, branches] : local_suspended) {
-                auto& target = suspended_branches[cluster_id];
-                target.insert(target.end(), std::make_move_iterator(branches.begin()), std::make_move_iterator(branches.end()));
-            }
-        });
-        paths = std::move(next_paths);
-        if (paths.empty() && suspended_branches.empty()) break;
+      for (size_t i = 0; i < resolved_steps.size(); ++i) {
+          const auto& rstep = resolved_steps[i];
+          const size_t num_chunks = (paths.size() < 64 || pool_threads <= 1)
+                                    ? 1
+                                    : std::min(pool_threads, paths.size() / 32);
+          std::vector<std::vector<TraversalPath>> chunk_next(num_chunks);
+          std::vector<std::unordered_map<uint16_t, std::vector<SuspendedItem>>> chunk_susp(num_chunks);
+
+          auto step_chunk = [&](size_t c_first, size_t c_last) {
+              for (size_t c = c_first; c < c_last; ++c) {
+                  const size_t start = (paths.size() * c) / num_chunks;
+                  const size_t end = (paths.size() * (c + 1)) / num_chunks;
+                  auto& local_next = chunk_next[c];
+                  auto& local_suspended = chunk_susp[c];
+
+                  for (size_t p_idx = start; p_idx < end; ++p_idx) {
+                      const auto& path = paths[p_idx];
+                      const size_t src_slot = (rstep.source_slot == SIZE_MAX) ? path.last_slot : rstep.source_slot;
+                      const auto& src_node = path.get(src_slot);
+                      if (!src_node) continue;
+
+                      std::vector<uint64_t> neighbors = rstep.is_out
+                          ? src_node->get_neighbors(rstep.label, rstep.min_weight, principal_id_)
+                          : src_node->get_in_neighbors(rstep.label, principal_id_);
+                      if (neighbors.size() > 1) {
+                          std::sort(neighbors.begin(), neighbors.end());
+                          neighbors.erase(std::unique(neighbors.begin(), neighbors.end()), neighbors.end());
+                      }
+
+                      for (uint64_t neighbor_id : neighbors) {
+                          uint16_t cluster_id = FederationID::get_cluster(neighbor_id);
+                          if (!engine_->get_resolver().is_local_cluster(cluster_id)) {
+                              std::vector<Step> remaining(steps_.begin() + static_cast<std::ptrdiff_t>(i + 1), steps_.end());
+                              local_suspended[cluster_id].push_back({neighbor_id, {std::string(rstep.target_alias), std::move(remaining)}});
+                              continue;
+                          }
+                          auto neighbor_node = engine_->get_node(neighbor_id);
+                          if (!neighbor_node) continue;
+                          if (!check_node_entity_type(neighbor_node.get(), rstep.target_alias)) continue;
+
+                          TraversalPath new_path = path;
+                          new_path.set(rstep.target_slot, neighbor_node);
+                          new_path.last_slot = rstep.target_slot;
+
+                          TriBool tb = evaluate_group_tribool_fn(
+                              root_filters_,
+                              [&](std::string_view alias) -> Node* {
+                                  size_t s_idx = aliases.find(alias);
+                                  if (s_idx == SIZE_MAX) return nullptr;
+                                  return new_path.get(s_idx).get();
+                              },
+                              engine_);
+                          if (tb != TriBool::False) {
+                              local_next.push_back(std::move(new_path));
+                          }
+                      }
+                  }
+              }
+          };
+
+          if (num_chunks == 1) {
+              step_chunk(0, 1);
+          } else {
+              std::vector<std::future<void>> futs;
+              futs.reserve(num_chunks - 1);
+              for (size_t c = 0; c + 1 < num_chunks; ++c) {
+                  futs.push_back(engine_->get_thread_pool().enqueue([&, c]() { step_chunk(c, c + 1); }));
+              }
+              step_chunk(num_chunks - 1, num_chunks);
+              for (auto& f : futs) f.get();
+          }
+
+          size_t total_next = 0;
+          for (const auto& cn : chunk_next) total_next += cn.size();
+          std::vector<TraversalPath> next_paths;
+          next_paths.reserve(total_next);
+          for (auto& cn : chunk_next) {
+              for (auto& p : cn) next_paths.push_back(std::move(p));
+          }
+          for (auto& cs : chunk_susp) {
+              for (auto& [cid, branches] : cs) {
+                  auto& target = suspended_branches[cid];
+                  target.insert(target.end(), std::make_move_iterator(branches.begin()), std::make_move_iterator(branches.end()));
+              }
+          }
+          paths = std::move(next_paths);
+          if (paths.empty() && suspended_branches.empty()) break;
       }
 
       std::vector<std::future<std::vector<ResultRow>>> remote_futures;
@@ -905,95 +1288,128 @@ std::vector<ResultRow> Query::execute() {
               lite3cpp::Buffer buf;
               std::vector<uint64_t> nodes;
           };
-          std::unordered_map<std::string, QueryGroup> groups;
+          std::unordered_map<std::string, QueryGroup> qgroups;
           for (auto& b : branches) {
               lite3cpp::Buffer sub_buf;
               sub_buf.init_object();
-              sub_buf.set_str(0, "root_alias", b.second.first);
-              sub_buf.set_i64(0, "principal_id", static_cast<int64_t>(principal_id_));
-              size_t steps_ofs = sub_buf.set_arr(0, "steps");
+              sub_buf.set_str(0, "root_alias"_hk, b.second.first);
+              sub_buf.set_i64(0, "principal_id"_hk, static_cast<int64_t>(principal_id_));
+              size_t steps_ofs = sub_buf.set_arr(0, "steps"_hk);
               for (const auto& step : b.second.second) {
                   std::visit(overloaded{
                       [&](const OutStep& s) {
                           size_t s_ofs = sub_buf.arr_append_obj(steps_ofs);
-                          sub_buf.set_str(s_ofs, "type", "out");
-                          sub_buf.set_str(s_ofs, "label", s.label);
-                          sub_buf.set_f64(s_ofs, "min_weight", s.min_weight);
-                          sub_buf.set_str(s_ofs, "target_alias", s.target_alias);
+                          sub_buf.set_str(s_ofs, "type"_hk, "out");
+                          sub_buf.set_str(s_ofs, "label"_hk, s.label);
+                          sub_buf.set_f64(s_ofs, "min_weight"_hk, s.min_weight);
+                          sub_buf.set_str(s_ofs, "target_alias"_hk, s.target_alias);
                           if (!s.source_alias.empty()) {
-                              sub_buf.set_str(s_ofs, "source_alias", s.source_alias);
+                              sub_buf.set_str(s_ofs, "source_alias"_hk, s.source_alias);
                           }
                       },
                       [&](const InStep& s) {
                           size_t s_ofs = sub_buf.arr_append_obj(steps_ofs);
-                          sub_buf.set_str(s_ofs, "type", "in");
-                          sub_buf.set_str(s_ofs, "label", s.label);
-                          sub_buf.set_str(s_ofs, "target_alias", s.target_alias);
+                          sub_buf.set_str(s_ofs, "type"_hk, "in");
+                          sub_buf.set_str(s_ofs, "label"_hk, s.label);
+                          sub_buf.set_str(s_ofs, "target_alias"_hk, s.target_alias);
                           if (!s.source_alias.empty()) {
-                              sub_buf.set_str(s_ofs, "source_alias", s.source_alias);
+                              sub_buf.set_str(s_ofs, "source_alias"_hk, s.source_alias);
                           }
                       }
                   }, step);
               }
-              size_t projs_ofs = sub_buf.set_arr(0, "projections");
+              size_t projs_ofs = sub_buf.set_arr(0, "projections"_hk);
               for (const auto& p : projections_) {
                   size_t p_ofs = sub_buf.arr_append_obj(projs_ofs);
-                  sub_buf.set_str(p_ofs, "alias", p.alias);
-                  sub_buf.set_str(p_ofs, "property", p.property);
-                  sub_buf.set_i64(p_ofs, "agg", static_cast<int64_t>(p.agg));
-                  sub_buf.set_bool(p_ofs, "distinct", p.distinct);
+                  sub_buf.set_str(p_ofs, "alias"_hk, p.alias);
+                  sub_buf.set_str(p_ofs, "property"_hk, p.property);
+                  sub_buf.set_i64(p_ofs, "agg"_hk, static_cast<int64_t>(p.agg));
+                  sub_buf.set_bool(p_ofs, "distinct"_hk, p.distinct);
               }
               if (!root_filters_.nodes.empty()) {
-                  size_t filters_ofs = sub_buf.set_arr(0, "filters");
+                  size_t filters_ofs = sub_buf.set_arr(0, "filters"_hk);
                   serialize_filter_nodes(root_filters_, sub_buf, filters_ofs);
               }
               std::string query_bytes(reinterpret_cast<const char*>(sub_buf.data()), sub_buf.size());
-              auto it = groups.find(query_bytes);
-              if (it == groups.end()) {
-                  groups.emplace(std::move(query_bytes), QueryGroup{std::move(sub_buf), {b.first}});
+              auto it = qgroups.find(query_bytes);
+              if (it == qgroups.end()) {
+                  qgroups.emplace(std::move(query_bytes), QueryGroup{std::move(sub_buf), {b.first}});
               } else {
                   it->second.nodes.push_back(b.first);
               }
           }
-          for (auto& [_, qg] : groups) {
+          for (auto& [_, qg] : qgroups) {
               remote_futures.push_back(engine_->get_remote_client().resume_query_async(cluster_id, qg.nodes, qg.buf, principal_id_));
           }
       }
 
-      for (const auto &path : paths) {
-        TriBool tb = evaluate_group_tribool(root_filters_, path.alias_to_node, "", engine_);
-        if (is_federated_branch_ ? (tb == TriBool::False) : (tb != TriBool::True)) {
-            continue;
-        }
-        ResultRow row;
-        row.projected_values.resize(projections_.size());
-        row.projected_names.resize(projections_.size());
-        for (const auto& [alias, node] : path.alias_to_node) {
-            row.nodes.push_back(node);
-            for (size_t i = 0; i < projections_.size(); ++i) {
-                if (projections_[i].alias == alias) {
-                    row.projected_names[i] = alias + "." + projections_[i].property;
-                    if (node->has_attribute(projections_[i].property)) {
-                        try {
-                            std::string val = node->get_attribute_as_string(projections_[i].property);
-                            row.fields[alias + "." + projections_[i].property] = val;
-                            row.fields["idx_" + std::to_string(i)] = val;
-                            row.projected_values[i] = val;
-                        } catch (...) {
-                        }
-                    }
-                }
-            }
-            for (const auto& s : sorts_) if (s.alias == alias) { std::string k = s.alias + "." + s.property; if (row.fields.find(k) == row.fields.end()) { if (node->has_attribute(s.property)) row.fields[k] = node->get_attribute_as_string(s.property); } }
-            for (const auto& g : groups_) if (g.alias == alias) { std::string k = g.alias + "." + g.property; if (row.fields.find(k) == row.fields.end()) { if (node->has_attribute(g.property)) row.fields[k] = node->get_attribute_as_string(g.property); } }
-        }
-        results.push_back(std::move(row));
+      results.reserve(paths.size());
+      for (const auto& path : paths) {
+          TriBool tb = evaluate_group_tribool_fn(
+              root_filters_,
+              [&](std::string_view alias) -> Node* {
+                  size_t s_idx = aliases.find(alias);
+                  if (s_idx == SIZE_MAX) return nullptr;
+                  return path.get(s_idx).get();
+              },
+              engine_);
+          if (is_federated_branch_ ? (tb == TriBool::False) : (tb != TriBool::True)) {
+              continue;
+          }
+          ResultRow row;
+          if (!flat_rows_) {
+              for (size_t s_idx = 0; s_idx < aliases.names.size(); ++s_idx) {
+                  const auto& n = path.get(s_idx);
+                  if (n) row.nodes.push_back(n);
+              }
+          }
+          row.projected_values.resize(projections_.size());
+          for (size_t i = 0; i < projections_.size(); ++i) {
+              size_t ps = proj_slots[i];
+              if (ps == SIZE_MAX) continue;
+              const auto& n = path.get(ps);
+              if (!n) continue;
+              std::string& dst_val = row.projected_values[i];
+              if (format_node_attr_into(n.get(), proj_hks[i], dst_val) && should_populate_fields) {
+                  row.fields[invariant_proj_names[i]] = dst_val;
+                  row.fields[idx_names[i]] = dst_val;
+              }
+          }
+          if (needs_fields) {
+              for (size_t si = 0; si < sorts_.size(); ++si) {
+                  size_t ss = sort_slots[si];
+                  if (ss == SIZE_MAX) continue;
+                  const auto& n = path.get(ss);
+                  if (n && !row.fields.contains(sort_field_keys[si])) {
+                      std::string val;
+                      if (format_node_attr_into(n.get(), sort_hks[si], val)) {
+                          row.fields[sort_field_keys[si]] = std::move(val);
+                      }
+                  }
+              }
+              for (size_t gi = 0; gi < groups_.size(); ++gi) {
+                  size_t gs = group_slots[gi];
+                  if (gs == SIZE_MAX) continue;
+                  const auto& n = path.get(gs);
+                  if (n && !row.fields.contains(group_field_keys[gi])) {
+                      std::string val;
+                      if (format_node_attr_into(n.get(), group_hks[gi], val)) {
+                          row.fields[group_field_keys[gi]] = std::move(val);
+                      }
+                  }
+              }
+          }
+          results.push_back(std::move(row));
       }
+
       for (auto& f : remote_futures) {
           auto remote_res = f.get();
-          results.insert(results.end(), remote_res.begin(), remote_res.end());
+          results.insert(results.end(),
+                         std::make_move_iterator(remote_res.begin()),
+                         std::make_move_iterator(remote_res.end()));
       }
   }
+
   if (has_agg || !groups_.empty()) {
       std::vector<std::string> partition_order;
       std::unordered_map<std::string, std::vector<ResultRow>> partitions;
@@ -1018,196 +1434,227 @@ std::vector<ResultRow> Query::execute() {
           partition_order.push_back("ALL");
           partitions["ALL"] = std::move(results);
       } else {
+          std::vector<std::string> eff_group_keys(effective_groups.size());
+          for (size_t gi = 0; gi < effective_groups.size(); ++gi) {
+              eff_group_keys[gi] = effective_groups[gi].alias + "." + effective_groups[gi].property;
+          }
           for (auto& row : results) {
               std::string g_key;
-              for (const auto& g : effective_groups) {
-                  auto it = row.fields.find(g.alias + "." + g.property);
+              for (size_t gi = 0; gi < effective_groups.size(); ++gi) {
+                  const auto& g = effective_groups[gi];
+                  auto it = row.fields.find(eff_group_keys[gi]);
                   std::string val = (it != row.fields.end() ? it->second : "");
                   if (!g.func_name.empty()) {
-                      std::string fn = g.func_name;
-                      std::transform(fn.begin(), fn.end(), fn.begin(), ::toupper);
-                      if (fn == "LENGTH") {
+                      if (icase_eq(g.func_name, "LENGTH")) {
                           val = std::to_string(val.size());
-                      } else if (fn == "SUBSTRING" || fn == "SUBSTR") {
+                      } else if (icase_eq(g.func_name, "SUBSTRING") || icase_eq(g.func_name, "SUBSTR")) {
                           if (!g.func_args.empty()) {
-                              try {
-                                  int pos = std::stoi(g.func_args[0]);
+                              int pos = 0;
+                              auto [p0, ec0] = std::from_chars(g.func_args[0].data(), g.func_args[0].data() + g.func_args[0].size(), pos);
+                              if (ec0 == std::errc{}) {
                                   int start = std::max(0, pos);
                                   if (start < static_cast<int>(val.size())) {
                                       if (g.func_args.size() > 1) {
-                                          int len = std::stoi(g.func_args[1]);
-                                          val = (len > 0) ? val.substr(start, len) : "";
+                                          int len = 0;
+                                          auto [p1, ec1] = std::from_chars(g.func_args[1].data(), g.func_args[1].data() + g.func_args[1].size(), len);
+                                          val = (ec1 == std::errc{} && len > 0) ? val.substr(static_cast<size_t>(start), static_cast<size_t>(len)) : "";
                                       } else {
-                                          val = val.substr(start);
+                                          val = val.substr(static_cast<size_t>(start));
                                       }
                                   } else {
-                                      val = "";
+                                      val.clear();
                                   }
-                              } catch (...) {}
+                              }
                           }
                       }
                   }
-                  g_key += val + "|";
+                  g_key += val;
+                  g_key.push_back('|');
               }
-              if (partitions.find(g_key) == partitions.end()) {
+              auto [pit, inserted] = partitions.try_emplace(g_key);
+              if (inserted) {
                   partition_order.push_back(g_key);
               }
-              partitions[g_key].push_back(std::move(row));
+              pit->second.push_back(std::move(row));
           }
       }
+
       std::vector<ResultRow> final_res;
+      final_res.reserve(partition_order.size());
       for (const auto& pk : partition_order) {
-          auto& part = partitions[pk]; ResultRow agg_row;
+          auto& part = partitions[pk];
+          ResultRow agg_row;
           for (const auto& g : effective_groups) {
               std::string gk = g.alias + "." + g.property;
-              if (!part.empty() && part[0].fields.contains(gk)) {
-                  agg_row.fields[gk] = part[0].fields.at(gk);
+              if (!part.empty()) {
+                  auto it = part[0].fields.find(gk);
+                  if (it != part[0].fields.end()) {
+                      agg_row.fields[gk] = it->second;
+                  }
               }
           }
           agg_row.projected_values.resize(projections_.size());
-          agg_row.projected_names.resize(projections_.size());
+          if (!flat_rows_) {
+              agg_row.projected_names = invariant_proj_names;
+          }
           for (size_t i = 0; i < projections_.size(); ++i) {
-              const auto& p = projections_[i]; std::string k = "idx_" + std::to_string(i);
-              agg_row.projected_names[i] = p.alias + "." + p.property;
-              agg_row.fields["_col_" + std::to_string(i)] = p.alias + "." + p.property;
-              if (p.agg == AggOp::None) { 
+              const auto& p = projections_[i];
+              const std::string& k = idx_names[i];
+              const std::string& full_name = invariant_proj_names[i];
+              std::string computed_val;
+
+              if (p.agg == AggOp::None) {
                   if (!part.empty()) {
-                      auto it = part[0].fields.find(p.alias + "." + p.property);
+                      auto it = part[0].fields.find(full_name);
                       if (it == part[0].fields.end()) it = part[0].fields.find(k);
-                      if (it != part[0].fields.end()) {
-                          agg_row.fields[k] = it->second;
-                          agg_row.fields[p.alias + "." + p.property] = it->second;
-                      } else {
-                          agg_row.fields[k] = "";
-                      }
-                  } else {
-                      agg_row.fields[k] = "";
+                      if (it != part[0].fields.end()) computed_val = it->second;
                   }
-              }
-              else if (p.agg == AggOp::Count) {
+              } else if (p.agg == AggOp::Count) {
                   if (p.distinct) {
-                      std::unordered_set<std::string> dist_vals;
-                      for (auto& r : part) {
-                          auto it = r.fields.find(p.alias + "." + p.property);
+                      std::unordered_set<std::string_view> dist_vals;
+                      for (const auto& r : part) {
+                          auto it = r.fields.find(full_name);
                           if (it == r.fields.end()) it = r.fields.find(k);
                           if (it != r.fields.end() && !it->second.empty()) dist_vals.insert(it->second);
                       }
-                      agg_row.fields[k] = std::to_string(dist_vals.size());
+                      computed_val = std::to_string(dist_vals.size());
                   } else {
-                      agg_row.fields[k] = std::to_string(part.size());
+                      computed_val = std::to_string(part.size());
                   }
-                  agg_row.fields[p.alias + "." + p.property] = agg_row.fields[k];
-              }
-              else {
+              } else {
                   std::vector<double> vals;
-                  if (p.distinct) {
-                      std::set<double> dist_set;
-                      for (auto& r : part) {
-                          auto it = r.fields.find(p.alias + "." + p.property);
-                          if (it == r.fields.end()) it = r.fields.find(k);
-                          if (it != r.fields.end() && !it->second.empty()) {
-                              try { dist_set.insert(std::stod(it->second)); } catch(...) {}
+                  vals.reserve(part.size());
+                  for (const auto& r : part) {
+                      auto it = r.fields.find(full_name);
+                      if (it == r.fields.end()) it = r.fields.find(k);
+                      if (it != r.fields.end() && !it->second.empty()) {
+                          double dv = 0.0;
+                          auto [ptr, ec] = std::from_chars(it->second.data(), it->second.data() + it->second.size(), dv);
+                          if (ec == std::errc{} && ptr == it->second.data() + it->second.size()) {
+                              vals.push_back(dv);
                           }
                       }
-                      vals.assign(dist_set.begin(), dist_set.end());
-                  } else {
-                      for (auto& r : part) {
-                          auto it = r.fields.find(p.alias + "." + p.property);
-                          if (it == r.fields.end()) it = r.fields.find(k);
-                          if (it != r.fields.end() && !it->second.empty()) {
-                              try { vals.push_back(std::stod(it->second)); } catch(...) {}
-                          }
-                      }
+                  }
+                  if (p.distinct && vals.size() > 1) {
+                      std::sort(vals.begin(), vals.end());
+                      vals.erase(std::unique(vals.begin(), vals.end()), vals.end());
                   }
                   if (vals.empty()) {
-                      agg_row.fields[k] = "0";
+                      computed_val = "0";
                   } else {
-                      double acc = 0;
+                      double acc = 0.0;
                       if (p.agg == AggOp::Min) {
                           acc = *std::min_element(vals.begin(), vals.end());
                       } else if (p.agg == AggOp::Max) {
                           acc = *std::max_element(vals.begin(), vals.end());
                       } else {
                           for (double v : vals) acc += v;
-                          if (p.agg == AggOp::Avg) acc /= vals.size();
+                          if (p.agg == AggOp::Avg) acc /= static_cast<double>(vals.size());
                       }
-                      if (acc == static_cast<int64_t>(acc)) agg_row.fields[k] = std::to_string(static_cast<int64_t>(acc));
-                      else agg_row.fields[k] = std::to_string(acc);
+                      if (acc == static_cast<double>(static_cast<int64_t>(acc))) {
+                          computed_val = std::to_string(static_cast<int64_t>(acc));
+                      } else {
+                          computed_val = std::to_string(acc);
+                      }
                   }
-                  agg_row.fields[p.alias + "." + p.property] = agg_row.fields[k];
               }
-              agg_row.projected_values[i] = agg_row.fields[k];
+
+              agg_row.projected_values[i] = computed_val;
+              if (should_populate_fields) {
+                  agg_row.fields["_col_" + std::to_string(i)] = full_name;
+                  agg_row.fields[k] = computed_val;
+                  agg_row.fields[full_name] = std::move(computed_val);
+              }
           }
           final_res.push_back(std::move(agg_row));
       }
       results = std::move(final_res);
   }
 
-  if (distinct_) {
-      std::set<std::string> seen; std::vector<ResultRow> unique_res;
+  if (distinct_ && results.size() > 1) {
+      std::unordered_set<std::string> seen;
+      seen.reserve(results.size());
+      std::vector<ResultRow> unique_res;
+      unique_res.reserve(results.size());
       for (auto& row : results) {
-          std::string key; 
+          std::string key;
           for (size_t i = 0; i < projections_.size(); ++i) {
               if (i < row.projected_values.size() && !row.projected_values[i].empty()) {
-                  key += row.projected_values[i] + "|";
-              } else {
-                  std::string k = "idx_" + std::to_string(i);
-                  auto it = row.fields.find(k);
-                  if (it != row.fields.end()) key += it->second + "|";
-                  else key += "|";
+                  key.append(row.projected_values[i]);
+              } else if (i < idx_names.size()) {
+                  auto it = row.fields.find(idx_names[i]);
+                  if (it != row.fields.end()) key.append(it->second);
               }
+              key.push_back('\x1F');
           }
-          if (seen.insert(key).second) unique_res.push_back(std::move(row));
+          if (seen.insert(std::move(key)).second) {
+              unique_res.push_back(std::move(row));
+          }
       }
       results = std::move(unique_res);
   }
 
-  std::sort(results.begin(), results.end(), [&](const ResultRow& a, const ResultRow& b) {
-      if (!sorts_.empty()) {
-          for (const auto& s : sorts_) {
-              std::string k = s.alias + "." + s.property;
+  const size_t start_ofs = offset_.value_or(0);
+  if (start_ofs >= results.size()) {
+      results.clear();
+      return results;
+  }
+
+  if (!sorts_.empty()) {
+      std::vector<size_t> order(results.size());
+      std::iota(order.begin(), order.end(), 0);
+
+      auto row_cmp = [&](size_t ia, size_t ib) -> bool {
+          const ResultRow& a = results[ia];
+          const ResultRow& b = results[ib];
+          for (size_t si = 0; si < sorts_.size(); ++si) {
+              const auto& k = sort_field_keys[si];
               auto it_a = a.fields.find(k);
               auto it_b = b.fields.find(k);
-              if (it_a != a.fields.end() && it_b != b.fields.end()) {
-                  if (it_a->second != it_b->second) { 
-                      if (s.ascending) return it_a->second < it_b->second; 
-                      return it_a->second > it_b->second; 
-                  }
+              std::string_view va = (it_a != a.fields.end()) ? std::string_view(it_a->second) : std::string_view{};
+              std::string_view vb = (it_b != b.fields.end()) ? std::string_view(it_b->second) : std::string_view{};
+              if (va != vb) {
+                  return sorts_[si].ascending ? (va < vb) : (va > vb);
               }
           }
-      }
-      for (size_t i = 0; i < projections_.size(); ++i) {
-          std::string v_a = (i < a.projected_values.size()) ? a.projected_values[i] : "";
-          std::string v_b = (i < b.projected_values.size()) ? b.projected_values[i] : "";
-          if (v_a.empty() && v_b.empty()) {
-              std::string k = "idx_" + std::to_string(i);
-              auto it_a = a.fields.find(k);
-              auto it_b = b.fields.find(k);
-              if (it_a != a.fields.end()) v_a = it_a->second;
-              if (it_b != b.fields.end()) v_b = it_b->second;
+          for (size_t i = 0; i < projections_.size(); ++i) {
+              std::string_view va = (i < a.projected_values.size()) ? std::string_view(a.projected_values[i]) : std::string_view{};
+              std::string_view vb = (i < b.projected_values.size()) ? std::string_view(b.projected_values[i]) : std::string_view{};
+              if (va != vb) return va < vb;
           }
-          if (v_a != v_b) return v_a < v_b;
+          return ia < ib;
+      };
+
+      const size_t end_ofs = limit_ ? std::min(results.size(), start_ofs + *limit_) : results.size();
+      if (end_ofs < results.size()) {
+          std::partial_sort(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(end_ofs), order.end(), row_cmp);
+      } else {
+          std::sort(order.begin(), order.end(), row_cmp);
       }
-      size_t min_nodes = std::min(a.nodes.size(), b.nodes.size());
-      for (size_t n = 0; n < min_nodes; ++n) {
-          if (a.nodes[n] && b.nodes[n]) {
-              uint64_t id_a = a.nodes[n]->get_id();
-              uint64_t id_b = b.nodes[n]->get_id();
-              if (id_a != id_b) return id_a < id_b;
-          }
+
+      std::vector<ResultRow> sorted_res;
+      sorted_res.reserve(end_ofs - start_ofs);
+      for (size_t p = start_ofs; p < end_ofs; ++p) {
+          sorted_res.push_back(std::move(results[order[p]]));
       }
-      return a.nodes.size() < b.nodes.size();
-  });
-  if (offset_) { if (*offset_ >= results.size()) results.clear(); else results.erase(results.begin(), results.begin() + *offset_); }
-  if (limit_ && results.size() > *limit_) results.resize(*limit_);
-  if (!results.empty() && results[0].projected_names.empty() && !invariant_proj_names.empty()) {
-      results[0].projected_names = invariant_proj_names;
+      results = std::move(sorted_res);
+  } else {
+      if (start_ofs > 0) {
+          results.erase(results.begin(), results.begin() + static_cast<std::ptrdiff_t>(start_ofs));
+      }
+      if (limit_ && results.size() > *limit_) {
+          results.resize(*limit_);
+      }
   }
-  L3_LOG(0, "Query::execute() returning results.size=%zu", results.size());
+
+  if (!flat_rows_ && !results.empty() && results[0].projected_names.empty() && !invariant_proj_names.empty()) {
+      results[0].projected_names = std::move(invariant_proj_names);
+  }
   return results;
 }
 
 lite3cpp::Buffer Query::serialize_results(const std::vector<ResultRow>& rows) {
+    using namespace lite3cpp::literals;
     lite3cpp::Buffer out_buf;
     size_t num_proj = rows.empty() ? 0 : rows[0].projected_values.size();
     size_t est_row_bytes = 2 * lite3cpp::config::node_size + num_proj * 48;
@@ -1218,158 +1665,190 @@ lite3cpp::Buffer Query::serialize_results(const std::vector<ResultRow>& rows) {
         size_t row_ofs = out_buf.arr_append_obj(0);
         if (!row.projected_values.empty()) {
             if (!wrote_cols && !row.projected_names.empty()) {
-                size_t cols_ofs = out_buf.set_arr(row_ofs, "cols");
+                size_t cols_ofs = out_buf.set_arr(row_ofs, "cols"_hk);
                 for (const auto& cn : row.projected_names) {
                     out_buf.arr_append_str(cols_ofs, cn);
                 }
                 wrote_cols = true;
             }
-            size_t proj_ofs = out_buf.set_arr(row_ofs, "proj");
+            size_t proj_ofs = out_buf.set_arr(row_ofs, "proj"_hk);
             for (const auto& pv : row.projected_values) {
                 out_buf.arr_append_str(proj_ofs, pv);
             }
         } else {
-            size_t fields_ofs = out_buf.set_obj(row_ofs, "fields");
+            size_t fields_ofs = out_buf.set_obj(row_ofs, "fields"_hk);
             for (const auto& [k, v] : row.fields) {
-                out_buf.set_str(fields_ofs, k, v);
+                out_buf.set_str(fields_ofs, lite3cpp::HashedKey(k), v);
             }
         }
     }
     return out_buf;
 }
 
+lite3cpp::Buffer Query::serialize_flat_results(const std::vector<ResultRow>& rows) {
+    lite3cpp::Buffer out_buf;
+    size_t num_proj = rows.empty() ? 0 : rows[0].projected_values.size();
+    size_t est_row_bytes = lite3cpp::config::node_size + num_proj * 36;
+    out_buf.ensure_capacity(rows.size() * est_row_bytes + 256);
+    out_buf.init_array();
+    for (const auto& row : rows) {
+        size_t r_ofs = out_buf.arr_append_arr(0);
+        for (const auto& pv : row.projected_values) {
+            out_buf.arr_append_str(r_ofs, pv);
+        }
+    }
+    return out_buf;
+}
+
+lite3cpp::Buffer Query::execute_to_flat_buffer() {
+    const bool prev_flat = flat_rows_;
+    const bool prev_pop = populate_fields_;
+    flat_rows_ = true;
+    populate_fields_ = false;
+    auto rows = execute();
+    flat_rows_ = prev_flat;
+    populate_fields_ = prev_pop;
+    return serialize_flat_results(rows);
+}
+
+lite3cpp::Buffer Query::execute_to_buffer() {
+    if (flat_rows_) {
+        return execute_to_flat_buffer();
+    }
+    auto rows = execute();
+    return serialize_results(rows);
+}
 
 Query &Query::resume(const std::vector<uint64_t>& starting_nodes, const lite3cpp::Buffer& query_buf) {
+    using namespace lite3cpp::literals;
     starting_nodes_ = starting_nodes;
     is_federated_branch_ = true;
-    try {
-        if (query_buf.size() < sizeof(lite3cpp::PackedNodeLayout)) return *this;
-        lite3cpp::NodeView root_node(reinterpret_cast<const lite3cpp::PackedNodeLayout*>(query_buf.data()));
-        if (root_node.type() != lite3cpp::Type::Object) return *this;
 
-        if (query_buf.get_type(0, "root_alias") == lite3cpp::Type::String) {
-            root_alias_ = std::string(query_buf.get_str(0, "root_alias"));
-            initial_match_ = {root_alias_};
-        }
-        if (query_buf.get_type(0, "principal_id") == lite3cpp::Type::Int64) {
-            principal_id_ = static_cast<uint32_t>(query_buf.get_i64(0, "principal_id"));
-        }
-        if (query_buf.get_type(0, "steps") == lite3cpp::Type::Array) {
-            size_t steps_ofs = query_buf.get_arr(0, "steps");
-            lite3cpp::NodeView sn(reinterpret_cast<const lite3cpp::PackedNodeLayout*>(query_buf.data() + steps_ofs));
-            for (uint32_t i = 0; i < sn.size(); ++i) {
-                if (query_buf.arr_get_type(steps_ofs, i) != lite3cpp::Type::Object) continue;
-                size_t s_ofs = query_buf.arr_get_obj(steps_ofs, i);
-                std::string type = (query_buf.get_type(s_ofs, "type") == lite3cpp::Type::String) 
-                                   ? std::string(query_buf.get_str(s_ofs, "type")) : "";
-                std::string src = (query_buf.get_type(s_ofs, "source_alias") == lite3cpp::Type::String) 
-                                  ? std::string(query_buf.get_str(s_ofs, "source_alias")) : "";
-                std::string label = (query_buf.get_type(s_ofs, "label") == lite3cpp::Type::String) 
-                                    ? std::string(query_buf.get_str(s_ofs, "label")) : "";
-                std::string target = (query_buf.get_type(s_ofs, "target_alias") == lite3cpp::Type::String) 
-                                     ? std::string(query_buf.get_str(s_ofs, "target_alias")) : "";
-                if (type == "out") {
-                    double min_w = 0.0;
-                    if (query_buf.get_type(s_ofs, "min_weight") == lite3cpp::Type::Float64) {
-                        min_w = query_buf.get_f64(s_ofs, "min_weight");
-                    } else if (query_buf.get_type(s_ofs, "min_weight") == lite3cpp::Type::Int64) {
-                        min_w = static_cast<double>(query_buf.get_i64(s_ofs, "min_weight"));
-                    }
-                    steps_.push_back(OutStep{std::move(label), min_w, std::move(target), std::move(src)});
-                } else if (type == "in") {
-                    steps_.push_back(InStep{std::move(label), std::move(target), std::move(src)});
+    if (query_buf.size() < sizeof(lite3cpp::PackedNodeLayout)) return *this;
+    lite3cpp::NodeView root_node(reinterpret_cast<const lite3cpp::PackedNodeLayout*>(query_buf.data()));
+    if (root_node.type() != lite3cpp::Type::Object) return *this;
+
+    if (auto ra = query_buf.try_get_str(0, "root_alias"_hk)) {
+        root_alias_.assign(ra->data(), ra->size());
+        initial_match_ = {root_alias_};
+    }
+    if (auto pid = query_buf.try_get_i64(0, "principal_id"_hk)) {
+        principal_id_ = static_cast<uint32_t>(*pid);
+    }
+    if (auto sip = query_buf.try_get_str(0, "start_index_prefix"_hk)) {
+        start_index_prefix_.assign(sip->data(), sip->size());
+    }
+    if (auto fr = query_buf.try_get_bool(0, "flat_rows"_hk)) {
+        flat_rows_ = *fr;
+    }
+
+    if (auto steps_ofs_opt = query_buf.try_get_arr(0, "steps"_hk)) {
+        const size_t steps_ofs = *steps_ofs_opt;
+        for (auto it = query_buf.begin(steps_ofs), end = query_buf.end(steps_ofs); it != end; ++it) {
+            if (it->value_type != lite3cpp::Type::Object) continue;
+            const size_t s_ofs = it->value_offset + 1;
+            if (s_ofs + sizeof(lite3cpp::PackedNodeLayout) > query_buf.size()) continue;
+
+            std::string_view type = query_buf.try_get_str(s_ofs, "type"_hk).value_or("");
+            std::string src(query_buf.try_get_str(s_ofs, "source_alias"_hk).value_or(""));
+            std::string label(query_buf.try_get_str(s_ofs, "label"_hk).value_or(""));
+            std::string target(query_buf.try_get_str(s_ofs, "target_alias"_hk).value_or(""));
+            if (type == "out") {
+                double min_w = 0.0;
+                if (auto mw = query_buf.try_get_f64(s_ofs, "min_weight"_hk)) {
+                    min_w = *mw;
+                } else if (auto mwi = query_buf.try_get_i64(s_ofs, "min_weight"_hk)) {
+                    min_w = static_cast<double>(*mwi);
                 }
+                steps_.push_back(OutStep{std::move(label), min_w, std::move(target), std::move(src)});
+            } else if (type == "in") {
+                steps_.push_back(InStep{std::move(label), std::move(target), std::move(src)});
             }
         }
-        if (query_buf.get_type(0, "projections") == lite3cpp::Type::Array) {
-            size_t projs_ofs = query_buf.get_arr(0, "projections");
-            lite3cpp::NodeView pn(reinterpret_cast<const lite3cpp::PackedNodeLayout*>(query_buf.data() + projs_ofs));
-            for (uint32_t i = 0; i < pn.size(); ++i) {
-                if (query_buf.arr_get_type(projs_ofs, i) != lite3cpp::Type::Object) continue;
-                size_t p_ofs = query_buf.arr_get_obj(projs_ofs, i);
-                std::string alias = (query_buf.get_type(p_ofs, "alias") == lite3cpp::Type::String) 
-                                    ? std::string(query_buf.get_str(p_ofs, "alias")) : "";
-                std::string prop = (query_buf.get_type(p_ofs, "property") == lite3cpp::Type::String) 
-                                   ? std::string(query_buf.get_str(p_ofs, "property")) : "";
-                int agg = 0;
-                if (query_buf.get_type(p_ofs, "agg") == lite3cpp::Type::Int64) {
-                    agg = static_cast<int>(query_buf.get_i64(p_ofs, "agg"));
-                }
-                bool dist = false;
-                if (query_buf.get_type(p_ofs, "distinct") == lite3cpp::Type::Bool) {
-                    dist = query_buf.get_bool(p_ofs, "distinct");
-                }
-                projections_.push_back(ReturnStep{std::move(alias), std::move(prop), static_cast<AggOp>(agg), dist});
-            }
+    }
+
+    if (auto projs_ofs_opt = query_buf.try_get_arr(0, "projections"_hk)) {
+        const size_t projs_ofs = *projs_ofs_opt;
+        for (auto it = query_buf.begin(projs_ofs), end = query_buf.end(projs_ofs); it != end; ++it) {
+            if (it->value_type != lite3cpp::Type::Object) continue;
+            const size_t p_ofs = it->value_offset + 1;
+            if (p_ofs + sizeof(lite3cpp::PackedNodeLayout) > query_buf.size()) continue;
+
+            std::string alias(query_buf.try_get_str(p_ofs, "alias"_hk).value_or(""));
+            std::string prop(query_buf.try_get_str(p_ofs, "property"_hk).value_or(""));
+            int agg = static_cast<int>(query_buf.try_get_i64(p_ofs, "agg"_hk).value_or(0));
+            bool dist = query_buf.try_get_bool(p_ofs, "distinct"_hk).value_or(false);
+            projections_.push_back(ReturnStep{std::move(alias), std::move(prop), static_cast<AggOp>(agg), dist});
         }
-        if (query_buf.get_type(0, "groups") == lite3cpp::Type::Array) {
-            size_t groups_ofs = query_buf.get_arr(0, "groups");
-            lite3cpp::NodeView gn(reinterpret_cast<const lite3cpp::PackedNodeLayout*>(query_buf.data() + groups_ofs));
-            for (uint32_t i = 0; i < gn.size(); ++i) {
-                if (query_buf.arr_get_type(groups_ofs, i) != lite3cpp::Type::Object) continue;
-                size_t g_ofs = query_buf.arr_get_obj(groups_ofs, i);
-                std::string alias = (query_buf.get_type(g_ofs, "alias") == lite3cpp::Type::String) 
-                                    ? std::string(query_buf.get_str(g_ofs, "alias")) : "";
-                std::string prop = (query_buf.get_type(g_ofs, "property") == lite3cpp::Type::String) 
-                                   ? std::string(query_buf.get_str(g_ofs, "property")) : "";
-                std::string func_name = (query_buf.get_type(g_ofs, "func_name") == lite3cpp::Type::String) 
-                                        ? std::string(query_buf.get_str(g_ofs, "func_name")) : "";
-                std::vector<std::string> func_args;
-                if (query_buf.get_type(g_ofs, "func_args") == lite3cpp::Type::Array) {
-                    size_t fa_ofs = query_buf.get_arr(g_ofs, "func_args");
-                    lite3cpp::NodeView fan(reinterpret_cast<const lite3cpp::PackedNodeLayout*>(query_buf.data() + fa_ofs));
-                    for (uint32_t j = 0; j < fan.size(); ++j) {
-                        if (query_buf.arr_get_type(fa_ofs, j) == lite3cpp::Type::String) {
-                            func_args.push_back(std::string(query_buf.arr_get_str(fa_ofs, j)));
+    }
+
+    if (auto groups_ofs_opt = query_buf.try_get_arr(0, "groups"_hk)) {
+        const size_t groups_ofs = *groups_ofs_opt;
+        for (auto it = query_buf.begin(groups_ofs), end = query_buf.end(groups_ofs); it != end; ++it) {
+            if (it->value_type != lite3cpp::Type::Object) continue;
+            const size_t g_ofs = it->value_offset + 1;
+            if (g_ofs + sizeof(lite3cpp::PackedNodeLayout) > query_buf.size()) continue;
+
+            std::string alias(query_buf.try_get_str(g_ofs, "alias"_hk).value_or(""));
+            std::string prop(query_buf.try_get_str(g_ofs, "property"_hk).value_or(""));
+            std::string func_name(query_buf.try_get_str(g_ofs, "func_name"_hk).value_or(""));
+            std::vector<std::string> func_args;
+            if (auto fa_ofs_opt = query_buf.try_get_arr(g_ofs, "func_args"_hk)) {
+                const size_t fa_ofs = *fa_ofs_opt;
+                for (auto fit = query_buf.begin(fa_ofs), fend = query_buf.end(fa_ofs); fit != fend; ++fit) {
+                    if (fit->value_type == lite3cpp::Type::String && fit->value_offset + 5 <= query_buf.size()) {
+                        uint32_t sz = 0;
+                        std::memcpy(&sz, query_buf.data() + fit->value_offset + 1, 4);
+                        if (fit->value_offset + 5 + sz <= query_buf.size()) {
+                            func_args.emplace_back(
+                                reinterpret_cast<const char*>(query_buf.data() + fit->value_offset + 5), sz);
                         }
                     }
                 }
-                groups_.push_back(GroupStep{std::move(alias), std::move(prop), std::move(func_name), std::move(func_args)});
             }
+            groups_.push_back(GroupStep{std::move(alias), std::move(prop), std::move(func_name), std::move(func_args)});
         }
-        if (query_buf.get_type(0, "sorts") == lite3cpp::Type::Array) {
-            size_t sorts_ofs = query_buf.get_arr(0, "sorts");
-            lite3cpp::NodeView sn(reinterpret_cast<const lite3cpp::PackedNodeLayout*>(query_buf.data() + sorts_ofs));
-            for (uint32_t i = 0; i < sn.size(); ++i) {
-                if (query_buf.arr_get_type(sorts_ofs, i) != lite3cpp::Type::Object) continue;
-                size_t s_ofs = query_buf.arr_get_obj(sorts_ofs, i);
-                std::string alias = (query_buf.get_type(s_ofs, "alias") == lite3cpp::Type::String) 
-                                    ? std::string(query_buf.get_str(s_ofs, "alias")) : "";
-                std::string prop = (query_buf.get_type(s_ofs, "property") == lite3cpp::Type::String) 
-                                   ? std::string(query_buf.get_str(s_ofs, "property")) : "";
-                bool asc = true;
-                if (query_buf.get_type(s_ofs, "ascending") == lite3cpp::Type::Bool) {
-                    asc = query_buf.get_bool(s_ofs, "ascending");
-                }
-                sorts_.push_back(SortStep{std::move(alias), std::move(prop), asc});
-            }
+    }
+
+    if (auto sorts_ofs_opt = query_buf.try_get_arr(0, "sorts"_hk)) {
+        const size_t sorts_ofs = *sorts_ofs_opt;
+        for (auto it = query_buf.begin(sorts_ofs), end = query_buf.end(sorts_ofs); it != end; ++it) {
+            if (it->value_type != lite3cpp::Type::Object) continue;
+            const size_t s_ofs = it->value_offset + 1;
+            if (s_ofs + sizeof(lite3cpp::PackedNodeLayout) > query_buf.size()) continue;
+
+            std::string alias(query_buf.try_get_str(s_ofs, "alias"_hk).value_or(""));
+            std::string prop(query_buf.try_get_str(s_ofs, "property"_hk).value_or(""));
+            bool asc = query_buf.try_get_bool(s_ofs, "ascending"_hk).value_or(true);
+            sorts_.push_back(SortStep{std::move(alias), std::move(prop), asc});
         }
-        if (query_buf.get_type(0, "limit") == lite3cpp::Type::Int64) {
-            limit_ = static_cast<size_t>(query_buf.get_i64(0, "limit"));
-        }
-        if (query_buf.get_type(0, "offset") == lite3cpp::Type::Int64) {
-            offset_ = static_cast<size_t>(query_buf.get_i64(0, "offset"));
-        }
-        if (query_buf.get_type(0, "distinct") == lite3cpp::Type::Bool) {
-            distinct_ = query_buf.get_bool(0, "distinct");
-        }
-        if (query_buf.get_type(0, "filters") == lite3cpp::Type::Array) {
-            parse_filter_nodes(query_buf, query_buf.get_arr(0, "filters"), root_filters_);
-        }
-    } catch (...) {}
+    }
+
+    if (auto lim = query_buf.try_get_i64(0, "limit"_hk)) {
+        limit_ = static_cast<size_t>(*lim);
+    }
+    if (auto ofs = query_buf.try_get_i64(0, "offset"_hk)) {
+        offset_ = static_cast<size_t>(*ofs);
+    }
+    if (auto dist = query_buf.try_get_bool(0, "distinct"_hk)) {
+        distinct_ = *dist;
+    }
+    if (auto filters_ofs = query_buf.try_get_arr(0, "filters"_hk)) {
+        parse_filter_nodes(query_buf, *filters_ofs, root_filters_);
+    }
+
     return *this;
 }
 
 Query &Query::resume(const std::vector<uint64_t>& starting_nodes, std::string_view query_payload) {
-    if (query_payload.size() >= sizeof(lite3cpp::PackedNodeLayout) && 
+    if (query_payload.size() >= sizeof(lite3cpp::PackedNodeLayout) &&
         (static_cast<uint8_t>(query_payload[0]) == 0x06 || static_cast<uint8_t>(query_payload[0]) == 0x07)) {
         const uint8_t* ptr = reinterpret_cast<const uint8_t*>(query_payload.data());
-        lite3cpp::Buffer buf(ptr, query_payload.size());
-        return resume(starting_nodes, buf);
-    } else {
-        lite3cpp::Buffer buf = lite3cpp::lite3_json::from_json_string(query_payload.empty() ? "{}" : std::string(query_payload));
+        lite3cpp::Buffer buf = lite3cpp::Buffer::from_view(ptr, query_payload.size());
         return resume(starting_nodes, buf);
     }
+    lite3cpp::Buffer buf = lite3cpp::lite3_json::from_json_string(query_payload.empty() ? "{}" : query_payload);
+    return resume(starting_nodes, buf);
 }
 
 } // namespace l3kvg

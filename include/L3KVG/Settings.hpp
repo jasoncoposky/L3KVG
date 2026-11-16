@@ -1,6 +1,9 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
+#include <string>
+#include <vector>
 
 namespace l3kvg {
 
@@ -22,6 +25,8 @@ struct Settings {
   int health_check_interval_ms = 1000;
   size_t node_initial_buffer_size = 1024;
   double default_min_weight = -999999.0;
+  bool fallback_to_full_scan_on_index_miss = false;
+  std::vector<std::string> cluster_endpoints;
 };
 
 } // namespace l3kvg

@@ -114,6 +114,8 @@ public:
   BinaryEdgeWAL* get_edge_wal() { return edge_wal_.get(); }
   const BinaryEdgeWAL* get_edge_wal() const { return edge_wal_.get(); }
   [[nodiscard]] uint64_t get_cache_epoch() const noexcept { return cache_epoch_.load(std::memory_order_relaxed); }
+  [[nodiscard]] bool has_legacy_kv_edges() const noexcept { return has_legacy_kv_edges_.load(std::memory_order_relaxed); }
+  void mark_legacy_kv_edges() noexcept { has_legacy_kv_edges_.store(true, std::memory_order_relaxed); }
 
 private:
   struct CacheShard {
@@ -149,6 +151,7 @@ private:
   std::vector<std::unique_ptr<CacheShard>> cache_shards_;
   std::atomic<uint64_t> cache_epoch_{1};
   std::atomic<bool> has_cached_nodes_{false};
+  std::atomic<bool> has_legacy_kv_edges_{false};
   uint64_t engine_instance_id_{0};
   
   HLCProvider hlc_;

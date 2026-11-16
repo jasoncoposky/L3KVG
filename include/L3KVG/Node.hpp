@@ -2,15 +2,22 @@
 
 #include <mutex>
 #include <atomic>
+#include <charconv>
 #include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <type_traits>
+#include <variant>
 #include <vector>
 #include <cstdint>
 #include "L3KVG/Edge.hpp"
 #include "L3KVG/KeyBuilder.hpp"
 #include "engine/credential_manager.hpp"
+
+namespace l3kv {
+class Blob;
+}
 
 namespace l3kvg {
 
@@ -18,12 +25,22 @@ class Engine;
 
 class Node {
 public:
+  using AttrValue = std::variant<std::monostate, int64_t, double, bool, std::string_view>;
+
   Node(Engine *engine, uint64_t id);
+  ~Node();
+
   void ensure_loaded();
+  bool try_load_local(uint32_t principal_id = l3kv::INTERNAL_UID);
   bool is_loaded() const { return loaded_.load(std::memory_order_acquire); }
   void hydrate(const std::string &data);
 
-  bool has_attribute(const std::string &key);
+  AttrValue try_get_attr(lite3cpp::HashedKey hk);
+  AttrValue try_get_attr(std::string_view key) {
+    return try_get_attr(lite3cpp::HashedKey(key));
+  }
+
+  bool has_attribute(std::string_view key);
   lite3cpp::Type get_attribute_type(std::string_view key);
   std::string get_attribute_as_string(std::string_view key);
 
@@ -57,59 +74,63 @@ public:
 private:
   Engine *engine_;
   uint64_t id_;
-  
-  // High Performance Proxy: payload_ owns the memory for all zero-copy views.
-  // Pointer stability is guaranteed as long as this Node object is alive.
+
+  // Zero-copy pin to L3KV Blob (when loaded locally) or owning Buffer (when hydrated remotely).
+  std::shared_ptr<const l3kv::Blob> blob_pin_;
   std::optional<lite3cpp::Buffer> payload_;
-  
+
   std::atomic<bool> loaded_{false};
   std::mutex loading_mutex_;
-  uint64_t bloom_filter_{0};
-
-  struct NeighborCache {
-      uint64_t epoch{UINT64_MAX};
-      double min_weight{0.0};
-      uint16_t label_id{0};
-      bool valid{false};
-      std::vector<uint64_t> neighbors;
-  };
-  mutable NeighborCache neighbor_cache_;
+  std::atomic<uint64_t> bloom_filter_{0};
 };
 
 template <typename T> T Node::get_attribute(std::string_view key) {
-  ensure_loaded();
-  if (!payload_ || payload_->size() == 0)
+  const AttrValue val = try_get_attr(lite3cpp::HashedKey(key));
+  if (std::holds_alternative<std::monostate>(val)) {
     return T{};
+  }
 
-  std::string k(key);
   if constexpr (std::is_same_v<T, std::string>) {
-    return std::string(payload_->get_str(0, k));
+    if (const auto* sv = std::get_if<std::string_view>(&val)) return std::string(*sv);
+    if (const auto* iv = std::get_if<int64_t>(&val)) return std::to_string(*iv);
+    if (const auto* fv = std::get_if<double>(&val)) return std::to_string(*fv);
+    if (const auto* bv = std::get_if<bool>(&val)) return *bv ? "true" : "false";
+    return {};
+  } else if constexpr (std::is_same_v<T, std::string_view>) {
+    if (const auto* sv = std::get_if<std::string_view>(&val)) return *sv;
+    return {};
   } else if constexpr (std::is_same_v<T, bool>) {
-    auto t = payload_->get_type(0, k);
-    if (t == lite3cpp::Type::Bool) {
-      return payload_->get_bool(0, k);
-    } else if (t == lite3cpp::Type::Int64) {
-      return payload_->get_i64(0, k) != 0;
-    } else if (t == lite3cpp::Type::String) {
-      auto s = payload_->get_str(0, k);
-      return s == "true" || s == "1" || s == "True";
+    if (const auto* bv = std::get_if<bool>(&val)) return *bv;
+    if (const auto* iv = std::get_if<int64_t>(&val)) return *iv != 0;
+    if (const auto* sv = std::get_if<std::string_view>(&val)) {
+      return *sv == "true" || *sv == "1" || *sv == "True";
     }
+    if (const auto* fv = std::get_if<double>(&val)) return *fv != 0.0;
     return false;
   } else if constexpr (std::is_integral_v<T>) {
-    auto t = payload_->get_type(0, k);
-    if (t == lite3cpp::Type::Bool) {
-      return static_cast<T>(payload_->get_bool(0, k) ? 1 : 0);
-    } else if (t == lite3cpp::Type::String) {
-      try {
-        auto s = payload_->get_str(0, k);
-        return static_cast<T>(std::stoll(std::string(s)));
-      } catch (...) {
-        return T{};
+    if (const auto* iv = std::get_if<int64_t>(&val)) return static_cast<T>(*iv);
+    if (const auto* bv = std::get_if<bool>(&val)) return static_cast<T>(*bv ? 1 : 0);
+    if (const auto* fv = std::get_if<double>(&val)) return static_cast<T>(*fv);
+    if (const auto* sv = std::get_if<std::string_view>(&val); sv && !sv->empty()) {
+      int64_t parsed = 0;
+      auto [ptr, ec] = std::from_chars(sv->data(), sv->data() + sv->size(), parsed);
+      if (ec == std::errc{} && ptr == sv->data() + sv->size()) {
+        return static_cast<T>(parsed);
       }
     }
-    return static_cast<T>(payload_->get_i64(0, k));
+    return T{};
   } else if constexpr (std::is_floating_point_v<T>) {
-    return static_cast<T>(payload_->get_f64(0, k));
+    if (const auto* fv = std::get_if<double>(&val)) return static_cast<T>(*fv);
+    if (const auto* iv = std::get_if<int64_t>(&val)) return static_cast<T>(*iv);
+    if (const auto* bv = std::get_if<bool>(&val)) return static_cast<T>(*bv ? 1.0 : 0.0);
+    if (const auto* sv = std::get_if<std::string_view>(&val); sv && !sv->empty()) {
+      double parsed = 0.0;
+      auto [ptr, ec] = std::from_chars(sv->data(), sv->data() + sv->size(), parsed);
+      if (ec == std::errc{} && ptr == sv->data() + sv->size()) {
+        return static_cast<T>(parsed);
+      }
+    }
+    return T{};
   }
   return T{};
 }

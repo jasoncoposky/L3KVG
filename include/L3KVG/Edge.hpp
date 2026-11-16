@@ -1,13 +1,13 @@
 #pragma once
 
 #include "buffer.hpp"
+#include <charconv>
 #include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
-#include <iostream>
-#include <stdexcept>
 #include <cstdint>
 
 namespace l3kvg {
@@ -31,59 +31,70 @@ public:
   uint64_t get_dst() const { return dst_; }
 
   template <typename T> T get_attribute(std::string_view key) {
-    if (!payload_ || payload_->size() == 0)
+    using namespace lite3cpp::literals;
+    if (!payload_ || payload_->size() < sizeof(lite3cpp::PackedNodeLayout))
       return T{};
 
-    // DEBUG: print keys at root
-    // std::cerr << "[Edge::get_attribute] Debug: root type: " << (int)payload_->get_type(0, "") << "\n";
-
-    // In Evolution 3, user properties are stored under the "props" key
     size_t props_ofs = 0;
-    try {
-        if (payload_->get_type(0, "props") == lite3cpp::Type::Object) {
-            props_ofs = payload_->get_obj(0, "props");
-        } else {
-            // Fallback to root for nodes or non-nested edges
-            props_ofs = 0;
-        }
-    } catch (...) {
-        props_ofs = 0;
+    if (auto p = payload_->try_get_obj(0, "props"_hk)) {
+      props_ofs = *p;
     }
 
-    std::string k(key);
-    try {
-        if constexpr (std::is_same_v<T, std::string>) {
-          return std::string(payload_->get_str(props_ofs, k));
-        } else if constexpr (std::is_same_v<T, bool>) {
-          auto t = payload_->get_type(props_ofs, k);
-          if (t == lite3cpp::Type::Bool) {
-            return payload_->get_bool(props_ofs, k);
-          } else if (t == lite3cpp::Type::Int64) {
-            return payload_->get_i64(props_ofs, k) != 0;
-          } else if (t == lite3cpp::Type::String) {
-            auto s = payload_->get_str(props_ofs, k);
-            return s == "true" || s == "1" || s == "True";
-          }
-          return false;
-        } else if constexpr (std::is_integral_v<T>) {
-          auto t = payload_->get_type(props_ofs, k);
-          if (t == lite3cpp::Type::Bool) {
-            return static_cast<T>(payload_->get_bool(props_ofs, k) ? 1 : 0);
-          } else if (t == lite3cpp::Type::String) {
-            try {
-              auto s = payload_->get_str(props_ofs, k);
-              return static_cast<T>(std::stoll(std::string(s)));
-            } catch (...) {
-              return T{};
-            }
-          }
-          return static_cast<T>(payload_->get_i64(props_ofs, k));
-        } else if constexpr (std::is_floating_point_v<T>) {
-          return static_cast<T>(payload_->get_f64(props_ofs, k));
+    const lite3cpp::HashedKey hk(key);
+    if constexpr (std::is_same_v<T, std::string>) {
+      if (auto sv = payload_->try_get_str(props_ofs, hk)) {
+        return std::string(*sv);
+      }
+      return {};
+    } else if constexpr (std::is_same_v<T, std::string_view>) {
+      if (auto sv = payload_->try_get_str(props_ofs, hk)) {
+        return *sv;
+      }
+      return {};
+    } else if constexpr (std::is_same_v<T, bool>) {
+      if (auto b = payload_->try_get_bool(props_ofs, hk)) {
+        return *b;
+      }
+      if (auto iv = payload_->try_get_i64(props_ofs, hk)) {
+        return *iv != 0;
+      }
+      if (auto sv = payload_->try_get_str(props_ofs, hk)) {
+        return *sv == "true" || *sv == "1" || *sv == "True";
+      }
+      return false;
+    } else if constexpr (std::is_integral_v<T>) {
+      if (auto iv = payload_->try_get_i64(props_ofs, hk)) {
+        return static_cast<T>(*iv);
+      }
+      if (auto b = payload_->try_get_bool(props_ofs, hk)) {
+        return static_cast<T>(*b ? 1 : 0);
+      }
+      if (auto fv = payload_->try_get_f64(props_ofs, hk)) {
+        return static_cast<T>(*fv);
+      }
+      if (auto sv = payload_->try_get_str(props_ofs, hk); sv && !sv->empty()) {
+        int64_t parsed = 0;
+        auto [ptr, ec] = std::from_chars(sv->data(), sv->data() + sv->size(), parsed);
+        if (ec == std::errc{} && ptr == sv->data() + sv->size()) {
+          return static_cast<T>(parsed);
         }
-    } catch (const std::exception& e) {
-        std::cerr << "[Edge::get_attribute] Error retrieving key '" << k << "': " << e.what() << "\n";
-        throw;
+      }
+      return T{};
+    } else if constexpr (std::is_floating_point_v<T>) {
+      if (auto fv = payload_->try_get_f64(props_ofs, hk)) {
+        return static_cast<T>(*fv);
+      }
+      if (auto iv = payload_->try_get_i64(props_ofs, hk)) {
+        return static_cast<T>(*iv);
+      }
+      if (auto sv = payload_->try_get_str(props_ofs, hk); sv && !sv->empty()) {
+        double parsed = 0.0;
+        auto [ptr, ec] = std::from_chars(sv->data(), sv->data() + sv->size(), parsed);
+        if (ec == std::errc{} && ptr == sv->data() + sv->size()) {
+          return static_cast<T>(parsed);
+        }
+      }
+      return T{};
     }
     return T{};
   }

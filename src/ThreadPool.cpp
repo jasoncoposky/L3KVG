@@ -79,11 +79,15 @@ struct ThreadPool::Impl {
     void parallel_for(size_t first, size_t last, std::function<void(size_t, size_t)> fn) {
         if (first >= last) return;
         size_t total = last - first;
-        if (num_threads <= 1 || total <= 1) {
+        if (workers.empty() || num_threads <= 1 || total < 64) {
             fn(first, last);
             return;
         }
-        size_t chunks = std::min(num_threads, total);
+        size_t chunks = std::min(num_threads, total / 32);
+        if (chunks <= 1) {
+            fn(first, last);
+            return;
+        }
         size_t chunk_size = total / chunks;
         size_t remainder = total % chunks;
         std::vector<std::future<void>> futures;
@@ -111,5 +115,6 @@ ThreadPool::ThreadPool(size_t threads) : pimpl_(std::make_unique<Impl>(threads))
 ThreadPool::~ThreadPool() = default;
 void ThreadPool::push_task_internal(std::function<void()> task) { pimpl_->push_task(std::move(task)); }
 void ThreadPool::parallel_for(size_t first, size_t last, std::function<void(size_t, size_t)> fn) { pimpl_->parallel_for(first, last, std::move(fn)); }
+size_t ThreadPool::size() const noexcept { return pimpl_->num_threads; }
 
 } // namespace l3kvg

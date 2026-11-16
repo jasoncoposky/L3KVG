@@ -14,6 +14,10 @@
 #include <chrono>
 #include <condition_variable>
 #include <filesystem>
+#include <fstream>
+#include <csignal>
+#include <sys/wait.h>
+#include <unistd.h>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -746,4 +750,431 @@ TEST(ServerConcurrencyTest, ParallelPrefixScans) {
 
     server.stop();
 }
+
+namespace {
+
+class RealServerProcess {
+public:
+    RealServerProcess(uint16_t zmq_port, uint16_t http_port, std::string db_path, std::string auth_secret = "")
+        : zmq_port_(zmq_port), http_port_(http_port), db_path_(std::move(db_path)),
+          cfg_path_(db_path_ + "_cfg.json"), auth_secret_(std::move(auth_secret)) {}
+
+    ~RealServerProcess() {
+        stop();
+    }
+
+    void start() {
+        std::error_code ec;
+        std::filesystem::remove_all(db_path_, ec);
+        std::filesystem::remove(cfg_path_, ec);
+
+        {
+            std::ofstream ofs(cfg_path_);
+            ofs << "{\n"
+                << "  \"db_path\": \"" << db_path_ << "\",\n"
+                << "  \"node_id\": 1,\n"
+                << "  \"zmq_port\": " << zmq_port_ << ",\n"
+                << "  \"http_port\": " << http_port_ << ",\n"
+                << "  \"num_workers\": 8";
+            if (!auth_secret_.empty()) {
+                ofs << ",\n  \"auth_secret\": \"" << auth_secret_ << "\"";
+            }
+            ofs << "\n}\n";
+        }
+
+        auto self_exe = std::filesystem::read_symlink("/proc/self/exe");
+        auto server_exe = self_exe.parent_path() / "l3kvg_server";
+        ASSERT_TRUE(std::filesystem::exists(server_exe)) << "Missing l3kvg_server binary at " << server_exe;
+
+        pid_ = ::fork();
+        ASSERT_GE(pid_, 0);
+        if (pid_ == 0) {
+            ::execl(server_exe.c_str(), server_exe.c_str(), cfg_path_.c_str(), static_cast<char*>(nullptr));
+            ::_exit(127);
+        }
+
+        // Wait until ZMQ port responds
+        zmq::context_t ctx(1);
+        zmq::socket_t sock(ctx, zmq::socket_type::dealer);
+        sock.set(zmq::sockopt::rcvtimeo, 100);
+        sock.set(zmq::sockopt::linger, 0);
+        sock.connect("tcp://127.0.0.1:" + std::to_string(zmq_port_));
+        bool ready = false;
+        for (int attempt = 0; attempt < 50; ++attempt) {
+            if (!auth_secret_.empty()) {
+                sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                uint32_t dummy = 0;
+                sock.send(zmq::message_t(&dummy, 4), zmq::send_flags::sndmore);
+                sock.send(zmq::message_t("A", 1), zmq::send_flags::sndmore);
+                sock.send(zmq::message_t("1", 1), zmq::send_flags::sndmore);
+                sock.send(zmq::message_t(auth_secret_.data(), auth_secret_.size()), zmq::send_flags::none);
+            } else {
+                sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+                uint32_t dummy = 0;
+                sock.send(zmq::message_t(&dummy, 4), zmq::send_flags::sndmore);
+                sock.send(zmq::message_t("H", 1), zmq::send_flags::none);
+            }
+            std::vector<zmq::message_t> resp;
+            if (zmq::recv_multipart(sock, std::back_inserter(resp)) && resp.size() >= 2) {
+                ready = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        sock.close();
+        ctx.close();
+        ASSERT_TRUE(ready) << "l3kvg_server failed to become ready on port " << zmq_port_;
+    }
+
+    void stop() {
+        if (pid_ > 0) {
+            ::kill(pid_, SIGTERM);
+            int status = 0;
+            for (int i = 0; i < 50; ++i) {
+                pid_t w = ::waitpid(pid_, &status, WNOHANG);
+                if (w == pid_) {
+                    pid_ = -1;
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            if (pid_ > 0) {
+                ::kill(pid_, SIGKILL);
+                (void)::waitpid(pid_, &status, 0);
+                pid_ = -1;
+            }
+        }
+        std::error_code ec;
+        std::filesystem::remove_all(db_path_, ec);
+        std::filesystem::remove(cfg_path_, ec);
+    }
+
+private:
+    uint16_t zmq_port_;
+    uint16_t http_port_;
+    std::string db_path_;
+    std::string cfg_path_;
+    std::string auth_secret_;
+    pid_t pid_{-1};
+};
+
+} // namespace
+
+TEST(ServerConcurrencyTest, RealServerOpcodesMultiReadAndFlatQuery) {
+    using namespace lite3cpp::literals;
+    uint16_t zmq_port = g_test_port.fetch_add(2);
+    uint16_t http_port = zmq_port + 1;
+    std::string db = "test_real_svr_" + std::to_string(zmq_port);
+
+    RealServerProcess server(zmq_port, http_port, db);
+    server.start();
+
+    // 1. Raw ZMQ verification of "H" -> "PONG", "Z" -> "ERR_UNKNOWN_OP", and "S" -> "OK"
+    {
+        zmq::context_t ctx(1);
+        zmq::socket_t sock(ctx, zmq::socket_type::dealer);
+        sock.set(zmq::sockopt::rcvtimeo, 2000);
+        sock.set(zmq::sockopt::linger, 0);
+        sock.connect("tcp://127.0.0.1:" + std::to_string(zmq_port));
+
+        // Opcode "H"
+        sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+        uint32_t pid = 0;
+        sock.send(zmq::message_t(&pid, 4), zmq::send_flags::sndmore);
+        sock.send(zmq::message_t("H", 1), zmq::send_flags::none);
+        std::vector<zmq::message_t> resp;
+        ASSERT_TRUE(zmq::recv_multipart(sock, std::back_inserter(resp)));
+        ASSERT_GE(resp.size(), 2u);
+        EXPECT_EQ(resp[1].to_string(), "PONG");
+
+        // Unknown Opcode "Z"
+        resp.clear();
+        sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+        sock.send(zmq::message_t(&pid, 4), zmq::send_flags::sndmore);
+        sock.send(zmq::message_t("Z", 1), zmq::send_flags::none);
+        ASSERT_TRUE(zmq::recv_multipart(sock, std::back_inserter(resp)));
+        ASSERT_GE(resp.size(), 2u);
+        EXPECT_EQ(resp[1].to_string(), "ERR_UNKNOWN_OP");
+
+        // Opcode "S" (Replication)
+        resp.clear();
+        std::string rep_key(l3kvg::KeyBuilder::node_key(0x7777));
+        std::string rep_val = R"({"name":"replicated_node"})";
+        sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+        sock.send(zmq::message_t(&pid, 4), zmq::send_flags::sndmore);
+        sock.send(zmq::message_t("S", 1), zmq::send_flags::sndmore);
+        sock.send(zmq::message_t(rep_key.data(), rep_key.size()), zmq::send_flags::sndmore);
+        sock.send(zmq::message_t(rep_val.data(), rep_val.size()), zmq::send_flags::sndmore);
+        sock.send(zmq::message_t("2", 1), zmq::send_flags::none);
+        ASSERT_TRUE(zmq::recv_multipart(sock, std::back_inserter(resp)));
+        ASSERT_GE(resp.size(), 2u);
+        EXPECT_EQ(resp[1].to_string(), "OK");
+
+        sock.close();
+        ctx.close();
+    }
+
+    // 2. Synchronous RemoteL3KVClient APIs + Graph Multi-Read ("G") + Flat Query ("R")
+    l3kvg::Settings csettings;
+    csettings.fed_timeout_ms = 3000;
+    l3kvg::RemoteL3KVClient client(csettings);
+    // Note: NO ThreadPool set on client — synchronous methods must bypass ThreadPool completely!
+    client.add_peer(1, "tcp://127.0.0.1:" + std::to_string(zmq_port));
+
+    // Verify replicated node is readable synchronously
+    lite3cpp::Buffer rep_buf = client.get_node_buffer(1, 0x7777);
+    ASSERT_GE(rep_buf.size(), sizeof(lite3cpp::PackedNodeLayout));
+    EXPECT_EQ(rep_buf.get_str(0, "name"_hk), "replicated_node");
+
+    // Seed graph via synchronous execute_batch
+    const uint64_t center_id = 0x5000;
+    const uint64_t out_a = 0x5001;
+    const uint64_t out_b = 0x5002;
+    const uint64_t in_a = 0x5003;
+
+    l3kvg::MutationBatch batch;
+    batch.put_node(center_id, R"({"entity_type":"data_object","n":"center_obj","s":512})");
+    batch.put_node(out_a, R"({"entity_type":"replica","n":"rep_a"})");
+    batch.put_node(out_b, R"({"entity_type":"replica","n":"rep_b"})");
+    batch.put_node(in_a, R"({"entity_type":"collection","n":"/tempZone/home/rods"})");
+    batch.add_edge(center_id, "HAS_REPLICA", 1.0, out_a);
+    batch.add_edge(center_id, "HAS_REPLICA", 2.0, out_b);
+    batch.add_edge(in_a, "CONTAINS", 1.0, center_id);
+    batch.put_raw("raw:config:key", R"({"mode":"turbo"})");
+    batch.put_raw("idx:DataObject:pn:/tempZone/home/rods:center_obj", "0000000000005000");
+
+    ASSERT_TRUE(client.execute_batch(1, batch.get_buffer()));
+
+    // Verify synchronous single-purpose methods
+    EXPECT_FALSE(client.get_node_payload(1, center_id).empty());
+    auto sync_outs = client.get_neighbors(1, center_id, "HAS_REPLICA", 0.5);
+    ASSERT_EQ(sync_outs.size(), 2u);
+    auto sync_ins = client.get_in_neighbors(1, center_id, "CONTAINS");
+    ASSERT_EQ(sync_ins.size(), 1u);
+    EXPECT_EQ(sync_ins[0], in_a);
+    EXPECT_FALSE(client.get_raw_key(1, "raw:config:key").empty());
+    auto pfx_entries = client.get_prefix_entries(1, "idx:DataObject:pn:/tempZone/home/rods:");
+    ASSERT_EQ(pfx_entries.size(), 1u);
+    EXPECT_EQ(pfx_entries[0].second, "0000000000005000");
+    auto pfx_keys = client.get_prefix_keys(1, "idx:DataObject:pn:/tempZone/home/rods:");
+    ASSERT_EQ(pfx_keys.size(), 1u);
+
+    // Verify Graph Multi-Read ("G") in a single round-trip
+    std::vector<l3kvg::GraphReadOp> ops = {
+        {l3kvg::GraphReadKind::NodePayload, center_id, "", 0.0},
+        {l3kvg::GraphReadKind::OutNeighbors, center_id, "HAS_REPLICA", 0.5},
+        {l3kvg::GraphReadKind::InNeighbors, center_id, "CONTAINS", 0.0},
+        {l3kvg::GraphReadKind::RawKey, 0, "raw:config:key", 0.0},
+        {l3kvg::GraphReadKind::RawKey, 0, "raw:missing:key", 0.0}
+    };
+    auto mres = client.execute_multi_read(1, ops);
+    ASSERT_EQ(mres.size(), 5u);
+    EXPECT_TRUE(mres[0].found);
+    ASSERT_GE(mres[0].payload.size(), sizeof(lite3cpp::PackedNodeLayout));
+    auto nview = lite3cpp::Buffer::from_view(
+        reinterpret_cast<const uint8_t*>(mres[0].payload.data()), mres[0].payload.size());
+    EXPECT_EQ(nview.get_str(0, "n"_hk), "center_obj");
+
+    EXPECT_TRUE(mres[1].found);
+    ASSERT_EQ(mres[1].neighbors.size(), 2u);
+
+    EXPECT_TRUE(mres[2].found);
+    ASSERT_EQ(mres[2].neighbors.size(), 1u);
+    EXPECT_EQ(mres[2].neighbors[0], in_a);
+
+    EXPECT_TRUE(mres[3].found);
+    EXPECT_FALSE(mres[3].payload.empty());
+
+    EXPECT_FALSE(mres[4].found);
+    EXPECT_TRUE(mres[4].payload.empty());
+
+    // Verify resume_query_buffer with start_index_prefix + flat_rows over ZMQ "R"
+    lite3cpp::Buffer qbuf;
+    qbuf.init_object();
+    qbuf.set_str(0, "root_alias"_hk, "DataObject");
+    qbuf.set_str(0, "start_index_prefix"_hk, "idx:DataObject:pn:/tempZone/home/rods:");
+    qbuf.set_bool(0, "flat_rows"_hk, true);
+    size_t projs = qbuf.set_arr(0, "projections"_hk);
+    size_t p0 = qbuf.arr_append_obj(projs);
+    qbuf.set_str(p0, "alias"_hk, "DataObject");
+    qbuf.set_str(p0, "property"_hk, "n");
+    size_t p1 = qbuf.arr_append_obj(projs);
+    qbuf.set_str(p1, "alias"_hk, "DataObject");
+    qbuf.set_str(p1, "property"_hk, "s");
+
+    lite3cpp::Buffer flat_resp = client.resume_query_buffer(1, {}, qbuf);
+    ASSERT_GE(flat_resp.size(), sizeof(lite3cpp::PackedNodeLayout));
+    lite3cpp::NodeView rnv(reinterpret_cast<const lite3cpp::PackedNodeLayout*>(flat_resp.data()));
+    ASSERT_EQ(rnv.type(), lite3cpp::Type::Array);
+    ASSERT_EQ(rnv.size(), 1u);
+    size_t row0 = flat_resp.arr_get_arr(0, 0);
+    EXPECT_EQ(flat_resp.arr_get_str(row0, 0), "center_obj");
+    EXPECT_EQ(flat_resp.arr_get_str(row0, 1), "512");
+
+    server.stop();
+}
+
+TEST(ServerConcurrencyTest, RealServerAuthEnforcementAndConcurrentTlsSockets) {
+    using namespace lite3cpp::literals;
+    uint16_t zmq_port = g_test_port.fetch_add(2);
+    uint16_t http_port = zmq_port + 1;
+    std::string db = "test_real_svr_auth_" + std::to_string(zmq_port);
+    const std::string secret = "super-secret-wave2b";
+
+    RealServerProcess server(zmq_port, http_port, db, secret);
+    server.start();
+
+    // 1. Unauthenticated ZMQ_DEALER socket MUST be rejected before "A", and wrong secret rejected
+    {
+        zmq::context_t ctx(1);
+        zmq::socket_t sock(ctx, zmq::socket_type::dealer);
+        sock.set(zmq::sockopt::rcvtimeo, 2000);
+        sock.set(zmq::sockopt::linger, 0);
+        sock.connect("tcp://127.0.0.1:" + std::to_string(zmq_port));
+
+        uint32_t pid = 0;
+        sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+        sock.send(zmq::message_t(&pid, 4), zmq::send_flags::sndmore);
+        sock.send(zmq::message_t("P", 1), zmq::send_flags::sndmore);
+        sock.send(zmq::message_t("unauth_k", 8), zmq::send_flags::sndmore);
+        sock.send(zmq::message_t("val", 3), zmq::send_flags::none);
+        std::vector<zmq::message_t> resp;
+        ASSERT_TRUE(zmq::recv_multipart(sock, std::back_inserter(resp)));
+        ASSERT_GE(resp.size(), 2u);
+        EXPECT_EQ(resp[1].to_string(), "ERR_UNAUTH");
+
+        // Wrong secret on "A"
+        resp.clear();
+        sock.send(zmq::message_t(), zmq::send_flags::sndmore);
+        sock.send(zmq::message_t(&pid, 4), zmq::send_flags::sndmore);
+        sock.send(zmq::message_t("A", 1), zmq::send_flags::sndmore);
+        sock.send(zmq::message_t("2", 1), zmq::send_flags::sndmore);
+        sock.send(zmq::message_t("wrong-secret", 12), zmq::send_flags::none);
+        ASSERT_TRUE(zmq::recv_multipart(sock, std::back_inserter(resp)));
+        ASSERT_GE(resp.size(), 2u);
+        EXPECT_EQ(resp[1].to_string(), "ERR_AUTH");
+
+        sock.close();
+        ctx.close();
+    }
+
+    // 2. Authenticated RemoteL3KVClient with 8 concurrent threads sharing ONE client instance
+    l3kvg::Settings csettings;
+    csettings.node_id = 2;
+    csettings.fed_timeout_ms = 3000;
+    l3kvg::RemoteL3KVClient client(csettings);
+    client.set_auth_secret(secret);
+    client.add_peer(1, "tcp://127.0.0.1:" + std::to_string(zmq_port));
+
+    l3kvg::MutationBatch seed;
+    seed.put_node(0x9001, R"({"n":"authed_node"})");
+    seed.add_edge(0x9001, "REL", 1.0, 0x9002);
+    ASSERT_TRUE(client.execute_batch(1, seed.get_buffer()));
+
+    std::atomic<int> ok_ops{0};
+    std::vector<std::thread> threads;
+    for (int t = 0; t < 8; ++t) {
+        threads.emplace_back([&client, &ok_ops]() {
+            for (int i = 0; i < 25; ++i) {
+                std::vector<l3kvg::GraphReadOp> ops = {
+                    {l3kvg::GraphReadKind::NodePayload, 0x9001, "", 0.0},
+                    {l3kvg::GraphReadKind::OutNeighbors, 0x9001, "REL", 0.0}
+                };
+                auto res = client.execute_multi_read(1, ops);
+                if (res.size() == 2 && res[0].found && res[1].neighbors.size() == 1 && res[1].neighbors[0] == 0x9002) {
+                    ok_ops.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        });
+    }
+    for (auto& th : threads) th.join();
+    EXPECT_EQ(ok_ops.load(), 8 * 25);
+
+    server.stop();
+}
+
+TEST(ServerConcurrencyTest, SynchronousClientParallelismWithoutGlobalSocketLock) {
+    uint16_t port = g_test_port.fetch_add(1);
+    std::atomic<bool> running{true};
+
+    // Multi-worker ZMQ proxy where each worker sleeps 40ms before replying.
+    // 8 serialized requests would take >= 320ms; 8 parallel thread_local DEALER sockets take ~40-80ms!
+    zmq::context_t ctx(1);
+    zmq::socket_t frontend(ctx, zmq::socket_type::router);
+    frontend.set(zmq::sockopt::linger, 0);
+    frontend.bind("tcp://127.0.0.1:" + std::to_string(port));
+
+    std::string inproc = "inproc://delay_workers_" + std::to_string(port);
+    zmq::socket_t backend(ctx, zmq::socket_type::dealer);
+    backend.set(zmq::sockopt::linger, 0);
+    backend.bind(inproc);
+
+    std::vector<std::thread> workers;
+    for (int w = 0; w < 8; ++w) {
+        workers.emplace_back([&ctx, &running, inproc]() {
+            zmq::socket_t ws(ctx, zmq::socket_type::dealer);
+            ws.set(zmq::sockopt::rcvtimeo, 100);
+            ws.set(zmq::sockopt::linger, 0);
+            ws.connect(inproc);
+            while (running.load(std::memory_order_relaxed)) {
+                std::vector<zmq::message_t> msgs;
+                try {
+                    if (!zmq::recv_multipart(ws, std::back_inserter(msgs)) || msgs.size() < 4) continue;
+                } catch (...) { break; }
+                std::this_thread::sleep_for(std::chrono::milliseconds(40));
+                ws.send(msgs[0], zmq::send_flags::sndmore);
+                ws.send(zmq::message_t(), zmq::send_flags::sndmore);
+                ws.send(zmq::message_t("val_ok", 6), zmq::send_flags::none);
+            }
+        });
+    }
+    std::thread proxy_t([&]() {
+        try { zmq::proxy(frontend, backend); } catch (...) {}
+    });
+
+    l3kvg::Settings csettings;
+    csettings.fed_timeout_ms = 3000;
+    l3kvg::RemoteL3KVClient client(csettings);
+    client.add_peer(1, "tcp://127.0.0.1:" + std::to_string(port));
+
+    // Warm up each thread's thread_local socket once, then time 8 simultaneous calls
+    std::atomic<int> ready{0};
+    std::atomic<bool> go{false};
+    std::atomic<int> matched{0};
+    std::vector<std::thread> callers;
+    for (int t = 0; t < 8; ++t) {
+        callers.emplace_back([&]() {
+            (void)client.get_raw_key(1, "warmup");
+            ready.fetch_add(1, std::memory_order_release);
+            while (!go.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            if (client.get_raw_key(1, "parallel_key") == "val_ok") {
+                matched.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+    while (ready.load(std::memory_order_acquire) < 8) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+
+    auto t0 = std::chrono::steady_clock::now();
+    go.store(true, std::memory_order_release);
+    for (auto& c : callers) c.join();
+    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+
+    EXPECT_EQ(matched.load(), 8);
+    // Serialized behind a single socket mutex would require >= 8 * 40ms = 320ms.
+    EXPECT_LT(elapsed_ms, 220) << "Expected parallel thread_local socket execution, got " << elapsed_ms << " ms";
+
+    running.store(false, std::memory_order_relaxed);
+    try { ctx.shutdown(); } catch (...) {}
+    if (proxy_t.joinable()) proxy_t.join();
+    for (auto& w : workers) if (w.joinable()) w.join();
+    frontend.close();
+    backend.close();
+    ctx.close();
+}
+
 

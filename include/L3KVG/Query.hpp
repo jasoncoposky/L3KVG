@@ -32,8 +32,14 @@ public:
   struct Filter {
     std::string alias;
     std::string key;
-    Op op;
+    Op op = Op::Eq;
     std::string value;
+    uint32_t key_hash = 0;
+    bool numeric_ready = false;
+    bool has_i64 = false;
+    bool has_f64 = false;
+    int64_t i64_val = 0;
+    double f64_val = 0.0;
   };
 
   struct FilterGroup;
@@ -110,13 +116,22 @@ public:
 
   // Execution
   std::vector<ResultRow> execute();
+  lite3cpp::Buffer execute_to_flat_buffer();
+  lite3cpp::Buffer execute_to_buffer();
 
-  // Federation Support
+  // Federation & Server Extensions
   static lite3cpp::Buffer serialize_results(const std::vector<ResultRow>& rows);
+  static lite3cpp::Buffer serialize_flat_results(const std::vector<ResultRow>& rows);
   Query &resume(const std::vector<uint64_t>& starting_nodes, const lite3cpp::Buffer& query_buf);
   Query &resume(const std::vector<uint64_t>& starting_nodes, std::string_view query_payload);
 
   Query &set_principal_id(uint32_t uid) { principal_id_ = uid; return *this; }
+  Query &set_start_index_prefix(std::string_view prefix) { start_index_prefix_.assign(prefix.data(), prefix.size()); return *this; }
+  const std::string& get_start_index_prefix() const noexcept { return start_index_prefix_; }
+  Query &set_flat_rows(bool enable = true) noexcept { flat_rows_ = enable; return *this; }
+  bool is_flat_rows() const noexcept { return flat_rows_; }
+  Query &set_populate_fields(bool enable) noexcept { populate_fields_ = enable; return *this; }
+  bool get_populate_fields() const noexcept { return populate_fields_; }
 
   bool is_federated_branch_ = false;
 
@@ -124,7 +139,10 @@ private:
   Engine *engine_;
   uint32_t principal_id_ = INTERNAL_UID;
   std::vector<uint64_t> starting_nodes_;
+  std::string start_index_prefix_;
   std::string root_alias_ = "__root";
+  bool flat_rows_ = false;
+  bool populate_fields_ = true;
 
   // AST State
   struct MatchStep {
