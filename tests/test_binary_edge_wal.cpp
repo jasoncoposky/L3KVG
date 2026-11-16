@@ -231,14 +231,14 @@ TEST(BinaryEdgeWALTest, DeletionTombstones) {
             .weight = 3.0f
         });
 
-        // Delete edge 10 -> 20 (label 1)
+        // Delete edge 10 -> 20 (label 1) using wildcard weight (-1.0f)
         l3kvg::EdgeMutationOp del_op{
             .src_id = 10,
             .dst_id = 20,
             .hlc_timestamp = 103,
             .label_id = 1,
             .flags = l3kvg::EdgeMutationOp::OP_DELETE,
-            .weight = 0.0f
+            .weight = -1.0f
         };
         EXPECT_TRUE(del_op.is_delete());
         wal.append(del_op);

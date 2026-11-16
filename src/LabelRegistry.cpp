@@ -30,6 +30,9 @@ uint16_t LabelRegistry::get_or_register(std::string_view label) {
     if (label.empty()) {
         return 0;
     }
+    if (label.find('\n') != std::string_view::npos || label.find('\r') != std::string_view::npos) {
+        throw std::invalid_argument("LabelRegistry: edge label must not contain newline characters");
+    }
 
     thread_local const LabelRegistry* tl_last_registry = nullptr;
     thread_local uint64_t tl_last_instance_id = 0;
@@ -68,7 +71,11 @@ uint16_t LabelRegistry::get_or_register(std::string_view label) {
     std::string_view stored_view = id_to_label_.back();
     label_to_id_[stored_view] = new_id;
     if (!dict_path_.empty()) {
-        persist_unlocked();
+        if (!persist_unlocked()) {
+            label_to_id_.erase(stored_view);
+            id_to_label_.pop_back();
+            throw std::runtime_error("Failed to persist label dictionary to " + dict_path_);
+        }
     }
     tl_last_registry = this;
     tl_last_instance_id = instance_id_;

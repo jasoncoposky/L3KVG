@@ -8,16 +8,24 @@ namespace l3kvg {
 namespace {
 
 [[nodiscard]] inline bool same_edge_weight(float w1, float w2) noexcept {
-    return (std::isnan(w1) && std::isnan(w2)) || std::abs(w1 - w2) < 1e-5f;
+    if (w1 == w2) return true;
+    if (std::isnan(w1) && std::isnan(w2)) return true;
+    return std::abs(w1 - w2) < 1e-5f;
 }
 
 inline void update_existing_edge_in_place(PackedEdge& existing, const PackedEdge& incoming) noexcept {
     existing.weight = incoming.weight;
-    existing.hlc_timestamp = incoming.hlc_timestamp;
-    existing.flags = static_cast<uint16_t>(
-        (existing.flags & ~PackedEdge::FLAG_HAS_PROPERTIES) |
-        (incoming.flags & (PackedEdge::FLAG_HAS_PROPERTIES | PackedEdge::FLAG_DIRECTED)) |
-        PackedEdge::FLAG_ACTIVE);
+    if (incoming.has_properties()) {
+        existing.hlc_timestamp = incoming.hlc_timestamp;
+        existing.flags = static_cast<uint16_t>(
+            existing.flags | PackedEdge::FLAG_HAS_PROPERTIES |
+            (incoming.flags & PackedEdge::FLAG_DIRECTED) |
+            PackedEdge::FLAG_ACTIVE);
+    } else {
+        existing.flags = static_cast<uint16_t>(
+            existing.flags | (incoming.flags & PackedEdge::FLAG_DIRECTED) |
+            PackedEdge::FLAG_ACTIVE);
+    }
 }
 
 } // namespace

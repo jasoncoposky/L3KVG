@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <memory>
 #include <mutex>
@@ -136,6 +137,7 @@ private:
   AdjacencyStore adjacency_store_;
   std::unique_ptr<BinaryEdgeWAL> edge_wal_;
   std::mutex local_edge_mu_;
+  std::array<std::mutex, 64> node_rmw_locks_;
 
   std::unique_ptr<l3kv::Engine> store_;
   FederationResolver resolver_;

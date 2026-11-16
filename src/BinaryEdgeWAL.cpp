@@ -127,7 +127,6 @@ void BinaryEdgeWAL::close_unlocked() {
         if (buffer_len_ > 0) {
             try {
                 write_all_unlocked(buffer_.data(), buffer_len_);
-                buffer_len_ = 0;
             } catch (...) {}
         }
 #if defined(__linux__)
@@ -140,6 +139,7 @@ void BinaryEdgeWAL::close_unlocked() {
         ::close(fd_);
         fd_ = -1;
     }
+    buffer_len_ = 0;
 }
 
 void BinaryEdgeWAL::append_unlocked(const EdgeMutationOp& op) {
@@ -289,7 +289,7 @@ size_t BinaryEdgeWAL::recover(AdjacencyStore& store) {
         for (size_t i = 0; i < full_records; ++i) {
             const auto& op = ops[i];
             if (op.is_delete()) {
-                store.del_edge(op.src_id, op.dst_id, op.label_id, op.weight <= 0.0f ? -1.0f : op.weight);
+                store.del_edge(op.src_id, op.dst_id, op.label_id, op.weight < 0.0f ? -1.0f : op.weight);
             } else {
                 store.add_edge(op.src_id, op.dst_id, op.label_id, op.weight, op.flags, 0, op.hlc_timestamp);
             }

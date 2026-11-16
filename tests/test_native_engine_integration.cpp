@@ -888,3 +888,58 @@ TEST(NativeEngineIntegrationTest, AdjacencyStoreTombstoneSlotReuseBoundsPages) {
     EXPECT_GE(page_chain_len, 1u);
     EXPECT_LE(page_chain_len, 2u);
 }
+
+TEST(NativeEngineIntegrationTest, ZeroWeightEdgeDeletionRecoveryAndIdempotentPropertyPreservation) {
+    TempDir temp_dir("test_zero_weight_and_prop_preserve_db");
+    const std::string& db_dir = temp_dir.path;
+
+    uint64_t initial_prop_hlc = 0;
+
+    {
+        l3kvg::Settings settings;
+        l3kvg::Engine engine(db_dir, 1, nullptr, 4, settings);
+
+        // 1. Parallel edges with weight 0.0 and 2.5; deleting 0.0 must NOT wildcard-delete 2.5 on WAL recovery
+        engine.add_edge(700, "WEIGHTED_REL", 0.0, 701);
+        engine.add_edge(700, "WEIGHTED_REL", 2.5, 701);
+        EXPECT_EQ(engine.get_adjacency_store().get_out_degree(700), 2u);
+
+        engine.del_edge(700, "WEIGHTED_REL", 0.0, 701);
+        EXPECT_EQ(engine.get_adjacency_store().get_out_degree(700), 1u);
+
+        // 2. Property-bearing edge followed by idempotent featureless add_edge must preserve FLAG_HAS_PROPERTIES & HLC
+        engine.add_edge(800, "HAS_META", 1.0, 801, R"({"tag":"preserved"})");
+        auto snap_before = engine.get_adjacency_store().get_outgoing_edges_snapshot(800);
+        ASSERT_EQ(snap_before.size(), 1u);
+        ASSERT_TRUE(snap_before[0].has_properties());
+        initial_prop_hlc = snap_before[0].hlc_timestamp;
+
+        // Idempotent featureless re-add
+        engine.add_edge(800, "HAS_META", 1.0, 801);
+        auto snap_after = engine.get_adjacency_store().get_outgoing_edges_snapshot(800);
+        ASSERT_EQ(snap_after.size(), 1u);
+        EXPECT_TRUE(snap_after[0].has_properties());
+        EXPECT_EQ(snap_after[0].hlc_timestamp, initial_prop_hlc);
+
+        // Newlines in labels must throw std::invalid_argument
+        EXPECT_THROW(engine.add_edge(800, "BAD\nLABEL", 1.0, 801), std::invalid_argument);
+        EXPECT_THROW(engine.add_edge(800, "BAD\rLABEL", 1.0, 801), std::invalid_argument);
+
+        engine.flush();
+    }
+
+    // Reopen and verify weight 2.5 survived recovery (0.0 stayed deleted) and properties survived
+    {
+        l3kvg::Settings settings;
+        l3kvg::Engine engine2(db_dir, 1, nullptr, 4, settings);
+
+        EXPECT_EQ(engine2.get_adjacency_store().get_out_degree(700), 1u);
+        auto neigh_high = engine2.get_node(700)->get_neighbors("WEIGHTED_REL", 2.0);
+        ASSERT_EQ(neigh_high.size(), 1u);
+        EXPECT_EQ(neigh_high[0], 701u);
+
+        auto edges_800 = engine2.get_node(800)->get_edges("HAS_META");
+        ASSERT_EQ(edges_800.size(), 1u);
+        EXPECT_EQ(edges_800[0]->get_attribute<std::string>("tag"), "preserved");
+    }
+}
