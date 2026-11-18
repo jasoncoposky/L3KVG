@@ -10,16 +10,19 @@ L3KVG is a C++20 embedded property graph engine built on a **Bifurcated Native G
 
 ## ⚡ Groundbreaking Performance Benchmarks
 
-### 1. Native Substrate Micro-Benchmarks (`bench_bifurcated_substrate`)
+### 1. Native Substrate Micro-Benchmarks (`bench_bifurcated_substrate`, `Release -O3`)
 Evaluated across 100,000 nodes, 1,000,000 neighbor traversals, and 10,000 multi-hop branching joins:
 
 | Metric / Workload | Empirical Measurement | Production SLA | Speedup vs Baseline |
 | :--- | :---: | :---: | :---: |
-| **Raw Edge Ingestion** | **184,146 edges/sec** | > 150,000 edges/sec | **~19.4x** (vs 9.5k baseline) |
-| **Point Hop Traversal Latency** | **18.40 ns / hop** | < 50.00 ns / hop | **~2.7x faster than SLA** |
-| **SIMD Predicate Filter (AVX2)** | **473 ns / 1,000 edges** | < 2,000 ns / 1k edges | **4.2x faster than SLA** |
-| **Chained 4KB Page Traversal** | **466 ns across 600 edges** | < 1,500 ns | **3.2x faster than SLA** |
-| **Complex Branching Join (`OBJ_STAT`)** | **10.15 µs** | < 20.00 µs | **9.6x speedup** (vs 97.3 µs baseline) |
+| **Raw Edge Ingestion** | **224,728 edges/sec** (`0.445s`) | > 150,000 edges/sec | **~23.7x** (vs 9.5k baseline) |
+| **Point Hop Traversal Latency** | **16.70 ns / hop** (visitor) · **20.54 ns / hop** (span) | < 50.00 ns / hop | **~3.0x faster than SLA** |
+| **SIMD Predicate Filter (AVX2)** | **486 ns / 1,000 edges** | < 2,000 ns / 1k edges | **4.1x faster than SLA** |
+| **Chained 4KB Page Traversal** | **484 ns across 600 edges** | < 1,500 ns | **3.1x faster than SLA** |
+| **Complex Branching Join (`OBJ_STAT`)** | **6.68 µs** | < 20.00 µs | **14.6x speedup** (vs 97.3 µs baseline) |
+
+- **`bench_engine_core` (10k nodes):** `146,194 nodes/sec` put (`68.4 ms`), `0.484 µs` get (`4.84 ms`).
+- **`bench_l3kvg` (10k nodes/edges):** `67,309 ops/sec` concurrent atomic `add_edge`, `0.349 µs` 50-fanout traversal (`[SUCCESS] SRE Metrics Achieved!`).
 
 ### 2. Enterprise Catalog Qualification: L3KVG vs. PostgreSQL 16
 Evaluated against PostgreSQL 16 on live iRODS 5.1.0 catalog macro-workloads (1K Scale Tier: 1,000 data objects, 50 collections, depth 2, 300 queries per pass):
@@ -77,11 +80,11 @@ flowchart LR
    - 4KB cache-aligned memory blocks holding up to 170 packed edges per page.
    - Symmetrically stores both outgoing and incoming edges.
    - Dynamic page chaining (`next_page_id`) handles high-fanout supernodes without memory fragmentation.
-   - 64-shard storage with SplitMix64 hashing and monotonic deadlock-free shard locking.
+   - 64-shard `FlatVertexMap` directory with SplitMix64 hashing, 64-byte `SmallInPool` for degree $\le 2$ incoming edges, and monotonic deadlock-free shard locking.
 4. **`SIMDFilter` Vectorized Predicate Engine:**
    - Evaluates label matching and float weight thresholds using AVX2 vector gathers (`_mm256_i32gather_epi32`, `_mm256_cmp_ps`, `_mm256_movemask_ps`).
    - Mechanical sympathy branchless scalar fallback ensuring identical semantics across architectures.
-   - Prunes 1,000 edges in **473 nanoseconds**.
+   - Prunes 1,000 edges in **486 nanoseconds**.
 5. **Compact `BinaryEdgeWAL` & Fast Crash Recovery:**
    - 32-byte binary `EdgeMutationOp` structs appended directly to disk.
    - 64KB user-space buffering with POSIX `fdatasync` durability.
@@ -118,7 +121,7 @@ cmake -B build -S . -G Ninja -DCMAKE_BUILD_TYPE=Release
 ninja -C build
 ```
 
-### Run CTest Suite (26/26 Suites Passing Cleanly)
+### Run CTest Suite (37/37 Suites Passing Cleanly)
 ```bash
 ctest --test-dir build --output-on-failure
 ```
