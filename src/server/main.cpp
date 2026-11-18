@@ -763,6 +763,8 @@ static void worker_routine(
     try {
         zmq::socket_t worker_sock(*ctx, zmq::socket_type::dealer);
         worker_sock.set(zmq::sockopt::rcvtimeo, 250);
+        worker_sock.set(zmq::sockopt::rcvhwm, 0);
+        worker_sock.set(zmq::sockopt::sndhwm, 0);
         worker_sock.set(zmq::sockopt::linger, 0);
         worker_sock.connect("inproc://workers");
 
@@ -827,15 +829,20 @@ int main(int argc, char *argv[]) {
 #endif
 
     AuthRegistry auth_registry;
-    zmq::context_t ctx(1);
+    const int zmq_io_threads = static_cast<int>(std::clamp(cfg.num_workers / 2, 2u, 4u));
+    zmq::context_t ctx(zmq_io_threads);
 
     zmq::socket_t frontend(ctx, zmq::socket_type::router);
     frontend.set(zmq::sockopt::linger, 0);
+    frontend.set(zmq::sockopt::rcvhwm, 0);
+    frontend.set(zmq::sockopt::sndhwm, 0);
     std::string zmq_endpoint = "tcp://0.0.0.0:" + std::to_string(cfg.zmq_port);
     frontend.bind(zmq_endpoint);
 
     zmq::socket_t backend(ctx, zmq::socket_type::dealer);
     backend.set(zmq::sockopt::linger, 0);
+    backend.set(zmq::sockopt::rcvhwm, 0);
+    backend.set(zmq::sockopt::sndhwm, 0);
     backend.bind("inproc://workers");
 
     std::vector<std::thread> worker_threads;
@@ -844,9 +851,50 @@ int main(int argc, char *argv[]) {
         worker_threads.emplace_back(worker_routine, &ctx, engine.get(), std::cref(cfg), std::ref(auth_registry), std::ref(s_running));
     }
 
-    std::thread routing_thread([&frontend, &backend]() {
+    std::thread routing_thread([&frontend, &backend, &engine, &cfg, &auth_registry]() {
         try {
-            zmq::proxy(frontend, backend);
+            std::vector<zmq::message_t> msgs;
+            msgs.reserve(8);
+            zmq::pollitem_t items[] = {
+                {frontend.handle(), 0, ZMQ_POLLIN, 0},
+                {backend.handle(), 0, ZMQ_POLLIN, 0}
+            };
+            while (s_running.load(std::memory_order_relaxed)) {
+                int rc = zmq::poll(items, 2, std::chrono::milliseconds(250));
+                if (rc <= 0) continue;
+
+                if (items[0].revents & ZMQ_POLLIN) {
+                    while (true) {
+                        msgs.clear();
+                        auto res = zmq::recv_multipart(frontend, std::back_inserter(msgs), zmq::recv_flags::dontwait);
+                        if (!res || msgs.empty()) break;
+
+                        // Peek opcode: [identity][empty?][pid(4B)?][opcode]
+                        size_t idx = 1;
+                        if (idx < msgs.size() && msgs[idx].size() == 0) ++idx;
+                        if (idx + 1 < msgs.size() && msgs[idx].size() == 4) ++idx;
+                        bool offload = false;
+                        if (idx < msgs.size()) {
+                            std::string_view op(static_cast<const char*>(msgs[idx].data()), msgs[idx].size());
+                            offload = (op == "R" || op == "K");
+                        }
+                        if (offload) {
+                            zmq::send_multipart(backend, msgs);
+                        } else {
+                            process_request(engine.get(), cfg, auth_registry, frontend, msgs);
+                        }
+                    }
+                }
+
+                if (items[1].revents & ZMQ_POLLIN) {
+                    while (true) {
+                        msgs.clear();
+                        auto res = zmq::recv_multipart(backend, std::back_inserter(msgs), zmq::recv_flags::dontwait);
+                        if (!res || msgs.empty()) break;
+                        zmq::send_multipart(frontend, msgs);
+                    }
+                }
+            }
         } catch (...) {}
     });
 

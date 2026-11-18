@@ -200,7 +200,7 @@ RemoteL3KVClient::RemoteL3KVClient(const Settings& settings)
       settings_(settings),
       socket_registry_(std::make_shared<SocketRegistry>()),
       zmq_sndhwm_(settings.zmq_sndhwm),
-      zmq_ctx_(1),
+      zmq_ctx_(2),
       creator_pid_(getpid()) {
     health_check_thread_ = std::thread(&RemoteL3KVClient::run_health_check_loop, this);
 }
@@ -250,13 +250,9 @@ void RemoteL3KVClient::set_auth_secret(const std::string& secret) {
     std::lock_guard<std::mutex> lock(endpoints_mutex_);
     if (auth_secret_ != secret) {
         auth_secret_ = secret;
+        has_auth_secret_.store(!auth_secret_.empty(), std::memory_order_release);
         config_epoch_.fetch_add(1, std::memory_order_release);
     }
-}
-
-bool RemoteL3KVClient::has_auth_secret() {
-    std::lock_guard<std::mutex> lock(endpoints_mutex_);
-    return !auth_secret_.empty();
 }
 
 void RemoteL3KVClient::add_peer(lite3::NodeID node_id, const std::string& endpoint_url) {
@@ -360,14 +356,9 @@ RemoteL3KVClient::TlSocketBox* RemoteL3KVClient::get_or_create_tl_socket(
     // Fast path: thread_local lookup without locking endpoints_mutex_
     if (auto it = tl_map.find(key); it != tl_map.end()) {
         auto* box = it->second.box.get();
-        if (box && box->socket && box->config_epoch == curr_epoch && !it->second.weak_registry.expired()) {
-            auto peer = get_peer_state(node_id);
-            if (!peer) {
-                tl_map.erase(it);
-                return nullptr;
-            }
-            if (out_peer) *out_peer = peer;
-            check_circuit(*peer);
+        if (box && box->socket && box->peer && box->config_epoch == curr_epoch && !it->second.weak_registry.expired()) {
+            if (out_peer) *out_peer = box->peer;
+            check_circuit(*box->peer);
             if (require_auth && !box->authenticated) {
                 ensure_socket_authenticated(*box, node_id);
             }
@@ -401,10 +392,12 @@ RemoteL3KVClient::TlSocketBox* RemoteL3KVClient::get_or_create_tl_socket(
     check_circuit(*peer);
 
     auto new_box = std::make_shared<TlSocketBox>();
+    new_box->peer = peer;
     new_box->endpoint = peer->endpoint;
     new_box->config_epoch = config_epoch_.load(std::memory_order_acquire);
     new_box->socket = std::make_unique<zmq::socket_t>(zmq_ctx_, ZMQ_DEALER);
     new_box->socket->set(zmq::sockopt::sndhwm, zmq_sndhwm_);
+    new_box->socket->set(zmq::sockopt::rcvhwm, 0);
     new_box->socket->set(zmq::sockopt::linger, 0);
     new_box->socket->set(zmq::sockopt::rcvtimeo, settings_.fed_timeout_ms);
     new_box->socket->set(zmq::sockopt::sndtimeo, settings_.fed_timeout_ms);
@@ -429,16 +422,18 @@ RemoteL3KVClient::TlSocketBox* RemoteL3KVClient::get_or_create_tl_socket(
 }
 
 template <typename SendFn>
-std::vector<zmq::message_t>& RemoteL3KVClient::send_and_recv_rpc(
+std::vector<zmq::message_t>* RemoteL3KVClient::send_and_recv_rpc_opt(
     lite3::NodeID peer_id,
     SendFn&& send_fn,
-    const char* timeout_msg) {
+    const char* timeout_msg,
+    PeerState** out_peer) {
     const bool can_reauth = has_auth_secret();
     for (int attempt = 0; attempt < 2; ++attempt) {
         TlSocketBox* box = get_or_create_tl_socket(peer_id);
         if (!box || !box->socket) {
-            throw std::runtime_error("Peer not connected");
+            return nullptr;
         }
+        if (out_peer) *out_peer = box->peer.get();
         auto& recv_msgs = get_tl_recv_msgs();
         bool io_ok = false;
         try {
@@ -446,13 +441,17 @@ std::vector<zmq::message_t>& RemoteL3KVClient::send_and_recv_rpc(
             auto res = zmq::recv_multipart(*box->socket, std::back_inserter(recv_msgs));
             io_ok = (res.has_value() && recv_msgs.size() >= 2);
         } catch (...) {
+            PeerState* p = box->peer.get();
             invalidate_tl_socket(peer_id, box);
-            report_failure(peer_id);
+            if (p) report_failure_peer(*p);
+            else report_failure(peer_id);
             throw;
         }
         if (!io_ok) {
+            PeerState* p = box->peer.get();
             invalidate_tl_socket(peer_id, box);
-            report_failure(peer_id);
+            if (p) report_failure_peer(*p);
+            else report_failure(peer_id);
             throw FederationTimeoutException(timeout_msg);
         }
         if (attempt == 0 && can_reauth && is_unauth_frame(recv_msgs[1])) {
@@ -460,9 +459,22 @@ std::vector<zmq::message_t>& RemoteL3KVClient::send_and_recv_rpc(
             ensure_socket_authenticated(*box, peer_id);
             continue;
         }
-        return recv_msgs;
+        return &recv_msgs;
     }
     throw FederationTimeoutException(timeout_msg);
+}
+
+template <typename SendFn>
+std::vector<zmq::message_t>& RemoteL3KVClient::send_and_recv_rpc(
+    lite3::NodeID peer_id,
+    SendFn&& send_fn,
+    const char* timeout_msg,
+    PeerState** out_peer) {
+    auto* res = send_and_recv_rpc_opt(peer_id, std::forward<SendFn>(send_fn), timeout_msg, out_peer);
+    if (!res) {
+        throw std::runtime_error("Peer not connected");
+    }
+    return *res;
 }
 
 void RemoteL3KVClient::run_health_check_loop() {
@@ -516,9 +528,8 @@ void RemoteL3KVClient::run_health_check_loop() {
 // ============================================================================
 
 std::string RemoteL3KVClient::get_raw_key(lite3::NodeID owner_id, std::string_view key, uint32_t principal_id) {
-    if (!get_peer_state(owner_id)) return {};
-
-    auto& recv_msgs = send_and_recv_rpc(
+    PeerState* peer = nullptr;
+    auto* recv_msgs = send_and_recv_rpc_opt(
         owner_id,
         [&](zmq::socket_t& sock) {
             sock.send(zmq::message_t(), zmq::send_flags::sndmore);
@@ -527,14 +538,20 @@ std::string RemoteL3KVClient::get_raw_key(lite3::NodeID owner_id, std::string_vi
             sock.send(zmq::message_t("G", 1), zmq::send_flags::sndmore);
             sock.send(zmq::message_t(key.data(), key.size()), zmq::send_flags::none);
         },
-        "Raw key fetch timed out");
+        "Raw key fetch timed out",
+        &peer);
+    if (!recv_msgs) return {};
 
-    const auto& msg = recv_msgs[1];
+    const auto& msg = (*recv_msgs)[1];
     if (is_err_frame(msg)) {
-        if (is_server_err_frame(msg)) report_failure(owner_id);
+        if (is_server_err_frame(msg)) {
+            if (peer) report_failure_peer(*peer);
+            else report_failure(owner_id);
+        }
         return {};
     }
-    report_success(owner_id);
+    if (peer) report_success_peer(*peer);
+    else report_success(owner_id);
     return std::string(static_cast<const char*>(msg.data()), msg.size());
 }
 
@@ -543,10 +560,9 @@ std::string RemoteL3KVClient::get_node_payload(lite3::NodeID owner_id, uint64_t 
 }
 
 lite3cpp::Buffer RemoteL3KVClient::get_node_buffer(lite3::NodeID owner_id, uint64_t target_node_id, uint32_t principal_id) {
-    if (!get_peer_state(owner_id)) return {};
     std::string_view key = KeyBuilder::node_key(target_node_id);
-
-    auto& recv_msgs = send_and_recv_rpc(
+    PeerState* peer = nullptr;
+    auto* recv_msgs = send_and_recv_rpc_opt(
         owner_id,
         [&](zmq::socket_t& sock) {
             sock.send(zmq::message_t(), zmq::send_flags::sndmore);
@@ -555,18 +571,25 @@ lite3cpp::Buffer RemoteL3KVClient::get_node_buffer(lite3::NodeID owner_id, uint6
             sock.send(zmq::message_t("G", 1), zmq::send_flags::sndmore);
             sock.send(zmq::message_t(key.data(), key.size()), zmq::send_flags::none);
         },
-        "Node buffer fetch timed out");
+        "Node buffer fetch timed out",
+        &peer);
+    if (!recv_msgs) return {};
 
-    const auto& msg = recv_msgs[1];
+    const auto& msg = (*recv_msgs)[1];
     if (msg.size() == 0) {
-        report_success(owner_id);
+        if (peer) report_success_peer(*peer);
+        else report_success(owner_id);
         return {};
     }
     if (is_err_frame(msg)) {
-        if (is_server_err_frame(msg)) report_failure(owner_id);
+        if (is_server_err_frame(msg)) {
+            if (peer) report_failure_peer(*peer);
+            else report_failure(owner_id);
+        }
         return {};
     }
-    report_success(owner_id);
+    if (peer) report_success_peer(*peer);
+    else report_success(owner_id);
     const uint8_t* ptr = static_cast<const uint8_t*>(msg.data());
     if (msg.size() >= sizeof(lite3cpp::PackedNodeLayout) && (ptr[0] == 0x06 || ptr[0] == 0x07)) {
         return lite3cpp::Buffer(ptr, msg.size());
@@ -584,15 +607,14 @@ std::vector<uint64_t> RemoteL3KVClient::get_neighbors(
     std::string_view label,
     double min_weight,
     uint32_t principal_id) {
-    if (!get_peer_state(owner_id)) return {};
-
     char id_buf[17];
     std::snprintf(id_buf, sizeof(id_buf), "%016llx", static_cast<unsigned long long>(target_node_id));
     char w_buf[32];
     int w_len = std::snprintf(w_buf, sizeof(w_buf), "%.6f", min_weight);
     if (w_len < 0) w_len = 0;
 
-    auto& recv_msgs = send_and_recv_rpc(
+    PeerState* peer = nullptr;
+    auto* recv_msgs = send_and_recv_rpc_opt(
         owner_id,
         [&](zmq::socket_t& sock) {
             sock.send(zmq::message_t(), zmq::send_flags::sndmore);
@@ -603,14 +625,20 @@ std::vector<uint64_t> RemoteL3KVClient::get_neighbors(
             sock.send(zmq::message_t(label.data(), label.size()), zmq::send_flags::sndmore);
             sock.send(zmq::message_t(w_buf, static_cast<size_t>(w_len)), zmq::send_flags::none);
         },
-        "Neighbor fetch timed out");
+        "Neighbor fetch timed out",
+        &peer);
+    if (!recv_msgs) return {};
 
-    const auto& msg = recv_msgs[1];
+    const auto& msg = (*recv_msgs)[1];
     if (is_err_frame(msg)) {
-        if (!is_acl_err_frame(msg)) report_failure(owner_id);
+        if (!is_acl_err_frame(msg)) {
+            if (peer) report_failure_peer(*peer);
+            else report_failure(owner_id);
+        }
         return {};
     }
-    report_success(owner_id);
+    if (peer) report_success_peer(*peer);
+    else report_success(owner_id);
     return parse_neighbors_message(msg);
 }
 
@@ -619,12 +647,11 @@ std::vector<uint64_t> RemoteL3KVClient::get_in_neighbors(
     uint64_t target_node_id,
     std::string_view label,
     uint32_t principal_id) {
-    if (!get_peer_state(owner_id)) return {};
-
     char id_buf[17];
     std::snprintf(id_buf, sizeof(id_buf), "%016llx", static_cast<unsigned long long>(target_node_id));
 
-    auto& recv_msgs = send_and_recv_rpc(
+    PeerState* peer = nullptr;
+    auto* recv_msgs = send_and_recv_rpc_opt(
         owner_id,
         [&](zmq::socket_t& sock) {
             sock.send(zmq::message_t(), zmq::send_flags::sndmore);
@@ -634,14 +661,20 @@ std::vector<uint64_t> RemoteL3KVClient::get_in_neighbors(
             sock.send(zmq::message_t(id_buf, 16), zmq::send_flags::sndmore);
             sock.send(zmq::message_t(label.data(), label.size()), zmq::send_flags::none);
         },
-        "In-Neighbor fetch timed out");
+        "In-Neighbor fetch timed out",
+        &peer);
+    if (!recv_msgs) return {};
 
-    const auto& msg = recv_msgs[1];
+    const auto& msg = (*recv_msgs)[1];
     if (is_err_frame(msg)) {
-        if (!is_acl_err_frame(msg)) report_failure(owner_id);
+        if (!is_acl_err_frame(msg)) {
+            if (peer) report_failure_peer(*peer);
+            else report_failure(owner_id);
+        }
         return {};
     }
-    report_success(owner_id);
+    if (peer) report_success_peer(*peer);
+    else report_success(owner_id);
     return parse_neighbors_message(msg);
 }
 
@@ -743,10 +776,9 @@ bool RemoteL3KVClient::execute_batch(
     lite3::NodeID owner_id,
     const lite3cpp::Buffer& batch_buffer,
     uint32_t principal_id) {
-    if (!get_peer_state(owner_id)) return false;
-
     try {
-        auto& recv_msgs = send_and_recv_rpc(
+        PeerState* peer = nullptr;
+        auto* recv_msgs = send_and_recv_rpc_opt(
             owner_id,
             [&](zmq::socket_t& sock) {
                 sock.send(zmq::message_t(), zmq::send_flags::sndmore);
@@ -755,10 +787,13 @@ bool RemoteL3KVClient::execute_batch(
                 sock.send(zmq::message_t("B", 1), zmq::send_flags::sndmore);
                 sock.send(zmq::message_t(batch_buffer.data(), batch_buffer.size()), zmq::send_flags::none);
             },
-            "Batch execution timed out");
+            "Batch execution timed out",
+            &peer);
+        if (!recv_msgs) return false;
 
-        if (recv_msgs[1].size() == 2 && std::memcmp(recv_msgs[1].data(), "OK", 2) == 0) {
-            report_success(owner_id);
+        if ((*recv_msgs)[1].size() == 2 && std::memcmp((*recv_msgs)[1].data(), "OK", 2) == 0) {
+            if (peer) report_success_peer(*peer);
+            else report_success(owner_id);
             return true;
         }
         return false;
@@ -812,7 +847,7 @@ std::vector<GraphReadResult> RemoteL3KVClient::execute_multi_read(
     std::span<const GraphReadOp> ops,
     uint32_t principal_id) {
     using namespace lite3cpp::literals;
-    if (ops.empty() || !get_peer_state(owner_id)) return {};
+    if (ops.empty()) return {};
 
     thread_local lite3cpp::Buffer tl_req_buf;
     tl_req_buf.clear();
@@ -833,7 +868,8 @@ std::vector<GraphReadResult> RemoteL3KVClient::execute_multi_read(
         }
     }
 
-    auto& recv_msgs = send_and_recv_rpc(
+    PeerState* peer = nullptr;
+    auto* recv_msgs = send_and_recv_rpc_opt(
         owner_id,
         [&](zmq::socket_t& sock) {
             sock.send(zmq::message_t(), zmq::send_flags::sndmore);
@@ -842,14 +878,20 @@ std::vector<GraphReadResult> RemoteL3KVClient::execute_multi_read(
             sock.send(zmq::message_t("G", 1), zmq::send_flags::sndmore);
             sock.send(zmq::message_t(tl_req_buf.data(), tl_req_buf.size()), zmq::send_flags::none);
         },
-        "Graph multi-read timed out");
+        "Graph multi-read timed out",
+        &peer);
+    if (!recv_msgs) return {};
 
-    const auto& msg = recv_msgs[1];
+    const auto& msg = (*recv_msgs)[1];
     if (is_err_frame(msg)) {
-        if (!is_acl_err_frame(msg)) report_failure(owner_id);
+        if (!is_acl_err_frame(msg)) {
+            if (peer) report_failure_peer(*peer);
+            else report_failure(owner_id);
+        }
         return {};
     }
-    report_success(owner_id);
+    if (peer) report_success_peer(*peer);
+    else report_success(owner_id);
 
     std::vector<GraphReadResult> out;
     if (msg.size() >= sizeof(lite3cpp::PackedNodeLayout)) {
@@ -1626,35 +1668,41 @@ void RemoteL3KVClient::set_circuit_state(lite3::NodeID node_id, CircuitState sta
     }
 }
 
+void RemoteL3KVClient::report_failure_peer(PeerState& peer) noexcept {
+    std::lock_guard<std::mutex> lock(peer.state_mu);
+    CircuitState st = peer.state.load(std::memory_order_relaxed);
+    if (st == CircuitState::OPEN) return;
+
+    int failures = peer.consecutive_failures.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (st == CircuitState::HALF_OPEN || failures >= settings_.breaker_failure_threshold) {
+        peer.last_failure_ns.store(steady_now_ns(), std::memory_order_release);
+        peer.state.store(CircuitState::OPEN, std::memory_order_release);
+    }
+}
+
+void RemoteL3KVClient::report_success_peer(PeerState& peer) noexcept {
+    if (peer.consecutive_failures.load(std::memory_order_relaxed) == 0 &&
+        peer.state.load(std::memory_order_relaxed) == CircuitState::CLOSED) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(peer.state_mu);
+    peer.consecutive_failures.store(0, std::memory_order_relaxed);
+    if (peer.state.load(std::memory_order_relaxed) == CircuitState::HALF_OPEN) {
+        peer.state.store(CircuitState::CLOSED, std::memory_order_release);
+    }
+}
+
 void RemoteL3KVClient::report_failure(lite3::NodeID node_id) {
     auto peer = get_peer_state(node_id);
     if (!peer) return;
-
-    std::lock_guard<std::mutex> lock(peer->state_mu);
-    CircuitState st = peer->state.load(std::memory_order_relaxed);
-    if (st == CircuitState::OPEN) return;
-
-    int failures = peer->consecutive_failures.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (st == CircuitState::HALF_OPEN || failures >= settings_.breaker_failure_threshold) {
-        peer->last_failure_ns.store(steady_now_ns(), std::memory_order_release);
-        peer->state.store(CircuitState::OPEN, std::memory_order_release);
-    }
+    report_failure_peer(*peer);
 }
 
 void RemoteL3KVClient::report_success(lite3::NodeID node_id) {
     auto peer = get_peer_state(node_id);
     if (!peer) return;
-
-    if (peer->consecutive_failures.load(std::memory_order_relaxed) == 0 &&
-        peer->state.load(std::memory_order_relaxed) == CircuitState::CLOSED) {
-        return;
-    }
-
-    std::lock_guard<std::mutex> lock(peer->state_mu);
-    peer->consecutive_failures.store(0, std::memory_order_relaxed);
-    if (peer->state.load(std::memory_order_relaxed) == CircuitState::HALF_OPEN) {
-        peer->state.store(CircuitState::CLOSED, std::memory_order_release);
-    }
+    report_success_peer(*peer);
 }
 
 } // namespace l3kvg

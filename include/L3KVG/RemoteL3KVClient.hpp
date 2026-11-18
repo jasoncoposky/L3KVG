@@ -274,9 +274,18 @@ public:
     void report_failure(lite3::NodeID node_id);
     void report_success(lite3::NodeID node_id);
 
+    struct PeerState {
+        std::string endpoint;
+        std::mutex state_mu;
+        std::atomic<CircuitState> state{CircuitState::CLOSED};
+        std::atomic<int> consecutive_failures{0};
+        std::atomic<int64_t> last_failure_ns{0};
+    };
+
     struct TlSocketBox {
         std::mutex close_mu;
         std::unique_ptr<zmq::socket_t> socket;
+        std::shared_ptr<PeerState> peer;
         std::string endpoint;
         uint64_t config_epoch{0};
         bool authenticated{false};
@@ -301,24 +310,23 @@ public:
     };
 
 private:
-    struct PeerState {
-        std::string endpoint;
-        std::mutex state_mu;
-        std::atomic<CircuitState> state{CircuitState::CLOSED};
-        std::atomic<int> consecutive_failures{0};
-        std::atomic<int64_t> last_failure_ns{0};
-    };
-
-    bool has_auth_secret();
+    bool has_auth_secret() const noexcept {
+        return has_auth_secret_.load(std::memory_order_acquire);
+    }
     std::shared_ptr<PeerState> get_peer_state(lite3::NodeID node_id);
     TlSocketBox* get_or_create_tl_socket(lite3::NodeID node_id, std::shared_ptr<PeerState>* out_peer = nullptr, bool require_auth = true);
     void invalidate_tl_socket(lite3::NodeID node_id, TlSocketBox* box) noexcept;
     void ensure_socket_authenticated(TlSocketBox& box, lite3::NodeID node_id);
     void check_circuit(PeerState& peer);
+    void report_success_peer(PeerState& peer) noexcept;
+    void report_failure_peer(PeerState& peer) noexcept;
     void run_health_check_loop();
 
     template <typename SendFn>
-    std::vector<zmq::message_t>& send_and_recv_rpc(lite3::NodeID peer_id, SendFn&& send_fn, const char* timeout_msg);
+    std::vector<zmq::message_t>* send_and_recv_rpc_opt(lite3::NodeID peer_id, SendFn&& send_fn, const char* timeout_msg, PeerState** out_peer = nullptr);
+
+    template <typename SendFn>
+    std::vector<zmq::message_t>& send_and_recv_rpc(lite3::NodeID peer_id, SendFn&& send_fn, const char* timeout_msg, PeerState** out_peer = nullptr);
 
     bool put_key_bytes_sync(lite3::NodeID owner_id, std::string_view key, const void* data, size_t len, uint32_t principal_id);
     bool del_key_sync(lite3::NodeID owner_id, std::string_view key, uint32_t principal_id);
@@ -330,6 +338,7 @@ private:
 
     Settings settings_;
     std::string auth_secret_;
+    std::atomic<bool> has_auth_secret_{false};
     std::unordered_map<lite3::NodeID, std::shared_ptr<PeerState>> peers_;
     std::shared_ptr<SocketRegistry> socket_registry_;
     std::mutex endpoints_mutex_;

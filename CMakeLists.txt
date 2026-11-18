@@ -214,3 +214,7 @@ target_link_libraries(bench_unified PRIVATE l3kvg_engine Threads::Threads $<$<BO
 add_executable(bench_bifurcated_substrate tests/bench_bifurcated_substrate.cpp)
 target_link_libraries(bench_bifurcated_substrate PRIVATE l3kvg_engine Threads::Threads)
 
+add_executable(bench_zmq_scaling tests/bench_zmq_scaling.cpp)
+target_link_libraries(bench_zmq_scaling PRIVATE l3kvg_engine Threads::Threads)
+target_compile_definitions(bench_zmq_scaling PRIVATE L3KVG_SERVER_BIN="$<TARGET_FILE:l3kvg_server>")
+
