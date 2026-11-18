@@ -176,15 +176,48 @@ bool AdjacencyStore::add_edge(uint64_t src_id, uint64_t dst_id, uint16_t label_i
         }
 
         if (v.ext.in_block_id == 0) {
-            uint32_t in_local_id = shard.page_pool.allocate_page();
-            auto& in_page = shard.page_pool[in_local_id];
-            in_page.edges[0] = in_edge;
-            in_page.count = 1;
-            in_page.next_page_id = 0;
+            uint32_t small_id = shard.small_in_pool.allocate_block();
+            auto& blk = shard.small_in_pool[small_id];
+            blk.edges[0] = in_edge;
+            blk.count = 1;
 
-            uint32_t in_pid = encode_page_id(s_dst, in_local_id);
-            v.ext.in_block_id = in_pid;
+            v.ext.in_block_id = encode_small_in_id(s_dst, small_id);
             v.in_degree = 1;
+        } else if (is_small_in_id(v.ext.in_block_id)) {
+            uint32_t p_shard = decode_shard_index(v.ext.in_block_id);
+            uint32_t small_id = decode_local_page_id(v.ext.in_block_id);
+            if (p_shard == s_dst && small_id < shard.small_in_pool.size()) {
+                auto& blk = shard.small_in_pool[small_id];
+                PackedEdge* first_tombstone = nullptr;
+                for (uint32_t i = 0; i < blk.count; ++i) {
+                    if (blk.edges[i].is_active()) {
+                        if (blk.edges[i].target_id == in_edge.target_id &&
+                            blk.edges[i].label_id == in_edge.label_id &&
+                            same_edge_weight(blk.edges[i].weight, in_edge.weight)) {
+                            update_existing_edge_in_place(blk.edges[i], in_edge);
+                            return;
+                        }
+                    } else if (first_tombstone == nullptr) {
+                        first_tombstone = &blk.edges[i];
+                    }
+                }
+                if (first_tombstone != nullptr) {
+                    *first_tombstone = in_edge;
+                } else if (blk.count < SmallInBlock::CAPACITY) {
+                    blk.edges[blk.count++] = in_edge;
+                } else {
+                    uint32_t in_local_id = shard.page_pool.allocate_page();
+                    auto& in_page = shard.page_pool[in_local_id];
+                    for (uint32_t i = 0; i < blk.count; ++i) {
+                        in_page.edges[i] = blk.edges[i];
+                    }
+                    in_page.edges[blk.count] = in_edge;
+                    in_page.count = blk.count + 1;
+                    in_page.next_page_id = 0;
+                    v.ext.in_block_id = encode_page_id(s_dst, in_local_id);
+                }
+                v.in_degree++;
+            }
         } else {
             PackedEdge* first_tombstone = nullptr;
             uint32_t curr_id = v.ext.in_block_id;
@@ -313,6 +346,25 @@ bool AdjacencyStore::del_edge(uint64_t src_id, uint64_t dst_id, uint16_t label_i
                 auto& v = it->second;
                 if (v.is_promoted() && v.ext.in_block_id > 0) {
                     uint32_t curr_id = v.ext.in_block_id;
+                    if (is_small_in_id(curr_id)) {
+                        uint32_t p_shard = decode_shard_index(curr_id);
+                        uint32_t small_id = decode_local_page_id(curr_id);
+                        if (p_shard == s_dst && small_id < shard_dst.small_in_pool.size()) {
+                            auto& blk = shard_dst.small_in_pool[small_id];
+                            for (uint32_t i = 0; i < blk.count; ++i) {
+                                if (blk.edges[i].target_id == src_id &&
+                                    blk.edges[i].label_id == label_id &&
+                                    same_edge_weight(blk.edges[i].weight, matched_weight) &&
+                                    blk.edges[i].is_active()) {
+                                    blk.edges[i].set_active(false);
+                                    if (v.in_degree > 0) {
+                                        v.in_degree--;
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    } else {
                     bool in_found = false;
                     while (curr_id != 0) {
                         uint32_t p_shard = decode_shard_index(curr_id);
@@ -335,6 +387,7 @@ bool AdjacencyStore::del_edge(uint64_t src_id, uint64_t dst_id, uint16_t label_i
                         }
                         if (in_found) break;
                         curr_id = page.next_page_id;
+                    }
                     }
                 }
             }
@@ -469,6 +522,19 @@ std::vector<PackedEdge> AdjacencyStore::get_incoming_edges_snapshot(uint64_t dst
     result.reserve(v.in_degree);
     if (!v.is_promoted()) return result;
     uint32_t curr_id = v.ext.in_block_id;
+    if (is_small_in_id(curr_id)) {
+        uint32_t p_shard = decode_shard_index(curr_id);
+        uint32_t small_id = decode_local_page_id(curr_id);
+        if (p_shard == s_idx && small_id < shard.small_in_pool.size()) {
+            const auto& blk = shard.small_in_pool[small_id];
+            for (uint32_t i = 0; i < blk.count; ++i) {
+                if (blk.edges[i].is_active()) {
+                    result.push_back(blk.edges[i]);
+                }
+            }
+        }
+        return result;
+    }
     while (curr_id != 0) {
         uint32_t p_shard = decode_shard_index(curr_id);
         uint32_t p_local = decode_local_page_id(curr_id);
@@ -522,6 +588,13 @@ std::span<const PackedEdge> AdjacencyStore::get_incoming_edges(uint64_t dst_id) 
     }
     uint32_t p_shard = decode_shard_index(v.ext.in_block_id);
     uint32_t local_id = decode_local_page_id(v.ext.in_block_id);
+    if (is_small_in_id(v.ext.in_block_id)) {
+        if (p_shard == s_idx && local_id < shard.small_in_pool.size()) {
+            return std::span<const PackedEdge>(shard.small_in_pool[local_id].edges,
+                                               shard.small_in_pool[local_id].count);
+        }
+        return {};
+    }
     if (p_shard == s_idx && local_id < shard.page_pool.size()) {
         return std::span<const PackedEdge>(shard.page_pool[local_id].edges,
                                            shard.page_pool[local_id].count);

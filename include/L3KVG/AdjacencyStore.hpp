@@ -73,16 +73,27 @@ class AdjacencyStore {
 public:
     static constexpr size_t NUM_SHARDS = 64;
 
+    static constexpr uint32_t kSmallInFlag = 1u << 23;
+    static constexpr uint32_t kLocalPageMask = 0x007FFFFFu;
+
     [[nodiscard]] static constexpr uint32_t decode_shard_index(uint32_t page_id) noexcept {
         return (page_id >> 24) & 0xFF;
     }
 
+    [[nodiscard]] static constexpr bool is_small_in_id(uint32_t block_id) noexcept {
+        return (block_id & kSmallInFlag) != 0;
+    }
+
     [[nodiscard]] static constexpr uint32_t decode_local_page_id(uint32_t page_id) noexcept {
-        return page_id & 0x00FFFFFF;
+        return page_id & kLocalPageMask;
     }
 
     [[nodiscard]] static constexpr uint32_t encode_page_id(size_t shard_idx, uint32_t local_idx) noexcept {
-        return (static_cast<uint32_t>(shard_idx) << 24) | (local_idx & 0x00FFFFFF);
+        return (static_cast<uint32_t>(shard_idx) << 24) | (local_idx & kLocalPageMask);
+    }
+
+    [[nodiscard]] static constexpr uint32_t encode_small_in_id(size_t shard_idx, uint32_t local_idx) noexcept {
+        return (static_cast<uint32_t>(shard_idx) << 24) | kSmallInFlag | (local_idx & kLocalPageMask);
     }
 
     [[nodiscard]] static size_t shard_index(uint64_t id) noexcept {
@@ -245,6 +256,17 @@ public:
         const auto& v = it->second;
         if (!v.is_promoted()) return;
         uint32_t curr_id = v.ext.in_block_id;
+        if (is_small_in_id(curr_id)) {
+            uint32_t p_shard = decode_shard_index(curr_id);
+            uint32_t p_local = decode_local_page_id(curr_id);
+            if (p_shard == s_idx && p_local < shard.small_in_pool.size()) {
+                const auto& blk = shard.small_in_pool[p_local];
+                for (uint32_t i = 0; i < blk.count; ++i) {
+                    visitor(blk.edges[i]);
+                }
+            }
+            return;
+        }
         while (curr_id != 0) {
             uint32_t p_shard = decode_shard_index(curr_id);
             uint32_t p_local = decode_local_page_id(curr_id);
@@ -512,10 +534,54 @@ public:
         Entry sentinel_{};
     };
 
+    struct alignas(64) SmallInBlock {
+        static constexpr uint32_t CAPACITY = 2;
+        uint32_t count{0};
+        uint32_t reserved0{0};
+        PackedEdge edges[CAPACITY];
+        uint64_t reserved1{0};
+    };
+    static_assert(sizeof(SmallInBlock) == 64, "SmallInBlock must be exactly 64 bytes");
+
+    class SmallInPool {
+    public:
+        static constexpr size_t CHUNK_SIZE = 1024; // 1024 * 64B = 64KB chunk
+
+        SmallInPool() {
+            allocate_block(); // Reserve index 0 as null block
+        }
+
+        uint32_t allocate_block() {
+            uint32_t id = static_cast<uint32_t>(size_);
+            size_t chunk_idx = id / CHUNK_SIZE;
+            if (chunk_idx >= chunks_.size()) {
+                chunks_.push_back(std::make_unique<SmallInBlock[]>(CHUNK_SIZE));
+            }
+            size_++;
+            chunks_[chunk_idx][id % CHUNK_SIZE].count = 0;
+            return id;
+        }
+
+        [[nodiscard]] size_t size() const noexcept { return size_; }
+
+        [[nodiscard]] SmallInBlock& operator[](size_t index) noexcept {
+            return chunks_[index / CHUNK_SIZE][index % CHUNK_SIZE];
+        }
+
+        [[nodiscard]] const SmallInBlock& operator[](size_t index) const noexcept {
+            return chunks_[index / CHUNK_SIZE][index % CHUNK_SIZE];
+        }
+
+    private:
+        std::vector<std::unique_ptr<SmallInBlock[]>> chunks_;
+        size_t size_{0};
+    };
+
     struct alignas(64) Shard {
         mutable SharedSpinLock mutex;
         FlatVertexMap directory;
         PagePool page_pool;
+        SmallInPool small_in_pool;
 
         Shard() {
             directory.reserve(4096);
