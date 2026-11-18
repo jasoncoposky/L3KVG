@@ -4,6 +4,7 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -143,8 +144,14 @@ private:
   LabelRegistry label_registry_;
   AdjacencyStore adjacency_store_;
   std::unique_ptr<BinaryEdgeWAL> edge_wal_;
-  std::mutex local_edge_mu_;
+  std::shared_mutex edge_global_mu_;
+  std::array<std::mutex, 256> edge_op_locks_;
   std::array<std::mutex, 64> node_rmw_locks_;
+
+  static constexpr size_t edge_stripe(uint64_t src, uint64_t dst) noexcept {
+    uint64_t h = (src * 0x9E3779B97F4A7C15ULL) ^ (dst * 0xBF58476D1CE4E5B9ULL);
+    return static_cast<size_t>((h ^ (h >> 32)) & 255ULL);
+  }
 
   std::unique_ptr<l3kv::Engine> store_;
   FederationResolver resolver_;

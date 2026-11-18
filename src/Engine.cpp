@@ -670,7 +670,7 @@ void Engine::del_node(uint64_t id) {
   auto hlc_ts = hlc_.now();
   std::vector<AdjacencyStore::IncidentEdgeRecord> removed;
   {
-    std::unique_lock<std::mutex> edge_lock(edge_wal_ ? edge_wal_->write_mutex() : local_edge_mu_);
+    std::unique_lock<std::shared_mutex> edge_lock(edge_global_mu_);
     removed = adjacency_store_.remove_vertex(id);
     if (edge_wal_ && !removed.empty()) {
       std::vector<EdgeMutationOp> del_ops;
@@ -685,7 +685,7 @@ void Engine::del_node(uint64_t id) {
             .weight = rec.weight
         });
       }
-      edge_wal_->append_batch_unlocked(del_ops);
+      edge_wal_->append_batch(del_ops);
     }
   }
 
@@ -741,11 +741,12 @@ void Engine::add_edge(uint64_t src_id, std::string_view label,
   const bool has_props = !payload.empty() && payload != "{}";
   uint16_t flags = PackedEdge::FLAG_ACTIVE | (has_props ? PackedEdge::FLAG_HAS_PROPERTIES : 0);
   {
-      std::unique_lock<std::mutex> edge_lock(edge_wal_ ? edge_wal_->write_mutex() : local_edge_mu_);
+      std::shared_lock<std::shared_mutex> global_lk(edge_global_mu_);
+      std::lock_guard<std::mutex> op_lk(edge_op_locks_[edge_stripe(src_id, dst_id)]);
       bool inserted = adjacency_store_.add_edge(src_id, dst_id, lid, static_cast<float>(weight), flags, 0, hlc_ts.wall_time);
       if (edge_wal_ && (inserted || has_props)) {
           EdgeMutationOp op{src_id, dst_id, hlc_ts.wall_time, lid, flags, static_cast<float>(weight)};
-          edge_wal_->append_unlocked(op);
+          edge_wal_->append(op);
       }
   }
   if (__builtin_expect(has_props || !resolver_.is_local(src_id) || !resolver_.is_local(dst_id) || resolver_.has_remote_clusters(), 0)) {
@@ -773,11 +774,12 @@ void Engine::del_edge(uint64_t src_id, std::string_view label,
   float removed_weight = static_cast<float>(weight);
   bool deleted = false;
   {
-      std::unique_lock<std::mutex> edge_lock(edge_wal_ ? edge_wal_->write_mutex() : local_edge_mu_);
+      std::shared_lock<std::shared_mutex> global_lk(edge_global_mu_);
+      std::lock_guard<std::mutex> op_lk(edge_op_locks_[edge_stripe(src_id, dst_id)]);
       deleted = adjacency_store_.del_edge(src_id, dst_id, lid, static_cast<float>(weight), &removed_flags, &removed_weight);
       if (edge_wal_ && deleted) {
           EdgeMutationOp op{src_id, dst_id, hlc_ts.wall_time, lid, EdgeMutationOp::OP_DELETE, removed_weight};
-          edge_wal_->append_unlocked(op);
+          edge_wal_->append(op);
       }
   }
   if ((removed_flags & PackedEdge::FLAG_HAS_PROPERTIES) != 0 ||
@@ -1147,7 +1149,51 @@ bool Engine::apply_batch(const lite3cpp::Buffer& buffer, uint32_t principal_id) 
 
         std::vector<AdjacencyStore::IncidentEdgeRecord> extra_prop_dels;
         if (!staged_edge_ops.empty()) {
-            std::unique_lock<std::mutex> edge_lock(edge_wal_ ? edge_wal_->write_mutex() : local_edge_mu_);
+            bool has_del_node = false;
+            std::array<size_t, 64> stripes_buf;
+            size_t num_stripes = 0;
+            std::vector<size_t> extra_stripes;
+            for (const auto& op : staged_edge_ops) {
+                if (op.kind == StagedEdgeKind::DelNode) {
+                    has_del_node = true;
+                    break;
+                }
+                size_t st = edge_stripe(op.src, op.dst);
+                if (num_stripes < stripes_buf.size()) {
+                    stripes_buf[num_stripes++] = st;
+                } else {
+                    if (extra_stripes.empty()) {
+                        extra_stripes.assign(stripes_buf.begin(), stripes_buf.end());
+                    }
+                    extra_stripes.push_back(st);
+                }
+            }
+
+            std::unique_lock<std::shared_mutex> global_uniq;
+            std::shared_lock<std::shared_mutex> global_shared;
+            std::vector<std::unique_lock<std::mutex>> op_locks;
+            if (has_del_node) {
+                global_uniq = std::unique_lock<std::shared_mutex>(edge_global_mu_);
+            } else {
+                global_shared = std::shared_lock<std::shared_mutex>(edge_global_mu_);
+                if (!extra_stripes.empty()) {
+                    std::sort(extra_stripes.begin(), extra_stripes.end());
+                    extra_stripes.erase(std::unique(extra_stripes.begin(), extra_stripes.end()), extra_stripes.end());
+                    op_locks.reserve(extra_stripes.size());
+                    for (size_t st : extra_stripes) {
+                        op_locks.emplace_back(edge_op_locks_[st]);
+                    }
+                } else {
+                    std::sort(stripes_buf.begin(), stripes_buf.begin() + num_stripes);
+                    num_stripes = static_cast<size_t>(
+                        std::unique(stripes_buf.begin(), stripes_buf.begin() + num_stripes) - stripes_buf.begin());
+                    op_locks.reserve(num_stripes);
+                    for (size_t i = 0; i < num_stripes; ++i) {
+                        op_locks.emplace_back(edge_op_locks_[stripes_buf[i]]);
+                    }
+                }
+            }
+
             std::vector<EdgeMutationOp> wal_ops;
             if (edge_wal_) {
                 wal_ops.reserve(staged_edge_ops.size());
@@ -1183,7 +1229,7 @@ bool Engine::apply_batch(const lite3cpp::Buffer& buffer, uint32_t principal_id) 
             }
 
             if (edge_wal_ && !wal_ops.empty()) {
-                edge_wal_->append_batch_unlocked(wal_ops);
+                edge_wal_->append_batch(wal_ops);
             }
         }
 
