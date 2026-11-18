@@ -469,6 +469,14 @@ std::vector<std::shared_ptr<Node>> Engine::get_nodes_by_prefix(const std::string
   return fetch_nodes(ids, principal_id);
 }
 
+std::vector<std::pair<std::string, lite3cpp::Buffer>> Engine::scan_kv_prefix(
+    const std::string& prefix,
+    const std::string& start_key,
+    size_t limit,
+    uint32_t principal_id) {
+    return store_->scan_prefix_kv(prefix, start_key, limit, principal_id);
+}
+
 void Engine::put_node(uint64_t id, std::string payload) {
   // if(0) std::fprintf(stderr, "[Engine] put_node %016llx: payload_size=%zu\n", (unsigned long long)id, payload.size());
   lite3::NodeID owner = resolver_.get_node_owner(id);
@@ -928,6 +936,15 @@ bool Engine::apply_batch(const lite3cpp::Buffer& buffer, uint32_t principal_id) 
                         has_legacy_kv_edges_.store(true, std::memory_order_relaxed);
                     }
                     stage_kv_put(item.key, item.value);
+                    break;
+                }
+                case MutationOp::CasRaw: {
+                    require_write_perm(item.key);
+                    auto res = store_->cas_put(std::string(item.key), std::string(item.value),
+                                               item.expected_hash, principal_id, item.ttl_ms);
+                    if (!res.ok) {
+                        return false;
+                    }
                     break;
                 }
                 case MutationOp::DelRaw: {

@@ -14,7 +14,8 @@ enum class MutationOp : uint8_t {
     DelRaw = 3,
     DelNode = 4,
     DelEdge = 5,
-    IncNodeInt = 6
+    IncNodeInt = 6,
+    CasRaw = 7
 };
 
 struct MutationItem {
@@ -26,6 +27,8 @@ struct MutationItem {
     std::string_view label;
     double weight = 1.0;
     int64_t int_delta = 0;
+    uint64_t expected_hash = 0;
+    int64_t ttl_ms = 0;
 };
 
 class MutationBatch {
@@ -33,6 +36,8 @@ public:
     MutationBatch();
 
     void put_raw(std::string_view key, std::string_view value);
+    void cas_raw(std::string_view key, std::string_view value, uint64_t expected_hash, int64_t ttl_ms = 0);
+    void cas_raw(std::string_view key, const lite3cpp::Buffer& value, uint64_t expected_hash, int64_t ttl_ms = 0);
     void put_node(uint64_t node_id, std::string_view payload);
     void put_node(uint64_t node_id, const lite3cpp::Buffer& payload);
     void add_edge(uint64_t src, std::string_view label, double weight, uint64_t dst, std::string_view payload = "");

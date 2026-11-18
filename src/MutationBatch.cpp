@@ -23,6 +23,22 @@ void MutationBatch::put_raw(std::string_view key, std::string_view value) {
     count_++;
 }
 
+void MutationBatch::cas_raw(std::string_view key, std::string_view value, uint64_t expected_hash, int64_t ttl_ms) {
+    size_t ofs = buf_.arr_append_obj(arr_ofs_);
+    buf_.set_i64(ofs, "op"_hk, static_cast<int64_t>(MutationOp::CasRaw));
+    buf_.set_str(ofs, "k"_hk, key);
+    buf_.set_str(ofs, "v"_hk, value);
+    buf_.set_i64(ofs, "eh"_hk, static_cast<int64_t>(expected_hash));
+    if (ttl_ms > 0) {
+        buf_.set_i64(ofs, "ttl"_hk, ttl_ms);
+    }
+    count_++;
+}
+
+void MutationBatch::cas_raw(std::string_view key, const lite3cpp::Buffer& value, uint64_t expected_hash, int64_t ttl_ms) {
+    cas_raw(key, std::string_view(reinterpret_cast<const char*>(value.data()), value.size()), expected_hash, ttl_ms);
+}
+
 void MutationBatch::put_node(uint64_t node_id, std::string_view payload) {
     size_t ofs = buf_.arr_append_obj(arr_ofs_);
     buf_.set_i64(ofs, "op"_hk, static_cast<int64_t>(MutationOp::PutNode));
@@ -130,6 +146,12 @@ MutationItem MutationBatch::read_item_at_offset(const lite3cpp::Buffer& buf, siz
     }
     if (auto inc = buf.try_get_i64(ofs, "i"_hk)) {
         item.int_delta = *inc;
+    }
+    if (auto eh = buf.try_get_i64(ofs, "eh"_hk)) {
+        item.expected_hash = static_cast<uint64_t>(*eh);
+    }
+    if (auto ttl = buf.try_get_i64(ofs, "ttl"_hk)) {
+        item.ttl_ms = *ttl;
     }
     return item;
 }

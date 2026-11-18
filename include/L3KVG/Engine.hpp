@@ -59,6 +59,11 @@ public:
   
   std::vector<std::shared_ptr<Node>> fetch_nodes(const std::vector<uint64_t>& ids, uint32_t principal_id = l3kv::INTERNAL_UID);
   std::vector<std::shared_ptr<Node>> get_nodes_by_prefix(const std::string& prefix, uint32_t principal_id = l3kv::INTERNAL_UID);
+  std::vector<std::pair<std::string, lite3cpp::Buffer>> scan_kv_prefix(
+      const std::string& prefix,
+      const std::string& start_key = "",
+      size_t limit = 1000,
+      uint32_t principal_id = l3kv::INTERNAL_UID);
   
   void put_node(uint64_t id, std::string payload);
   void put_node(std::string_view uuid, std::string payload);
