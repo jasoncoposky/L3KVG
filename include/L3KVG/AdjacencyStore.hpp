@@ -10,6 +10,7 @@
 #include <type_traits>
 #include <functional>
 #include <memory>
+#include <limits>
 #include <sys/mman.h>
 #include "L3KVG/PackedEdge.hpp"
 #include "L3KVG/LabelRegistry.hpp"
@@ -284,7 +285,7 @@ public:
 
     class PagePool {
     public:
-        static constexpr size_t CHUNK_SIZE = 1024; // 1024 pages * 4KB = 4MB chunk
+        static constexpr size_t CHUNK_SIZE = 512; // 512 pages * 4KB = 2MB THP-aligned chunk
 
         PagePool() {
             allocate_page(); // Reserve index 0 as null page
@@ -321,10 +322,13 @@ public:
             if (chunk_idx >= chunks_.size()) {
                 void* ptr = ::mmap(nullptr, sizeof(AdjacencyPage) * CHUNK_SIZE,
                                    PROT_READ | PROT_WRITE,
-                                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE, -1, 0);
+                                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
                 if (ptr == MAP_FAILED) {
                     throw std::bad_alloc();
                 }
+#ifdef MADV_HUGEPAGE
+                ::madvise(ptr, sizeof(AdjacencyPage) * CHUNK_SIZE, MADV_HUGEPAGE);
+#endif
                 chunks_.push_back(static_cast<AdjacencyPage*>(ptr));
             }
             size_++;
@@ -364,9 +368,153 @@ public:
         size_t size_{0};
     };
 
+    class FlatVertexMap {
+    public:
+        static constexpr uint64_t kEmptyKey = std::numeric_limits<uint64_t>::max();
+
+        struct Entry {
+            uint64_t first{kEmptyKey};
+            VertexRecord second;
+        };
+
+        class const_iterator {
+        public:
+            const_iterator(const Entry* cur, const Entry* end_ptr, const Entry* sentinel) noexcept
+                : cur_(cur), end_(end_ptr), sentinel_(sentinel) {
+                advance_to_occupied();
+            }
+            const Entry& operator*() const noexcept { return cur_ ? *cur_ : *sentinel_; }
+            const Entry* operator->() const noexcept { return cur_ ? cur_ : sentinel_; }
+            const_iterator& operator++() noexcept {
+                if (cur_) {
+                    ++cur_;
+                    advance_to_occupied();
+                } else {
+                    sentinel_ = nullptr;
+                }
+                return *this;
+            }
+            bool operator==(const const_iterator& o) const noexcept {
+                return cur_ == o.cur_ && sentinel_ == o.sentinel_;
+            }
+            bool operator!=(const const_iterator& o) const noexcept { return !(*this == o); }
+            friend bool operator==(const Entry* p, const const_iterator& o) noexcept {
+                return p == o.cur_ && o.sentinel_ == nullptr;
+            }
+
+        private:
+            void advance_to_occupied() noexcept {
+                while (cur_ < end_ && cur_->first == kEmptyKey) {
+                    ++cur_;
+                }
+                if (cur_ >= end_) {
+                    cur_ = nullptr;
+                }
+            }
+            const Entry* cur_{nullptr};
+            const Entry* end_{nullptr};
+            const Entry* sentinel_{nullptr};
+        };
+
+        FlatVertexMap() { rehash(64); }
+
+        void reserve(size_t n) {
+            size_t needed = n * 2;
+            if (needed > slots_.size()) {
+                size_t cap = 64;
+                while (cap < needed) cap <<= 1;
+                rehash(cap);
+            }
+        }
+
+        [[nodiscard]] const Entry* find(uint64_t key) const noexcept {
+            if (key == kEmptyKey) {
+                return has_sentinel_ ? &sentinel_ : nullptr;
+            }
+            const size_t mask = slots_.size() - 1;
+            size_t idx = hash_key(key) & mask;
+            for (;;) {
+                const Entry& e = slots_[idx];
+                if (e.first == key) return &e;
+                if (e.first == kEmptyKey) return nullptr;
+                idx = (idx + 1) & mask;
+            }
+        }
+
+        [[nodiscard]] Entry* find(uint64_t key) noexcept {
+            return const_cast<Entry*>(static_cast<const FlatVertexMap*>(this)->find(key));
+        }
+
+        VertexRecord& operator[](uint64_t key) {
+            if (key == kEmptyKey) {
+                if (!has_sentinel_) {
+                    sentinel_.first = kEmptyKey;
+                    sentinel_.second = VertexRecord();
+                    has_sentinel_ = true;
+                }
+                return sentinel_.second;
+            }
+            if ((size_ + 1) * 2 > slots_.size()) {
+                rehash(slots_.size() * 2);
+            }
+            const size_t mask = slots_.size() - 1;
+            size_t idx = hash_key(key) & mask;
+            for (;;) {
+                Entry& e = slots_[idx];
+                if (e.first == key) {
+                    return e.second;
+                }
+                if (e.first == kEmptyKey) {
+                    e.first = key;
+                    e.second = VertexRecord();
+                    ++size_;
+                    return e.second;
+                }
+                idx = (idx + 1) & mask;
+            }
+        }
+
+        [[nodiscard]] const_iterator begin() const noexcept {
+            return const_iterator(slots_.data(), slots_.data() + slots_.size(),
+                                  has_sentinel_ ? &sentinel_ : nullptr);
+        }
+        [[nodiscard]] const_iterator end() const noexcept {
+            return const_iterator(nullptr, nullptr, nullptr);
+        }
+
+    private:
+        static size_t hash_key(uint64_t x) noexcept {
+            x ^= x >> 30;
+            x *= 0xbf58476d1ce4e5b9ULL;
+            x ^= x >> 27;
+            x *= 0x94d049bb133111ebULL;
+            x ^= x >> 31;
+            return static_cast<size_t>(x);
+        }
+
+        void rehash(size_t new_cap) {
+            std::vector<Entry> next(new_cap);
+            const size_t mask = new_cap - 1;
+            for (const Entry& old : slots_) {
+                if (old.first == kEmptyKey) continue;
+                size_t idx = hash_key(old.first) & mask;
+                while (next[idx].first != kEmptyKey) {
+                    idx = (idx + 1) & mask;
+                }
+                next[idx] = old;
+            }
+            slots_.swap(next);
+        }
+
+        std::vector<Entry> slots_;
+        size_t size_{0};
+        bool has_sentinel_{false};
+        Entry sentinel_{};
+    };
+
     struct alignas(64) Shard {
         mutable SharedSpinLock mutex;
-        std::unordered_map<uint64_t, VertexRecord> directory;
+        FlatVertexMap directory;
         PagePool page_pool;
 
         Shard() {
