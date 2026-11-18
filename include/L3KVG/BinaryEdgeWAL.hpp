@@ -93,7 +93,9 @@ private:
     std::string path_;
     int fd_{-1};
     mutable std::mutex write_mutex_;
+    mutable std::mutex io_mutex_;
     std::vector<char> buffer_;
+    std::vector<char> io_buffer_;
     size_t buffer_len_{0};
 };
 

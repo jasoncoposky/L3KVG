@@ -43,6 +43,7 @@ BinaryEdgeWAL::BinaryEdgeWAL(const std::string& path)
         throw std::runtime_error("Failed to open WAL file " + path_ + ": " + std::string(std::strerror(errno)));
     }
     buffer_.resize(65536);
+    io_buffer_.resize(65536);
     buffer_len_ = 0;
 }
 
@@ -55,10 +56,11 @@ BinaryEdgeWAL::~BinaryEdgeWAL() {
 }
 
 BinaryEdgeWAL::BinaryEdgeWAL(BinaryEdgeWAL&& other) noexcept {
-    std::lock_guard<std::mutex> lock(other.write_mutex_);
+    std::scoped_lock lock(other.write_mutex_, other.io_mutex_);
     path_ = std::move(other.path_);
     fd_ = other.fd_;
     buffer_ = std::move(other.buffer_);
+    io_buffer_ = std::move(other.io_buffer_);
     buffer_len_ = other.buffer_len_;
     other.buffer_len_ = 0;
     other.fd_ = -1;
@@ -66,11 +68,12 @@ BinaryEdgeWAL::BinaryEdgeWAL(BinaryEdgeWAL&& other) noexcept {
 
 BinaryEdgeWAL& BinaryEdgeWAL::operator=(BinaryEdgeWAL&& other) noexcept {
     if (this != &other) {
-        std::scoped_lock lock(write_mutex_, other.write_mutex_);
+        std::scoped_lock lock(write_mutex_, io_mutex_, other.write_mutex_, other.io_mutex_);
         close_unlocked();
         path_ = std::move(other.path_);
         fd_ = other.fd_;
         buffer_ = std::move(other.buffer_);
+        io_buffer_ = std::move(other.io_buffer_);
         buffer_len_ = other.buffer_len_;
         other.buffer_len_ = 0;
         other.fd_ = -1;
@@ -155,8 +158,33 @@ void BinaryEdgeWAL::append_unlocked(const EdgeMutationOp& op) {
 }
 
 void BinaryEdgeWAL::append(const EdgeMutationOp& op) {
-    std::lock_guard<std::mutex> lock(write_mutex_);
-    append_unlocked(op);
+    std::unique_lock<std::mutex> wlk(write_mutex_);
+    if (fd_ < 0) {
+        throw std::runtime_error("Cannot append: WAL is closed");
+    }
+    if (buffer_len_ + sizeof(EdgeMutationOp) > 65536) {
+        std::unique_lock<std::mutex> ilock(io_mutex_, std::try_to_lock);
+        if (ilock.owns_lock()) {
+            size_t flush_len = buffer_len_;
+            buffer_.swap(io_buffer_);
+            buffer_len_ = sizeof(EdgeMutationOp);
+            std::memcpy(buffer_.data(), &op, sizeof(EdgeMutationOp));
+            wlk.unlock();
+            write_all_unlocked(io_buffer_.data(), flush_len);
+            return;
+        }
+        std::vector<char> overflow_buf(65536);
+        size_t flush_len = buffer_len_;
+        buffer_.swap(overflow_buf);
+        buffer_len_ = sizeof(EdgeMutationOp);
+        std::memcpy(buffer_.data(), &op, sizeof(EdgeMutationOp));
+        wlk.unlock();
+        std::lock_guard<std::mutex> ilock2(io_mutex_);
+        write_all_unlocked(overflow_buf.data(), flush_len);
+        return;
+    }
+    std::memcpy(buffer_.data() + buffer_len_, &op, sizeof(EdgeMutationOp));
+    buffer_len_ += sizeof(EdgeMutationOp);
 }
 
 void BinaryEdgeWAL::append_batch_unlocked(std::span<const EdgeMutationOp> ops) {
@@ -188,12 +216,49 @@ void BinaryEdgeWAL::append_batch(std::span<const EdgeMutationOp> ops) {
     if (ops.empty()) {
         return;
     }
-    std::lock_guard<std::mutex> lock(write_mutex_);
-    append_batch_unlocked(ops);
+    std::unique_lock<std::mutex> wlk(write_mutex_);
+    if (fd_ < 0) {
+        throw std::runtime_error("Cannot append batch: WAL is closed");
+    }
+    const char* ptr = reinterpret_cast<const char*>(ops.data());
+    size_t total_bytes = ops.size_bytes();
+    if (total_bytes >= 65536) {
+        std::scoped_lock ilock(io_mutex_);
+        if (buffer_len_ > 0) {
+            write_all_unlocked(buffer_.data(), buffer_len_);
+            buffer_len_ = 0;
+        }
+        wlk.unlock();
+        write_all_unlocked(ptr, total_bytes);
+        return;
+    }
+    if (buffer_len_ + total_bytes > 65536) {
+        std::unique_lock<std::mutex> ilock(io_mutex_, std::try_to_lock);
+        if (ilock.owns_lock()) {
+            size_t flush_len = buffer_len_;
+            buffer_.swap(io_buffer_);
+            buffer_len_ = total_bytes;
+            std::memcpy(buffer_.data(), ptr, total_bytes);
+            wlk.unlock();
+            write_all_unlocked(io_buffer_.data(), flush_len);
+            return;
+        }
+        std::vector<char> overflow_buf(65536);
+        size_t flush_len = buffer_len_;
+        buffer_.swap(overflow_buf);
+        buffer_len_ = total_bytes;
+        std::memcpy(buffer_.data(), ptr, total_bytes);
+        wlk.unlock();
+        std::lock_guard<std::mutex> ilock2(io_mutex_);
+        write_all_unlocked(overflow_buf.data(), flush_len);
+        return;
+    }
+    std::memcpy(buffer_.data() + buffer_len_, ptr, total_bytes);
+    buffer_len_ += total_bytes;
 }
 
 void BinaryEdgeWAL::flush() {
-    std::lock_guard<std::mutex> lock(write_mutex_);
+    std::scoped_lock lock(write_mutex_, io_mutex_);
     if (fd_ < 0) {
         throw std::runtime_error("Cannot flush: WAL is closed");
     }
@@ -201,7 +266,7 @@ void BinaryEdgeWAL::flush() {
 }
 
 void BinaryEdgeWAL::close() {
-    std::lock_guard<std::mutex> lock(write_mutex_);
+    std::scoped_lock lock(write_mutex_, io_mutex_);
     close_unlocked();
 }
 
@@ -211,7 +276,7 @@ bool BinaryEdgeWAL::is_open() const noexcept {
 }
 
 size_t BinaryEdgeWAL::recover(AdjacencyStore& store) {
-    std::lock_guard<std::mutex> lock(write_mutex_);
+    std::scoped_lock lock(write_mutex_, io_mutex_);
 
     int read_fd = fd_;
     bool close_read_fd = false;
@@ -308,7 +373,7 @@ size_t BinaryEdgeWAL::recover(AdjacencyStore& store) {
 }
 
 uint64_t BinaryEdgeWAL::file_size() const noexcept {
-    std::lock_guard<std::mutex> lock(write_mutex_);
+    std::scoped_lock lock(write_mutex_, io_mutex_);
 #if defined(_WIN32)
     if (fd_ >= 0) {
         struct _stat64 st;
@@ -333,7 +398,7 @@ uint64_t BinaryEdgeWAL::file_size() const noexcept {
 }
 
 bool BinaryEdgeWAL::compact(const AdjacencyStore& store) {
-    std::lock_guard<std::mutex> lock(write_mutex_);
+    std::scoped_lock lock(write_mutex_, io_mutex_);
     if (path_.empty() || path_ == ":memory:") {
         return false;
     }
