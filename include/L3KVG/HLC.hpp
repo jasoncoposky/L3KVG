@@ -1,9 +1,9 @@
 #pragma once
 
-#include <string>
+#include <atomic>
 #include <chrono>
-#include <mutex>
 #include <cstdint>
+#include <string>
 #include <string_view>
 #include <algorithm>
 #include "buffer.hpp"
@@ -83,49 +83,73 @@ struct HLCTimestamp {
 
 class HLCProvider {
 public:
-    explicit HLCProvider(uint32_t node_id) : node_id_(node_id), last_wall_time_(0), logical_counter_(0) {}
+    explicit HLCProvider(uint32_t node_id) : node_id_(node_id) {}
 
     HLCTimestamp now() {
-        std::lock_guard<std::mutex> lock(mu_);
-        uint64_t current_wall = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
-        
-        if (current_wall == last_wall_time_) {
-            logical_counter_++;
-        } else if (current_wall > last_wall_time_) {
-            last_wall_time_ = current_wall;
-            logical_counter_ = 0;
-        } else {
-            current_wall = last_wall_time_;
-            logical_counter_++;
-        }
+        uint64_t current_wall = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count()) & kWallMask;
 
-        return {current_wall, logical_counter_, node_id_};
+        uint64_t expected = state_.load(std::memory_order_relaxed);
+        for (;;) {
+            uint64_t last_wall = expected >> 16;
+            uint16_t last_logical = static_cast<uint16_t>(expected & 0xFFFFu);
+            uint64_t next_wall = last_wall;
+            uint16_t next_logical = 0;
+
+            if (current_wall > last_wall) {
+                next_wall = current_wall;
+                next_logical = 0;
+            } else {
+                next_logical = static_cast<uint16_t>(last_logical + 1u);
+                if (next_logical == 0) {
+                    next_wall = last_wall + 1u;
+                }
+            }
+
+            uint64_t desired = (next_wall << 16) | next_logical;
+            if (state_.compare_exchange_weak(expected, desired,
+                                             std::memory_order_acq_rel,
+                                             std::memory_order_relaxed)) {
+                return {next_wall, next_logical, node_id_};
+            }
+        }
     }
 
     void update(const HLCTimestamp& remote) {
-        std::lock_guard<std::mutex> lock(mu_);
-        uint64_t current_wall = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
-        
-        uint64_t prev_wall = last_wall_time_;
-        last_wall_time_ = std::max({prev_wall, remote.wall_time, current_wall});
-        if (last_wall_time_ == prev_wall && last_wall_time_ == remote.wall_time) {
-            logical_counter_ = std::max(static_cast<uint16_t>(logical_counter_), remote.logical) + 1;
-        } else if (last_wall_time_ == prev_wall) {
-            logical_counter_++;
-        } else if (last_wall_time_ == remote.wall_time) {
-            logical_counter_ = remote.logical + 1;
-        } else {
-            logical_counter_ = 0;
+        uint64_t current_wall = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count()) & kWallMask;
+        uint64_t remote_wall = remote.wall_time & kWallMask;
+
+        uint64_t expected = state_.load(std::memory_order_relaxed);
+        for (;;) {
+            uint64_t prev_wall = expected >> 16;
+            uint16_t prev_logical = static_cast<uint16_t>(expected & 0xFFFFu);
+
+            uint64_t next_wall = std::max({prev_wall, remote_wall, current_wall});
+            uint16_t next_logical = 0;
+            if (next_wall == prev_wall && next_wall == remote_wall) {
+                next_logical = static_cast<uint16_t>(std::max(prev_logical, remote.logical) + 1u);
+            } else if (next_wall == prev_wall) {
+                next_logical = static_cast<uint16_t>(prev_logical + 1u);
+            } else if (next_wall == remote_wall) {
+                next_logical = static_cast<uint16_t>(remote.logical + 1u);
+            }
+
+            uint64_t desired = (next_wall << 16) | next_logical;
+            if (state_.compare_exchange_weak(expected, desired,
+                                             std::memory_order_acq_rel,
+                                             std::memory_order_relaxed)) {
+                return;
+            }
         }
     }
 
 private:
+    static constexpr uint64_t kWallMask = (1ULL << 48) - 1ULL;
     uint32_t node_id_;
-    uint64_t last_wall_time_;
-    uint16_t logical_counter_;
-    std::mutex mu_;
+    std::atomic<uint64_t> state_{0};
 };
 
 } // namespace l3kvg
