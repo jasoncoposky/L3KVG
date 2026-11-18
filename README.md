@@ -15,14 +15,14 @@ Evaluated across 100,000 nodes, 1,000,000 neighbor traversals, and 10,000 multi-
 
 | Metric / Workload | Empirical Measurement | Production SLA | Speedup vs Baseline |
 | :--- | :---: | :---: | :---: |
-| **Raw Edge Ingestion** | **224,728 edges/sec** (`0.445s`) | > 150,000 edges/sec | **~23.7x** (vs 9.5k baseline) |
-| **Point Hop Traversal Latency** | **16.70 ns / hop** (visitor) · **20.54 ns / hop** (span) | < 50.00 ns / hop | **~3.0x faster than SLA** |
-| **SIMD Predicate Filter (AVX2)** | **486 ns / 1,000 edges** | < 2,000 ns / 1k edges | **4.1x faster than SLA** |
-| **Chained 4KB Page Traversal** | **484 ns across 600 edges** | < 1,500 ns | **3.1x faster than SLA** |
-| **Complex Branching Join (`OBJ_STAT`)** | **6.68 µs** | < 20.00 µs | **14.6x speedup** (vs 97.3 µs baseline) |
+| **Raw Edge Ingestion** | **212,717–240,802 edges/sec** | > 150,000 edges/sec | **~25.3x** (vs 9.5k baseline) |
+| **Point Hop Traversal Latency** | **16.64 ns / hop** (visitor) · **19.90 ns / hop** (span) | < 50.00 ns / hop | **~3.0x faster than SLA** |
+| **SIMD Predicate Filter (AVX2)** | **489.2 ns / 1,000 edges** | < 2,000 ns / 1k edges | **4.1x faster than SLA** |
+| **Chained 4KB Page Traversal** | **439.8 ns across 600 edges** | < 1,500 ns | **3.4x faster than SLA** |
+| **Complex Branching Join (`OBJ_STAT`)** | **6.70 µs** | < 20.00 µs | **14.5x speedup** (vs 97.3 µs baseline) |
 
-- **`bench_engine_core` (10k nodes):** `146,194 nodes/sec` put (`68.4 ms`), `0.484 µs` get (`4.84 ms`).
-- **`bench_l3kvg` (10k nodes/edges):** `67,309 ops/sec` concurrent atomic `add_edge`, `0.349 µs` 50-fanout traversal (`[SUCCESS] SRE Metrics Achieved!`).
+- **`bench_engine_core` (10k nodes):** `189,731 nodes/sec` put (`52.71 ms`), `0.515 µs` get (`5.15 ms`).
+- **`bench_l3kvg` (10k nodes/edges):** `55,385–60,735 ops/sec` concurrent atomic `add_edge` (100 threads), `0.350 µs` 50-fanout traversal (`[SUCCESS] SRE Metrics Achieved!`).
 
 ### 2. Enterprise Catalog Qualification: L3KVG vs. PostgreSQL 16
 Evaluated against PostgreSQL 16 on live iRODS 5.1.0 catalog macro-workloads (1K Scale Tier: 1,000 data objects, 50 collections, depth 2, 300 queries per pass):
