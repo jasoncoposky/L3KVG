@@ -1204,6 +1204,7 @@ std::vector<ResultRow> Query::execute() {
           std::vector<std::unordered_map<uint16_t, std::vector<SuspendedItem>>> chunk_susp(num_chunks);
 
           auto step_chunk = [&](size_t c_first, size_t c_last) {
+              std::vector<uint64_t> neighbors;
               for (size_t c = c_first; c < c_last; ++c) {
                   const size_t start = (paths.size() * c) / num_chunks;
                   const size_t end = (paths.size() * (c + 1)) / num_chunks;
@@ -1216,9 +1217,11 @@ std::vector<ResultRow> Query::execute() {
                       const auto& src_node = path.get(src_slot);
                       if (!src_node) continue;
 
-                      std::vector<uint64_t> neighbors = rstep.is_out
-                          ? src_node->get_neighbors(rstep.label, rstep.min_weight, principal_id_)
-                          : src_node->get_in_neighbors(rstep.label, principal_id_);
+                      if (rstep.is_out) {
+                          src_node->get_neighbors_into(neighbors, rstep.label, rstep.min_weight, principal_id_);
+                      } else {
+                          src_node->get_in_neighbors_into(neighbors, rstep.label, principal_id_);
+                      }
                       if (neighbors.size() > 1) {
                           std::sort(neighbors.begin(), neighbors.end());
                           neighbors.erase(std::unique(neighbors.begin(), neighbors.end()), neighbors.end());
@@ -1258,13 +1261,7 @@ std::vector<ResultRow> Query::execute() {
           if (num_chunks == 1) {
               step_chunk(0, 1);
           } else {
-              std::vector<std::future<void>> futs;
-              futs.reserve(num_chunks - 1);
-              for (size_t c = 0; c + 1 < num_chunks; ++c) {
-                  futs.push_back(engine_->get_thread_pool().enqueue([&, c]() { step_chunk(c, c + 1); }));
-              }
-              step_chunk(num_chunks - 1, num_chunks);
-              for (auto& f : futs) f.get();
+              engine_->get_thread_pool().parallel_for(0, num_chunks, step_chunk);
           }
 
           size_t total_next = 0;

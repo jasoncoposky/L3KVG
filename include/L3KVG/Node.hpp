@@ -58,6 +58,13 @@ public:
 
   template <typename T> T get_attribute(std::string_view key);
 
+  void get_neighbors_into(std::vector<uint64_t> &out, std::string_view label,
+                          double min_weight = -999999.0,
+                          uint32_t principal_id = l3kv::INTERNAL_UID);
+
+  void get_in_neighbors_into(std::vector<uint64_t> &out, std::string_view label,
+                             uint32_t principal_id = l3kv::INTERNAL_UID);
+
   std::vector<uint64_t> get_neighbors(std::string_view label,
                                          double min_weight = -999999.0,
                                          uint32_t principal_id = l3kv::INTERNAL_UID);

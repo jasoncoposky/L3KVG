@@ -241,9 +241,11 @@ void Node::register_edge_bloom(std::string_view label) {
   bloom_filter_.fetch_or(bloom_hash(label), std::memory_order_relaxed);
 }
 
-std::vector<uint64_t> Node::get_neighbors(std::string_view label,
-                                             double min_weight,
-                                             uint32_t principal_id) {
+void Node::get_neighbors_into(std::vector<uint64_t>& neighbors,
+                              std::string_view label,
+                              double min_weight,
+                              uint32_t principal_id) {
+  neighbors.clear();
   uint16_t lid = 0;
   if (!label.empty()) {
       lid = engine_->get_label_registry().lookup(label);
@@ -252,11 +254,10 @@ std::vector<uint64_t> Node::get_neighbors(std::string_view label,
   const bool allow_kv_fallback = engine_->has_legacy_kv_edges() || !engine_->get_settings().cluster_endpoints.empty();
   auto& resolver = engine_->get_resolver();
 
-  std::vector<uint64_t> neighbors;
   if (lid != 0 || label.empty()) {
       engine_->get_adjacency_store().filter_outgoing_edges(id_, lid, static_cast<float>(min_weight), neighbors);
       if (!neighbors.empty() || (!allow_kv_fallback && resolver.is_local(id_))) {
-          return neighbors;
+          return;
       }
   }
 
@@ -294,7 +295,7 @@ std::vector<uint64_t> Node::get_neighbors(std::string_view label,
           current_start = chunk.back().first + '\0';
       }
       if (!neighbors.empty()) {
-          return neighbors;
+          return;
       }
   }
 
@@ -302,16 +303,28 @@ std::vector<uint64_t> Node::get_neighbors(std::string_view label,
       lite3::NodeID owner = resolver.get_node_owner(id_);
       auto& client = engine_->get_remote_client();
       try {
-          return client.get_neighbors(owner, id_, label, min_weight, principal_id);
+          neighbors = client.get_neighbors(owner, id_, label, min_weight, principal_id);
+          return;
       } catch (const std::exception& e) {
           std::cerr << "[Node::get_neighbors] Remote RPC Failed: " << e.what() << "\n";
-          return {};
+          neighbors.clear();
+          return;
       }
   }
+}
+
+std::vector<uint64_t> Node::get_neighbors(std::string_view label,
+                                             double min_weight,
+                                             uint32_t principal_id) {
+  std::vector<uint64_t> neighbors;
+  get_neighbors_into(neighbors, label, min_weight, principal_id);
   return neighbors;
 }
 
-std::vector<uint64_t> Node::get_in_neighbors(std::string_view label, uint32_t principal_id) {
+void Node::get_in_neighbors_into(std::vector<uint64_t>& neighbors,
+                                 std::string_view label,
+                                 uint32_t principal_id) {
+  neighbors.clear();
   uint16_t lid = 0;
   if (!label.empty()) {
       lid = engine_->get_label_registry().lookup(label);
@@ -320,7 +333,6 @@ std::vector<uint64_t> Node::get_in_neighbors(std::string_view label, uint32_t pr
   const bool allow_kv_fallback = engine_->has_legacy_kv_edges() || !engine_->get_settings().cluster_endpoints.empty();
   auto& resolver = engine_->get_resolver();
 
-  std::vector<uint64_t> neighbors;
   if (lid != 0 || label.empty()) {
       engine_->get_adjacency_store().for_each_incoming_edge(id_, [&](const PackedEdge& pe) {
           if (pe.is_active() && (lid == 0 || pe.label_id == lid)) {
@@ -328,7 +340,7 @@ std::vector<uint64_t> Node::get_in_neighbors(std::string_view label, uint32_t pr
           }
       });
       if (!neighbors.empty() || (!allow_kv_fallback && resolver.is_local(id_))) {
-          return neighbors;
+          return;
       }
   }
 
@@ -358,7 +370,7 @@ std::vector<uint64_t> Node::get_in_neighbors(std::string_view label, uint32_t pr
           current_start = chunk.back().first + '\0';
       }
       if (!neighbors.empty()) {
-          return neighbors;
+          return;
       }
   }
 
@@ -366,12 +378,19 @@ std::vector<uint64_t> Node::get_in_neighbors(std::string_view label, uint32_t pr
       lite3::NodeID owner = resolver.get_node_owner(id_);
       auto& client = engine_->get_remote_client();
       try {
-          return client.get_in_neighbors(owner, id_, label, principal_id);
+          neighbors = client.get_in_neighbors(owner, id_, label, principal_id);
+          return;
       } catch (const std::exception& e) {
           std::cerr << "[Node::get_in_neighbors] Remote RPC Failed: " << e.what() << "\n";
-          return {};
+          neighbors.clear();
+          return;
       }
   }
+}
+
+std::vector<uint64_t> Node::get_in_neighbors(std::string_view label, uint32_t principal_id) {
+  std::vector<uint64_t> neighbors;
+  get_in_neighbors_into(neighbors, label, principal_id);
   return neighbors;
 }
 
