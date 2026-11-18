@@ -7,6 +7,7 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <span>
 #include <string>
 #include <string_view>
@@ -341,7 +342,7 @@ private:
     std::atomic<bool> has_auth_secret_{false};
     std::unordered_map<lite3::NodeID, std::shared_ptr<PeerState>> peers_;
     std::shared_ptr<SocketRegistry> socket_registry_;
-    std::mutex endpoints_mutex_;
+    std::shared_mutex endpoints_mutex_;
     int zmq_sndhwm_;
     zmq::context_t zmq_ctx_;
     std::shared_ptr<ThreadPool> task_pool_;

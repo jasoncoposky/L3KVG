@@ -235,7 +235,7 @@ RemoteL3KVClient::~RemoteL3KVClient() {
         }
     }
     {
-        std::lock_guard<std::mutex> lock(endpoints_mutex_);
+        std::unique_lock<std::shared_mutex> lock(endpoints_mutex_);
         peers_.clear();
     }
 
@@ -247,7 +247,7 @@ RemoteL3KVClient::~RemoteL3KVClient() {
 }
 
 void RemoteL3KVClient::set_auth_secret(const std::string& secret) {
-    std::lock_guard<std::mutex> lock(endpoints_mutex_);
+    std::unique_lock<std::shared_mutex> lock(endpoints_mutex_);
     if (auth_secret_ != secret) {
         auth_secret_ = secret;
         has_auth_secret_.store(!auth_secret_.empty(), std::memory_order_release);
@@ -269,7 +269,7 @@ void RemoteL3KVClient::add_peer(lite3::NodeID node_id, const std::string& endpoi
         url = "tcp://" + url;
     }
 
-    std::lock_guard<std::mutex> lock(endpoints_mutex_);
+    std::unique_lock<std::shared_mutex> lock(endpoints_mutex_);
     auto peer = std::make_shared<PeerState>();
     peer->endpoint = std::move(url);
     peers_[node_id] = std::move(peer);
@@ -277,7 +277,7 @@ void RemoteL3KVClient::add_peer(lite3::NodeID node_id, const std::string& endpoi
 }
 
 std::shared_ptr<RemoteL3KVClient::PeerState> RemoteL3KVClient::get_peer_state(lite3::NodeID node_id) {
-    std::lock_guard<std::mutex> lock(endpoints_mutex_);
+    std::shared_lock<std::shared_mutex> lock(endpoints_mutex_);
     auto it = peers_.find(node_id);
     return (it != peers_.end()) ? it->second : nullptr;
 }
@@ -309,7 +309,7 @@ void RemoteL3KVClient::ensure_socket_authenticated(TlSocketBox& box, lite3::Node
 
     std::string secret_copy;
     {
-        std::lock_guard<std::mutex> lock(endpoints_mutex_);
+        std::shared_lock<std::shared_mutex> lock(endpoints_mutex_);
         secret_copy = auth_secret_;
     }
     if (secret_copy.empty()) {
@@ -380,7 +380,7 @@ RemoteL3KVClient::TlSocketBox* RemoteL3KVClient::get_or_create_tl_socket(
 
     std::shared_ptr<PeerState> peer;
     {
-        std::lock_guard<std::mutex> lock(endpoints_mutex_);
+        std::shared_lock<std::shared_mutex> lock(endpoints_mutex_);
         auto pit = peers_.find(node_id);
         if (pit == peers_.end()) {
             return nullptr;
@@ -490,7 +490,7 @@ void RemoteL3KVClient::run_health_check_loop() {
 
         std::vector<std::pair<lite3::NodeID, std::shared_ptr<PeerState>>> to_check;
         {
-            std::lock_guard<std::mutex> lock(endpoints_mutex_);
+            std::shared_lock<std::shared_mutex> lock(endpoints_mutex_);
             for (auto& [id, peer] : peers_) {
                 CircuitState st = peer->state.load(std::memory_order_acquire);
                 if (st == CircuitState::HALF_OPEN) {
