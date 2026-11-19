@@ -21,6 +21,7 @@
 #include "L3KVG/LabelRegistry.hpp"
 #include "L3KVG/AdjacencyStore.hpp"
 #include "L3KVG/BinaryEdgeWAL.hpp"
+#include "L3KVG/PropertyIndex.hpp"
 #include "engine/credential_manager.hpp"
 
 namespace l3kv {
@@ -102,6 +103,7 @@ public:
   std::shared_ptr<Node> get_swizzled(uint64_t id);
 
   l3kv::Engine *get_store() const { return store_.get(); }
+  PropertyIndex property_index() const noexcept { return PropertyIndex(store_.get()); }
   
   FederationResolver& get_resolver() { return resolver_; }
   RemoteL3KVClient& get_remote_client() { return *remote_client_; }

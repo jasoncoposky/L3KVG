@@ -25,6 +25,7 @@ add_library(l3kvg_engine STATIC
     src/AdjacencyStore.cpp
     src/SIMDFilter.cpp
     src/BinaryEdgeWAL.cpp
+    src/PropertyIndex.cpp
 )
 
 include(CheckCXXCompilerFlag)
@@ -87,6 +88,10 @@ if(NOT TARGET gtest_main)
 endif()
 add_executable(test_l3kvg tests/test_engine.cpp)
 target_link_libraries(test_l3kvg PRIVATE l3kvg_engine gtest_main Threads::Threads)
+
+add_executable(test_property_index tests/test_property_index.cpp)
+target_link_libraries(test_property_index PRIVATE l3kvg_engine gtest_main Threads::Threads)
+add_test(NAME test_property_index COMMAND test_property_index)
 
 add_executable(test_fluent_api tests/test_fluent_api.cpp)
 target_link_libraries(test_fluent_api PRIVATE l3kvg_engine gtest_main Threads::Threads)
