@@ -135,6 +135,17 @@ ctest --test-dir build --output-on-failure
 
 ---
 
+## 📚 Administrator Documentation
+
+- [Architecture & Bifurcated Graph Substrate](docs/admin/architecture_and_substrate.md) — `AdjacencyStore`, `VertexRecord`/`AdjacencyPage` layout, `SIMDFilter`, `PropertyIndex`, and on-disk storage modes.
+- [Durability, WAL & Crash Recovery](docs/admin/durability_wal_and_recovery.md) — `BinaryEdgeWAL`, `MutationBatch`, 64 KB chunked recovery, auto-compaction thresholds, and backup procedures.
+- [Clustering, Federation & Active-Active Replication](docs/admin/clustering_federation_and_replication.md) — Consistent-hash sharding, `EdgeCoordinator`, HLC LWW conflict resolution, and `RemoteL3KVClient` circuit breakers.
+- [Configuration, Runtime Knobs & Tuning](docs/admin/configuration_and_tuning.md) — Server `config.json`, `l3kvg::Settings` reference, and Docker Compose mesh deployment.
+- [Identity Management, Principals & Access Control](docs/admin/identity_management.md) — ZeroMQ `auth_secret`, `principal_id` propagation, `CredentialManager` longest-prefix ACLs, `sys:u:`/`sys:acl:` replication, and vertex/UUID resolution.
+- [Security, Observability & Operational Runbooks](docs/admin/security_observability_and_runbooks.md) — ZeroMQ `auth_secret`, `l3kv::Permission` ACLs, `SREMetrics`, and incident troubleshooting.
+
+---
+
 ## 📄 License
 
 See [LICENSE](LICENSE) for details.
