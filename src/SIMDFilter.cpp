@@ -6,9 +6,20 @@ void SIMDFilter::filter_edges(std::span<const PackedEdge> edges,
                              uint16_t target_label,
                              float min_weight,
                              std::vector<uint64_t>& matched_targets) {
+    if (edges.empty()) return;
+    matched_targets.reserve(matched_targets.size() + edges.size());
+    uint64_t batch[32];
+    size_t batch_len = 0;
     filter_edges_cb(edges, target_label, min_weight, [&](const PackedEdge& edge) {
-        matched_targets.push_back(edge.target_id);
+        batch[batch_len++] = edge.target_id;
+        if (batch_len == 32) {
+            matched_targets.insert(matched_targets.end(), batch, batch + 32);
+            batch_len = 0;
+        }
     });
+    if (batch_len > 0) {
+        matched_targets.insert(matched_targets.end(), batch, batch + batch_len);
+    }
 }
 
 size_t SIMDFilter::count_matching_edges(std::span<const PackedEdge> edges,

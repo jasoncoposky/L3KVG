@@ -2,6 +2,7 @@
 #include "L3KVG/SIMDFilter.hpp"
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 
 namespace l3kvg {
 
@@ -26,6 +27,225 @@ inline void update_existing_edge_in_place(PackedEdge& existing, const PackedEdge
             existing.flags | (incoming.flags & PackedEdge::FLAG_DIRECTED) |
             PackedEdge::FLAG_ACTIVE);
     }
+}
+
+// Inserts or updates `edge` in a vertex's page chain starting at `head_page_id`.
+// For single-page chains (<= 170 edges), performs a cache-local linear scan.
+// Once a vertex chains beyond 1 page, promotes to O(1) SupernodeState dedup + tail append.
+// Returns true if a new edge was inserted, false if an existing edge was updated in place.
+bool add_edge_to_page_chain(
+    AdjacencyStore::Shard& shard,
+    size_t shard_idx,
+    uint64_t owner_id,
+    uint32_t head_page_id,
+    const PackedEdge& edge,
+    std::unordered_map<uint64_t, AdjacencyStore::SupernodeState>& super_map) {
+    uint32_t head_shard = AdjacencyStore::decode_shard_index(head_page_id);
+    uint32_t head_local = AdjacencyStore::decode_local_page_id(head_page_id);
+    if (head_shard != shard_idx || head_local >= shard.page_pool.size()) {
+        return false;
+    }
+
+    auto& head_page = shard.page_pool[head_local];
+
+    // Fast O(1) supernode path when chain spans >1 page
+    if (head_page.next_page_id != 0) {
+        auto sit = super_map.find(owner_id);
+        if (sit != super_map.end()) {
+            auto& st = sit->second;
+            AdjacencyStore::SupernodeKey skey{edge.target_id, edge.label_id};
+            if (auto bit = st.slots.find(skey); bit != st.slots.end()) {
+                auto check_ref = [&](AdjacencyStore::EdgeSlotRef ref) -> bool {
+                    auto& pe = shard.page_pool[ref.local_page_id].edges[ref.slot_idx];
+                    if (pe.is_active() && same_edge_weight(pe.weight, edge.weight)) {
+                        update_existing_edge_in_place(pe, edge);
+                        return true;
+                    }
+                    return false;
+                };
+                if (bit->second.has_first && check_ref(bit->second.first)) {
+                    return false;
+                }
+                for (const auto& ref : bit->second.extra) {
+                    if (check_ref(ref)) {
+                        return false;
+                    }
+                }
+            }
+
+            AdjacencyStore::EdgeSlotRef inserted_ref{};
+            if (!st.tombstones.empty()) {
+                inserted_ref = st.tombstones.back();
+                st.tombstones.pop_back();
+                auto& pg = shard.page_pool[inserted_ref.local_page_id];
+                pg.edges[inserted_ref.slot_idx] = edge;
+                if (pg.tombstone_count > 0) {
+                    pg.tombstone_count--;
+                }
+            } else {
+                uint32_t tail_local = st.tail_local_page_id;
+                auto* tail_page = &shard.page_pool[tail_local];
+                if (tail_page->count < AdjacencyPage::CAPACITY) {
+                    uint16_t slot = static_cast<uint16_t>(tail_page->count++);
+                    tail_page->edges[slot] = edge;
+                    inserted_ref = {tail_local, slot};
+                } else {
+                    uint32_t new_local = shard.page_pool.allocate_page();
+                    uint32_t new_page_id = AdjacencyStore::encode_page_id(shard_idx, new_local);
+                    shard.page_pool[tail_local].next_page_id = new_page_id;
+                    auto& new_page = shard.page_pool[new_local];
+                    new_page.edges[0] = edge;
+                    new_page.count = 1;
+                    new_page.next_page_id = 0;
+                    new_page.tombstone_count = 0;
+                    st.tail_local_page_id = new_local;
+                    inserted_ref = {new_local, 0};
+                }
+            }
+            st.slots[skey].add(inserted_ref);
+            return true;
+        }
+    }
+
+    // Single-page fast path (<= 170 edges)
+    PackedEdge* first_tombstone = nullptr;
+    AdjacencyPage* first_tombstone_page = nullptr;
+    for (uint32_t i = 0; i < head_page.count; ++i) {
+        if (head_page.edges[i].is_active()) {
+            if (head_page.edges[i].target_id == edge.target_id &&
+                head_page.edges[i].label_id == edge.label_id &&
+                same_edge_weight(head_page.edges[i].weight, edge.weight)) {
+                update_existing_edge_in_place(head_page.edges[i], edge);
+                return false;
+            }
+        } else if (first_tombstone == nullptr) {
+            first_tombstone = &head_page.edges[i];
+            first_tombstone_page = &head_page;
+        }
+    }
+
+    if (first_tombstone != nullptr) {
+        *first_tombstone = edge;
+        if (first_tombstone_page->tombstone_count > 0) {
+            first_tombstone_page->tombstone_count--;
+        }
+        return true;
+    }
+
+    if (head_page.count < AdjacencyPage::CAPACITY) {
+        head_page.edges[head_page.count++] = edge;
+        return true;
+    }
+
+    // Head page is full -> allocate page 2 and promote vertex to O(1) SupernodeState
+    uint32_t new_local = shard.page_pool.allocate_page();
+    uint32_t new_page_id = AdjacencyStore::encode_page_id(shard_idx, new_local);
+    auto& hp_after = shard.page_pool[head_local];
+    hp_after.next_page_id = new_page_id;
+
+    auto& new_page = shard.page_pool[new_local];
+    new_page.edges[0] = edge;
+    new_page.count = 1;
+    new_page.next_page_id = 0;
+    new_page.tombstone_count = 0;
+
+    auto& st = super_map[owner_id];
+    st.tail_local_page_id = new_local;
+    st.slots.reserve(AdjacencyPage::CAPACITY * 2);
+    for (uint32_t i = 0; i < hp_after.count; ++i) {
+        if (hp_after.edges[i].is_active()) {
+            st.slots[AdjacencyStore::SupernodeKey{hp_after.edges[i].target_id, hp_after.edges[i].label_id}]
+                .add(AdjacencyStore::EdgeSlotRef{head_local, static_cast<uint16_t>(i)});
+        } else {
+            st.tombstones.push_back(AdjacencyStore::EdgeSlotRef{head_local, static_cast<uint16_t>(i)});
+        }
+    }
+    st.slots[AdjacencyStore::SupernodeKey{edge.target_id, edge.label_id}]
+        .add(AdjacencyStore::EdgeSlotRef{new_local, 0});
+    return true;
+}
+
+// Tombstones a matching edge in a vertex's page chain starting at `head_page_id`.
+// Uses O(1) SupernodeState lookup when chained across >1 page.
+bool del_edge_from_page_chain(
+    AdjacencyStore::Shard& shard,
+    size_t shard_idx,
+    uint64_t owner_id,
+    uint32_t head_page_id,
+    uint64_t target_id,
+    uint16_t label_id,
+    float weight,
+    bool wildcard_weight,
+    std::unordered_map<uint64_t, AdjacencyStore::SupernodeState>& super_map,
+    uint16_t* out_removed_flags,
+    float* out_matched_weight) {
+    uint32_t head_shard = AdjacencyStore::decode_shard_index(head_page_id);
+    uint32_t head_local = AdjacencyStore::decode_local_page_id(head_page_id);
+    if (head_shard != shard_idx || head_local >= shard.page_pool.size()) {
+        return false;
+    }
+
+    auto& head_page = shard.page_pool[head_local];
+
+    // O(1) supernode path
+    if (head_page.next_page_id != 0) {
+        if (auto sit = super_map.find(owner_id); sit != super_map.end()) {
+            auto& st = sit->second;
+            AdjacencyStore::SupernodeKey skey{target_id, label_id};
+            if (auto bit = st.slots.find(skey); bit != st.slots.end()) {
+                auto try_erase_ref = [&](AdjacencyStore::EdgeSlotRef ref) -> bool {
+                    auto& pg = shard.page_pool[ref.local_page_id];
+                    auto& pe = pg.edges[ref.slot_idx];
+                    if (pe.is_active() && (wildcard_weight || same_edge_weight(pe.weight, weight))) {
+                        if (out_removed_flags) *out_removed_flags = pe.flags;
+                        if (out_matched_weight) *out_matched_weight = pe.weight;
+                        pe.set_active(false);
+                        pg.tombstone_count++;
+                        bit->second.remove(ref);
+                        if (bit->second.empty()) {
+                            st.slots.erase(bit);
+                        }
+                        st.tombstones.push_back(ref);
+                        return true;
+                    }
+                    return false;
+                };
+                if (bit->second.has_first && try_erase_ref(bit->second.first)) {
+                    return true;
+                }
+                for (size_t i = 0; i < bit->second.extra.size(); ++i) {
+                    if (try_erase_ref(bit->second.extra[i])) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+    }
+
+    // Single-page (or unindexed fallback) linear scan
+    uint32_t curr_id = head_page_id;
+    while (curr_id != 0) {
+        uint32_t p_shard = AdjacencyStore::decode_shard_index(curr_id);
+        uint32_t local_id = AdjacencyStore::decode_local_page_id(curr_id);
+        if (p_shard != shard_idx || local_id >= shard.page_pool.size()) break;
+        auto& page = shard.page_pool[local_id];
+        if (page.next_page_id == curr_id) break;
+        for (uint32_t i = 0; i < page.count; ++i) {
+            if (page.edges[i].target_id == target_id &&
+                page.edges[i].label_id == label_id &&
+                (wildcard_weight || same_edge_weight(page.edges[i].weight, weight)) &&
+                page.edges[i].is_active()) {
+                if (out_removed_flags) *out_removed_flags = page.edges[i].flags;
+                if (out_matched_weight) *out_matched_weight = page.edges[i].weight;
+                page.edges[i].set_active(false);
+                page.tombstone_count++;
+                return true;
+            }
+        }
+        curr_id = page.next_page_id;
+    }
+    return false;
 }
 
 } // namespace
@@ -99,50 +319,11 @@ bool AdjacencyStore::add_edge(uint64_t src_id, uint64_t dst_id, uint16_t label_i
                 v.out_degree = 1 | VertexRecord::FLAG_PROMOTED;
                 return true;
             } else {
-                PackedEdge* first_tombstone = nullptr;
-                uint32_t curr_id = v.ext.out_block_id;
-                uint32_t last_local_id = decode_local_page_id(curr_id);
-                while (curr_id != 0) {
-                    uint32_t p_shard = decode_shard_index(curr_id);
-                    uint32_t local_id = decode_local_page_id(curr_id);
-                    if (p_shard != s_src || local_id >= shard.page_pool.size()) break;
-                    last_local_id = local_id;
-                    auto& page = shard.page_pool[local_id];
-                    for (uint32_t i = 0; i < page.count; ++i) {
-                        if (page.edges[i].is_active()) {
-                            if (page.edges[i].target_id == edge.target_id &&
-                                page.edges[i].label_id == edge.label_id &&
-                                same_edge_weight(page.edges[i].weight, edge.weight)) {
-                                update_existing_edge_in_place(page.edges[i], edge);
-                                return false;
-                            }
-                        } else if (first_tombstone == nullptr) {
-                            first_tombstone = &page.edges[i];
-                        }
-                    }
-                    if (page.next_page_id == 0 || page.next_page_id == curr_id) {
-                        break;
-                    }
-                    curr_id = page.next_page_id;
+                if (add_edge_to_page_chain(shard, s_src, src_id, v.ext.out_block_id, edge, shard.super_out)) {
+                    v.out_degree = ((v.out_degree & VertexRecord::DEGREE_MASK) + 1) | VertexRecord::FLAG_PROMOTED;
+                    return true;
                 }
-                if (first_tombstone != nullptr) {
-                    *first_tombstone = edge;
-                } else {
-                    auto* curr_page = &shard.page_pool[last_local_id];
-                    if (curr_page->count < AdjacencyPage::CAPACITY) {
-                        curr_page->edges[curr_page->count++] = edge;
-                    } else {
-                        uint32_t new_local_id = shard.page_pool.allocate_page();
-                        uint32_t new_page_id = encode_page_id(s_src, new_local_id);
-                        shard.page_pool[last_local_id].next_page_id = new_page_id;
-                        auto& new_page = shard.page_pool[new_local_id];
-                        new_page.edges[0] = edge;
-                        new_page.count = 1;
-                        new_page.next_page_id = 0;
-                    }
-                }
-                v.out_degree = ((v.out_degree & VertexRecord::DEGREE_MASK) + 1) | VertexRecord::FLAG_PROMOTED;
-                return true;
+                return false;
             }
         }
     };
@@ -208,60 +389,23 @@ bool AdjacencyStore::add_edge(uint64_t src_id, uint64_t dst_id, uint16_t label_i
                 } else {
                     uint32_t in_local_id = shard.page_pool.allocate_page();
                     auto& in_page = shard.page_pool[in_local_id];
+                    uint32_t tombs = 0;
                     for (uint32_t i = 0; i < blk.count; ++i) {
                         in_page.edges[i] = blk.edges[i];
+                        if (!blk.edges[i].is_active()) tombs++;
                     }
                     in_page.edges[blk.count] = in_edge;
                     in_page.count = blk.count + 1;
                     in_page.next_page_id = 0;
+                    in_page.tombstone_count = tombs;
                     v.ext.in_block_id = encode_page_id(s_dst, in_local_id);
                 }
                 v.in_degree++;
             }
         } else {
-            PackedEdge* first_tombstone = nullptr;
-            uint32_t curr_id = v.ext.in_block_id;
-            uint32_t last_local_id = decode_local_page_id(curr_id);
-            while (curr_id != 0) {
-                uint32_t p_shard = decode_shard_index(curr_id);
-                uint32_t local_id = decode_local_page_id(curr_id);
-                if (p_shard != s_dst || local_id >= shard.page_pool.size()) break;
-                last_local_id = local_id;
-                auto& page = shard.page_pool[local_id];
-                for (uint32_t i = 0; i < page.count; ++i) {
-                    if (page.edges[i].is_active()) {
-                        if (page.edges[i].target_id == in_edge.target_id &&
-                            page.edges[i].label_id == in_edge.label_id &&
-                            same_edge_weight(page.edges[i].weight, in_edge.weight)) {
-                            update_existing_edge_in_place(page.edges[i], in_edge);
-                            return;
-                        }
-                    } else if (first_tombstone == nullptr) {
-                        first_tombstone = &page.edges[i];
-                    }
-                }
-                if (page.next_page_id == 0 || page.next_page_id == curr_id) {
-                    break;
-                }
-                curr_id = page.next_page_id;
+            if (add_edge_to_page_chain(shard, s_dst, dst_id, v.ext.in_block_id, in_edge, shard.super_in)) {
+                v.in_degree++;
             }
-            if (first_tombstone != nullptr) {
-                *first_tombstone = in_edge;
-            } else {
-                auto* curr_page = &shard.page_pool[last_local_id];
-                if (curr_page->count < AdjacencyPage::CAPACITY) {
-                    curr_page->edges[curr_page->count++] = in_edge;
-                } else {
-                    uint32_t new_local_id = shard.page_pool.allocate_page();
-                    uint32_t new_page_id = encode_page_id(s_dst, new_local_id);
-                    shard.page_pool[last_local_id].next_page_id = new_page_id;
-                    auto& new_page = shard.page_pool[new_local_id];
-                    new_page.edges[0] = in_edge;
-                    new_page.count = 1;
-                    new_page.next_page_id = 0;
-                }
-            }
-            v.in_degree++;
         }
     };
 
@@ -310,32 +454,15 @@ bool AdjacencyStore::del_edge(uint64_t src_id, uint64_t dst_id, uint16_t label_i
                     v.ext.page_offset = 0;
                 }
             } else if (v.is_promoted() && v.ext.out_block_id > 0) {
-                uint32_t curr_id = v.ext.out_block_id;
-                while (curr_id != 0) {
-                    uint32_t p_shard = decode_shard_index(curr_id);
-                    uint32_t local_id = decode_local_page_id(curr_id);
-                    if (p_shard != s_src || local_id >= shard_src.page_pool.size()) break;
-                    auto& page = shard_src.page_pool[local_id];
-                    if (page.next_page_id == curr_id) break; // cycle guard
-                    for (uint32_t i = 0; i < page.count; ++i) {
-                        if (page.edges[i].target_id == dst_id &&
-                            page.edges[i].label_id == label_id &&
-                            (weight < 0.0f || same_edge_weight(page.edges[i].weight, weight)) &&
-                            page.edges[i].is_active()) {
-                            if (out_removed_flags) *out_removed_flags = page.edges[i].flags;
-                            matched_weight = page.edges[i].weight;
-                            if (out_removed_weight) *out_removed_weight = matched_weight;
-                            page.edges[i].set_active(false);
-                            found = true;
-                            uint32_t current_deg = v.out_degree & VertexRecord::DEGREE_MASK;
-                            if (current_deg > 0) {
-                                v.out_degree = (current_deg - 1) | (v.out_degree & VertexRecord::FLAG_PROMOTED);
-                            }
-                            break;
-                        }
+                if (del_edge_from_page_chain(shard_src, s_src, src_id, v.ext.out_block_id,
+                                             dst_id, label_id, weight, weight < 0.0f,
+                                             shard_src.super_out, out_removed_flags, &matched_weight)) {
+                    if (out_removed_weight) *out_removed_weight = matched_weight;
+                    found = true;
+                    uint32_t current_deg = v.out_degree & VertexRecord::DEGREE_MASK;
+                    if (current_deg > 0) {
+                        v.out_degree = (current_deg - 1) | (v.out_degree & VertexRecord::FLAG_PROMOTED);
                     }
-                    if (found) break;
-                    curr_id = page.next_page_id;
                 }
             }
         }
@@ -365,29 +492,13 @@ bool AdjacencyStore::del_edge(uint64_t src_id, uint64_t dst_id, uint16_t label_i
                             }
                         }
                     } else {
-                    bool in_found = false;
-                    while (curr_id != 0) {
-                        uint32_t p_shard = decode_shard_index(curr_id);
-                        uint32_t local_id = decode_local_page_id(curr_id);
-                        if (p_shard != s_dst || local_id >= shard_dst.page_pool.size()) break;
-                        auto& page = shard_dst.page_pool[local_id];
-                        if (page.next_page_id == curr_id) break; // cycle guard
-                        for (uint32_t i = 0; i < page.count; ++i) {
-                            if (page.edges[i].target_id == src_id &&
-                                page.edges[i].label_id == label_id &&
-                                same_edge_weight(page.edges[i].weight, matched_weight) &&
-                                page.edges[i].is_active()) {
-                                page.edges[i].set_active(false);
-                                if (v.in_degree > 0) {
-                                    v.in_degree--;
-                                }
-                                in_found = true;
-                                break;
+                        if (del_edge_from_page_chain(shard_dst, s_dst, dst_id, curr_id,
+                                                     src_id, label_id, matched_weight, false,
+                                                     shard_dst.super_in, nullptr, nullptr)) {
+                            if (v.in_degree > 0) {
+                                v.in_degree--;
                             }
                         }
-                        if (in_found) break;
-                        curr_id = page.next_page_id;
-                    }
                     }
                 }
             }
@@ -466,9 +577,13 @@ std::vector<PackedEdge> AdjacencyStore::get_outgoing_edges_snapshot(uint64_t src
         if (p_shard != s_idx || p_local >= shard.page_pool.size()) break;
         const auto& page = shard.page_pool[p_local];
         if (page.next_page_id == curr_id) break; // cycle guard
-        for (uint32_t i = 0; i < page.count; ++i) {
-            if (page.edges[i].is_active()) {
-                result.push_back(page.edges[i]);
+        if (page.tombstone_count == 0) {
+            result.insert(result.end(), page.edges, page.edges + page.count);
+        } else {
+            for (uint32_t i = 0; i < page.count; ++i) {
+                if (page.edges[i].is_active()) {
+                    result.push_back(page.edges[i]);
+                }
             }
         }
         curr_id = page.next_page_id;
@@ -492,6 +607,7 @@ void AdjacencyStore::filter_outgoing_edges(uint64_t src_id, uint16_t target_labe
         return;
     }
     if (!v.is_promoted()) return;
+    out_neighbors.reserve(out_neighbors.size() + v.get_out_degree());
     uint32_t curr_id = v.ext.out_block_id;
     while (curr_id != 0) {
         uint32_t p_shard = decode_shard_index(curr_id);
@@ -541,9 +657,13 @@ std::vector<PackedEdge> AdjacencyStore::get_incoming_edges_snapshot(uint64_t dst
         if (p_shard != s_idx || p_local >= shard.page_pool.size()) break;
         const auto& page = shard.page_pool[p_local];
         if (page.next_page_id == curr_id) break; // cycle guard
-        for (uint32_t i = 0; i < page.count; ++i) {
-            if (page.edges[i].is_active()) {
-                result.push_back(page.edges[i]);
+        if (page.tombstone_count == 0) {
+            result.insert(result.end(), page.edges, page.edges + page.count);
+        } else {
+            for (uint32_t i = 0; i < page.count; ++i) {
+                if (page.edges[i].is_active()) {
+                    result.push_back(page.edges[i]);
+                }
             }
         }
         curr_id = page.next_page_id;

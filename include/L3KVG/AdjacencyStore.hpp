@@ -61,10 +61,10 @@ struct alignas(64) AdjacencyPage {
     uint32_t count{0};
     uint32_t next_page_id{0}; // 0 = none, or 1-indexed into page_pool
     uint32_t version{0};
-    uint32_t reserved{0};
+    uint32_t tombstone_count{0};
     PackedEdge edges[CAPACITY];
 
-    AdjacencyPage() noexcept : count(0), next_page_id(0), version(0), reserved(0) {}
+    AdjacencyPage() noexcept : count(0), next_page_id(0), version(0), tombstone_count(0) {}
 };
 static_assert(sizeof(AdjacencyPage) == 4096, "AdjacencyPage must be exactly 4096 bytes");
 static_assert(alignof(AdjacencyPage) == 64, "AdjacencyPage must be 64-byte aligned");
@@ -577,11 +577,83 @@ public:
         size_t size_{0};
     };
 
+    struct EdgeSlotRef {
+        uint32_t local_page_id{0};
+        uint16_t slot_idx{0};
+        bool operator==(const EdgeSlotRef&) const noexcept = default;
+    };
+
+    struct SupernodeKey {
+        uint64_t target_id{0};
+        uint16_t label_id{0};
+        bool operator==(const SupernodeKey&) const noexcept = default;
+    };
+
+    struct SupernodeKeyHash {
+        size_t operator()(const SupernodeKey& k) const noexcept {
+            uint64_t x = k.target_id ^ (static_cast<uint64_t>(k.label_id) * 0x9e3779b97f4a7c15ULL);
+            x ^= x >> 30;
+            x *= 0xbf58476d1ce4e5b9ULL;
+            x ^= x >> 27;
+            x *= 0x94d049bb133111ebULL;
+            x ^= x >> 31;
+            return static_cast<size_t>(x);
+        }
+    };
+
+    struct SupernodeSlotBucket {
+        EdgeSlotRef first{};
+        bool has_first{false};
+        std::vector<EdgeSlotRef> extra;
+
+        void add(EdgeSlotRef ref) {
+            if (!has_first) {
+                first = ref;
+                has_first = true;
+            } else {
+                extra.push_back(ref);
+            }
+        }
+
+        bool remove(EdgeSlotRef ref) noexcept {
+            if (has_first && first == ref) {
+                if (!extra.empty()) {
+                    first = extra.back();
+                    extra.pop_back();
+                } else {
+                    has_first = false;
+                }
+                return true;
+            }
+            for (size_t i = 0; i < extra.size(); ++i) {
+                if (extra[i] == ref) {
+                    extra[i] = extra.back();
+                    extra.pop_back();
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        [[nodiscard]] bool empty() const noexcept {
+            return !has_first && extra.empty();
+        }
+    };
+
+    struct SupernodeState {
+        uint32_t tail_local_page_id{0};
+        std::unordered_map<SupernodeKey, SupernodeSlotBucket, SupernodeKeyHash> slots;
+        std::vector<EdgeSlotRef> tombstones;
+    };
+
     struct alignas(64) Shard {
         mutable SharedSpinLock mutex;
         FlatVertexMap directory;
         PagePool page_pool;
         SmallInPool small_in_pool;
+        // Lazily populated only for supernodes whose edge list spans >1 page (>170 edges)
+        std::unordered_map<uint64_t, SupernodeState> super_out;
+        std::unordered_map<uint64_t, SupernodeState> super_in;
 
         Shard() {
             directory.reserve(4096);
