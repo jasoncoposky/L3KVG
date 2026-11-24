@@ -746,38 +746,374 @@ Query& Query::distinct(bool enable) {
     return *this;
 }
 
+namespace {
+
+using FilterGroup = Query::FilterGroup;
+using Filter = Query::Filter;
+using Op = Query::Op;
+using LogicalOp = Query::LogicalOp;
+
+void append_index_prefix_ids(l3kv::Engine& store,
+                             const std::string& prefix,
+                             size_t limit,
+                             std::vector<uint64_t>& out) {
+    auto idx_entries = store.get_prefix_entries_all_shards(prefix, "", limit);
+    out.reserve(out.size() + idx_entries.size());
+    for (const auto& [k, v] : idx_entries) {
+        if (k.ends_with(":meta")) continue;
+        uint64_t parsed_id = 0;
+        if (parse_hex_id_sv(v, parsed_id)) {
+            out.push_back(parsed_id);
+        }
+    }
+}
+
+void sort_unique_ids(std::vector<uint64_t>& ids) {
+    if (ids.size() > 1) {
+        std::sort(ids.begin(), ids.end());
+        ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    }
+}
+
+std::vector<uint64_t> lookup_trigram_candidates(l3kv::Engine& store,
+                                                const std::string& alias,
+                                                const std::string& pattern,
+                                                size_t limit) {
+    std::vector<std::string> trigrams;
+    std::string segment;
+    auto flush_segment = [&]() {
+        if (segment.size() >= 3) {
+            for (size_t ti = 0; ti + 3 <= segment.size(); ++ti) {
+                trigrams.push_back(segment.substr(ti, 3));
+            }
+        }
+        segment.clear();
+    };
+    for (char c : pattern) {
+        if (c == '%' || c == '_') {
+            flush_segment();
+        } else {
+            segment += c;
+        }
+    }
+    flush_segment();
+    if (trigrams.empty()) return {};
+
+    std::vector<uint64_t> candidates;
+    bool first_tri = true;
+    for (const auto& tri : trigrams) {
+        std::vector<uint64_t> cur_tri;
+        append_index_prefix_ids(store, "idx:" + alias + ":tri:" + tri + ":", limit, cur_tri);
+        sort_unique_ids(cur_tri);
+        if (first_tri) {
+            candidates = std::move(cur_tri);
+            first_tri = false;
+        } else {
+            std::vector<uint64_t> inter;
+            inter.reserve(std::min(candidates.size(), cur_tri.size()));
+            std::set_intersection(candidates.begin(), candidates.end(),
+                                  cur_tri.begin(), cur_tri.end(),
+                                  std::back_inserter(inter));
+            candidates = std::move(inter);
+        }
+        if (candidates.empty()) break;
+    }
+    return candidates;
+}
+
+void collect_filter_index_frontier(l3kv::Engine& store,
+                                   const FilterGroup& fg,
+                                   const std::string& root_alias,
+                                   size_t scan_limit,
+                                   bool& had_eq_filter,
+                                   std::vector<uint64_t>& frontier) {
+    for (const auto& n : fg.nodes) {
+        if (auto* f = std::get_if<Filter>(&n.node)) {
+            if (f->alias != root_alias) continue;
+            if (f->op == Op::Eq) {
+                if (f->key == "n" || f->key == "path" || f->key == "id") {
+                    had_eq_filter = true;
+                }
+                append_index_prefix_ids(store, "idx:" + f->alias + ":" + f->key + ":" + f->value,
+                                        scan_limit, frontier);
+            } else if (f->op == Op::Like) {
+                size_t first_wc = f->value.find_first_of("%_");
+                std::string prefix_literal = (first_wc == std::string::npos) ? f->value : f->value.substr(0, first_wc);
+                if (!prefix_literal.empty()) {
+                    append_index_prefix_ids(store, "idx:" + f->alias + ":" + f->key + ":" + prefix_literal,
+                                            scan_limit, frontier);
+                } else {
+                    auto tri = lookup_trigram_candidates(store, f->alias, f->value, scan_limit);
+                    frontier.insert(frontier.end(), tri.begin(), tri.end());
+                }
+            }
+        } else if (auto* sub = std::get_if<std::shared_ptr<FilterGroup>>(&n.node)) {
+            if (*sub && n.prepended_op == LogicalOp::And) {
+                collect_filter_index_frontier(store, **sub, root_alias, scan_limit, had_eq_filter, frontier);
+            }
+        }
+    }
+}
+
+} // namespace
+
+std::string Query::eval_group_key_value(const GroupStep& g, std::string val) {
+    if (g.func_name.empty()) return val;
+    if (icase_eq(g.func_name, "LENGTH")) {
+        return std::to_string(val.size());
+    }
+    if ((icase_eq(g.func_name, "SUBSTRING") || icase_eq(g.func_name, "SUBSTR")) && !g.func_args.empty()) {
+        int pos = 0;
+        auto [p0, ec0] = std::from_chars(g.func_args[0].data(), g.func_args[0].data() + g.func_args[0].size(), pos);
+        if (ec0 != std::errc{}) return val;
+        int start = std::max(0, pos);
+        if (start >= static_cast<int>(val.size())) return {};
+        if (g.func_args.size() > 1) {
+            int len = 0;
+            auto [p1, ec1] = std::from_chars(g.func_args[1].data(), g.func_args[1].data() + g.func_args[1].size(), len);
+            return (ec1 == std::errc{} && len > 0)
+                       ? val.substr(static_cast<size_t>(start), static_cast<size_t>(len))
+                       : std::string{};
+        }
+        return val.substr(static_cast<size_t>(start));
+    }
+    return val;
+}
+
+std::string Query::compute_numeric_agg(const ReturnStep& p,
+                                       const std::vector<ResultRow>& part,
+                                       const std::string& full_name,
+                                       const std::string& idx_key) {
+    std::vector<double> vals;
+    vals.reserve(part.size());
+    for (const auto& r : part) {
+        auto it = r.fields.find(full_name);
+        if (it == r.fields.end()) it = r.fields.find(idx_key);
+        if (it != r.fields.end() && !it->second.empty()) {
+            double dv = 0.0;
+            auto [ptr, ec] = std::from_chars(it->second.data(), it->second.data() + it->second.size(), dv);
+            if (ec == std::errc{} && ptr == it->second.data() + it->second.size()) {
+                vals.push_back(dv);
+            }
+        }
+    }
+    if (p.distinct && vals.size() > 1) {
+        std::sort(vals.begin(), vals.end());
+        vals.erase(std::unique(vals.begin(), vals.end()), vals.end());
+    }
+    if (vals.empty()) return "0";
+
+    double acc = 0.0;
+    if (p.agg == AggOp::Min) {
+        acc = *std::min_element(vals.begin(), vals.end());
+    } else if (p.agg == AggOp::Max) {
+        acc = *std::max_element(vals.begin(), vals.end());
+    } else {
+        for (double v : vals) acc += v;
+        if (p.agg == AggOp::Avg) acc /= static_cast<double>(vals.size());
+    }
+    if (acc == static_cast<double>(static_cast<int64_t>(acc))) {
+        return std::to_string(static_cast<int64_t>(acc));
+    }
+    return std::to_string(acc);
+}
+
+std::vector<ResultRow> Query::apply_group_by_and_aggregations(
+    std::vector<ResultRow> results,
+    const std::vector<std::string>& invariant_proj_names,
+    const std::vector<std::string>& idx_names,
+    bool has_agg,
+    bool should_populate_fields) const {
+    std::vector<std::string> partition_order;
+    std::unordered_map<std::string, std::vector<ResultRow>> partitions;
+    std::vector<GroupStep> effective_groups = groups_;
+    if (effective_groups.empty() && has_agg) {
+        for (const auto& p : projections_) {
+            if (p.agg != AggOp::None) continue;
+            bool exists = std::any_of(effective_groups.begin(), effective_groups.end(), [&](const GroupStep& eg) {
+                return eg.alias == p.alias && eg.property == p.property;
+            });
+            if (!exists) {
+                effective_groups.push_back(GroupStep{p.alias, p.property, "", {}});
+            }
+        }
+    }
+
+    if (effective_groups.empty()) {
+        partition_order.push_back("ALL");
+        partitions["ALL"] = std::move(results);
+    } else {
+        std::vector<std::string> eff_group_keys(effective_groups.size());
+        for (size_t gi = 0; gi < effective_groups.size(); ++gi) {
+            eff_group_keys[gi] = effective_groups[gi].alias + "." + effective_groups[gi].property;
+        }
+        for (auto& row : results) {
+            std::string g_key;
+            for (size_t gi = 0; gi < effective_groups.size(); ++gi) {
+                auto it = row.fields.find(eff_group_keys[gi]);
+                std::string val = (it != row.fields.end() ? it->second : "");
+                g_key += eval_group_key_value(effective_groups[gi], std::move(val));
+                g_key.push_back('|');
+            }
+            auto [pit, inserted] = partitions.try_emplace(g_key);
+            if (inserted) partition_order.push_back(g_key);
+            pit->second.push_back(std::move(row));
+        }
+    }
+
+    std::vector<ResultRow> final_res;
+    final_res.reserve(partition_order.size());
+    for (const auto& pk : partition_order) {
+        auto& part = partitions[pk];
+        ResultRow agg_row;
+        for (const auto& g : effective_groups) {
+            std::string gk = g.alias + "." + g.property;
+            if (!part.empty()) {
+                if (auto it = part[0].fields.find(gk); it != part[0].fields.end()) {
+                    agg_row.fields[gk] = it->second;
+                }
+            }
+        }
+        agg_row.projected_values.resize(projections_.size());
+        if (!flat_rows_) agg_row.projected_names = invariant_proj_names;
+
+        for (size_t i = 0; i < projections_.size(); ++i) {
+            const auto& p = projections_[i];
+            const std::string& k = idx_names[i];
+            const std::string& full_name = invariant_proj_names[i];
+            std::string computed_val;
+
+            if (p.agg == AggOp::None) {
+                if (!part.empty()) {
+                    auto it = part[0].fields.find(full_name);
+                    if (it == part[0].fields.end()) it = part[0].fields.find(k);
+                    if (it != part[0].fields.end()) computed_val = it->second;
+                }
+            } else if (p.agg == AggOp::Count) {
+                if (p.distinct) {
+                    std::unordered_set<std::string_view> dist_vals;
+                    for (const auto& r : part) {
+                        auto it = r.fields.find(full_name);
+                        if (it == r.fields.end()) it = r.fields.find(k);
+                        if (it != r.fields.end() && !it->second.empty()) dist_vals.insert(it->second);
+                    }
+                    computed_val = std::to_string(dist_vals.size());
+                } else {
+                    computed_val = std::to_string(part.size());
+                }
+            } else {
+                computed_val = compute_numeric_agg(p, part, full_name, k);
+            }
+
+            agg_row.projected_values[i] = computed_val;
+            if (should_populate_fields) {
+                agg_row.fields["_col_" + std::to_string(i)] = full_name;
+                agg_row.fields[k] = computed_val;
+                agg_row.fields[full_name] = std::move(computed_val);
+            }
+        }
+        final_res.push_back(std::move(agg_row));
+    }
+    return final_res;
+}
+
+void Query::apply_distinct_sort_limit(
+    std::vector<ResultRow>& results,
+    const std::vector<std::string>& idx_names,
+    const std::vector<std::string>& sort_field_keys) const {
+    if (distinct_ && results.size() > 1) {
+        std::unordered_set<std::string> seen;
+        seen.reserve(results.size());
+        std::vector<ResultRow> unique_res;
+        unique_res.reserve(results.size());
+        for (auto& row : results) {
+            std::string key;
+            for (size_t i = 0; i < projections_.size(); ++i) {
+                if (i < row.projected_values.size() && !row.projected_values[i].empty()) {
+                    key.append(row.projected_values[i]);
+                } else if (i < idx_names.size()) {
+                    auto it = row.fields.find(idx_names[i]);
+                    if (it != row.fields.end()) key.append(it->second);
+                }
+                key.push_back('\x1F');
+            }
+            if (seen.insert(std::move(key)).second) {
+                unique_res.push_back(std::move(row));
+            }
+        }
+        results = std::move(unique_res);
+    }
+
+    const size_t start_ofs = offset_.value_or(0);
+    if (start_ofs >= results.size()) {
+        results.clear();
+        return;
+    }
+
+    if (!sorts_.empty()) {
+        std::vector<size_t> order(results.size());
+        std::iota(order.begin(), order.end(), 0);
+
+        auto row_cmp = [&](size_t ia, size_t ib) -> bool {
+            const ResultRow& a = results[ia];
+            const ResultRow& b = results[ib];
+            for (size_t si = 0; si < sorts_.size(); ++si) {
+                const auto& k = sort_field_keys[si];
+                auto it_a = a.fields.find(k);
+                auto it_b = b.fields.find(k);
+                std::string_view va = (it_a != a.fields.end()) ? std::string_view(it_a->second) : std::string_view{};
+                std::string_view vb = (it_b != b.fields.end()) ? std::string_view(it_b->second) : std::string_view{};
+                if (va != vb) {
+                    return sorts_[si].ascending ? (va < vb) : (va > vb);
+                }
+            }
+            for (size_t i = 0; i < projections_.size(); ++i) {
+                std::string_view va = (i < a.projected_values.size()) ? std::string_view(a.projected_values[i]) : std::string_view{};
+                std::string_view vb = (i < b.projected_values.size()) ? std::string_view(b.projected_values[i]) : std::string_view{};
+                if (va != vb) return va < vb;
+            }
+            return ia < ib;
+        };
+
+        const size_t end_ofs = limit_ ? std::min(results.size(), start_ofs + *limit_) : results.size();
+        if (end_ofs < results.size()) {
+            std::partial_sort(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(end_ofs), order.end(), row_cmp);
+        } else {
+            std::sort(order.begin(), order.end(), row_cmp);
+        }
+
+        std::vector<ResultRow> sorted_res;
+        sorted_res.reserve(end_ofs - start_ofs);
+        for (size_t p = start_ofs; p < end_ofs; ++p) {
+            sorted_res.push_back(std::move(results[order[p]]));
+        }
+        results = std::move(sorted_res);
+    } else {
+        if (start_ofs > 0) {
+            results.erase(results.begin(), results.begin() + static_cast<std::ptrdiff_t>(start_ofs));
+        }
+        if (limit_ && results.size() > *limit_) {
+            results.resize(*limit_);
+        }
+    }
+}
+
 std::vector<ResultRow> Query::execute() {
   using namespace lite3cpp::literals;
   std::vector<ResultRow> results;
   std::vector<uint64_t> frontier;
+  const size_t scan_limit = engine_->get_settings().prefix_scan_limit;
 
   if (!starting_nodes_.empty()) {
       frontier = starting_nodes_;
-      if (frontier.size() > 1) {
-          std::sort(frontier.begin(), frontier.end());
-          frontier.erase(std::unique(frontier.begin(), frontier.end()), frontier.end());
-      }
+      sort_unique_ids(frontier);
       if (initial_match_ && (root_alias_.empty() || root_alias_ == "__root")) {
           root_alias_ = initial_match_->alias;
       }
   } else if (!start_index_prefix_.empty()) {
-      if (initial_match_) {
-          root_alias_ = initial_match_->alias;
-      }
-      auto idx_entries = engine_->get_store()->get_prefix_entries_all_shards(
-          start_index_prefix_, "", engine_->get_settings().prefix_scan_limit);
-      frontier.reserve(idx_entries.size());
-      for (const auto& [k, v] : idx_entries) {
-          if (k.ends_with(":meta")) continue;
-          uint64_t parsed_id = 0;
-          if (parse_hex_id_sv(v, parsed_id)) {
-              frontier.push_back(parsed_id);
-          }
-      }
-      if (frontier.size() > 1) {
-          std::sort(frontier.begin(), frontier.end());
-          frontier.erase(std::unique(frontier.begin(), frontier.end()), frontier.end());
-      }
+      if (initial_match_) root_alias_ = initial_match_->alias;
+      append_index_prefix_ids(*engine_->get_store(), start_index_prefix_, scan_limit, frontier);
+      sort_unique_ids(frontier);
   } else {
       if (!initial_match_) return results;
       root_alias_ = initial_match_->alias;
@@ -788,157 +1124,36 @@ std::vector<ResultRow> Query::execute() {
           had_eq_filter = true;
           frontier.push_back(engine_->get_resolver().parse_uuid(f->value));
       }
-
       if (frontier.empty()) {
-          std::function<void(const FilterGroup&)> find_index_filters = [&](const FilterGroup& fg) {
-              for (const auto &n : fg.nodes) {
-                  if (auto* f = std::get_if<Filter>(&n.node)) {
-                      if (f->alias == root_alias_) {
-                          if (f->op == Op::Eq) {
-                              if (f->key == "n" || f->key == "path" || f->key == "id") {
-                                  had_eq_filter = true;
-                              }
-                              std::string idx_prefix = "idx:" + f->alias + ":" + f->key + ":" + f->value;
-                              auto idx_entries = engine_->get_store()->get_prefix_entries_all_shards(
-                                  idx_prefix, "", engine_->get_settings().prefix_scan_limit);
-                              for (const auto& [k, v] : idx_entries) {
-                                  if (k.ends_with(":meta")) continue;
-                                  uint64_t parsed_id = 0;
-                                  if (parse_hex_id_sv(v, parsed_id)) {
-                                      frontier.push_back(parsed_id);
-                                  }
-                              }
-                          } else if (f->op == Op::Like) {
-                              size_t first_wc = f->value.find_first_of("%_");
-                              std::string prefix_literal = (first_wc == std::string::npos) ? f->value : f->value.substr(0, first_wc);
-                              if (!prefix_literal.empty()) {
-                                  std::string idx_prefix = "idx:" + f->alias + ":" + f->key + ":" + prefix_literal;
-                                  auto idx_entries = engine_->get_store()->get_prefix_entries_all_shards(
-                                      idx_prefix, "", engine_->get_settings().prefix_scan_limit);
-                                  for (const auto& [k, v] : idx_entries) {
-                                      if (k.ends_with(":meta")) continue;
-                                      uint64_t parsed_id = 0;
-                                      if (parse_hex_id_sv(v, parsed_id)) {
-                                          frontier.push_back(parsed_id);
-                                      }
-                                  }
-                              } else {
-                                  std::vector<std::string> trigrams;
-                                  std::string segment;
-                                  for (char c : f->value) {
-                                      if (c == '%' || c == '_') {
-                                          if (segment.size() >= 3) {
-                                              for (size_t ti = 0; ti + 3 <= segment.size(); ++ti) {
-                                                  trigrams.push_back(segment.substr(ti, 3));
-                                              }
-                                          }
-                                          segment.clear();
-                                      } else {
-                                          segment += c;
-                                      }
-                                  }
-                                  if (segment.size() >= 3) {
-                                      for (size_t ti = 0; ti + 3 <= segment.size(); ++ti) {
-                                          trigrams.push_back(segment.substr(ti, 3));
-                                      }
-                                  }
-                                  if (!trigrams.empty()) {
-                                      std::vector<uint64_t> tri_candidates;
-                                      bool first_tri = true;
-                                      for (const auto& tri : trigrams) {
-                                          std::string tri_prefix = "idx:" + f->alias + ":tri:" + tri + ":";
-                                          auto idx_entries = engine_->get_store()->get_prefix_entries_all_shards(
-                                              tri_prefix, "", engine_->get_settings().prefix_scan_limit);
-                                          std::vector<uint64_t> cur_tri;
-                                          cur_tri.reserve(idx_entries.size());
-                                          for (const auto& [k, v] : idx_entries) {
-                                              if (k.ends_with(":meta")) continue;
-                                              uint64_t parsed_id = 0;
-                                              if (parse_hex_id_sv(v, parsed_id)) {
-                                                  cur_tri.push_back(parsed_id);
-                                              }
-                                          }
-                                          std::sort(cur_tri.begin(), cur_tri.end());
-                                          cur_tri.erase(std::unique(cur_tri.begin(), cur_tri.end()), cur_tri.end());
-                                          if (first_tri) {
-                                              tri_candidates = std::move(cur_tri);
-                                              first_tri = false;
-                                          } else {
-                                              std::vector<uint64_t> inter;
-                                              inter.reserve(std::min(tri_candidates.size(), cur_tri.size()));
-                                              std::set_intersection(tri_candidates.begin(), tri_candidates.end(),
-                                                                    cur_tri.begin(), cur_tri.end(),
-                                                                    std::back_inserter(inter));
-                                              tri_candidates = std::move(inter);
-                                          }
-                                          if (tri_candidates.empty()) break;
-                                      }
-                                      frontier.insert(frontier.end(), tri_candidates.begin(), tri_candidates.end());
-                                  }
-                              }
-                          }
-                      }
-                  } else if (auto* sub = std::get_if<std::shared_ptr<FilterGroup>>(&n.node)) {
-                      if (*sub && n.prepended_op == LogicalOp::And) {
-                          find_index_filters(**sub);
-                      }
-                  }
-              }
-          };
-          find_index_filters(root_filters_);
+          collect_filter_index_frontier(*engine_->get_store(), root_filters_, root_alias_,
+                                        scan_limit, had_eq_filter, frontier);
       }
-
       if (frontier.empty()) {
-          if (had_eq_filter && !has_complex) {
-              return results;
-          }
+          if (had_eq_filter && !has_complex) return results;
           if (!root_alias_.empty() && root_alias_ != "__root") {
               std::string entity_name = (root_alias_ == "Group" ? "User" : root_alias_);
-              std::string idx_id_prefix = "idx:" + entity_name + ":id:";
-              auto idx_entries = engine_->get_store()->get_prefix_entries_all_shards(idx_id_prefix, "", 10000);
-              for (const auto& [k, v] : idx_entries) {
-                  if (k.ends_with(":meta")) continue;
-                  uint64_t parsed_id = 0;
-                  if (parse_hex_id_sv(v, parsed_id)) {
-                      frontier.push_back(parsed_id);
-                  }
-              }
+              append_index_prefix_ids(*engine_->get_store(), "idx:" + entity_name + ":id:", 10000, frontier);
               if (frontier.empty()) {
-                  std::string idx_n_prefix = "idx:" + entity_name + ":n:";
-                  auto idx_entries_n = engine_->get_store()->get_prefix_entries_all_shards(idx_n_prefix, "", 10000);
-                  for (const auto& [k, v] : idx_entries_n) {
-                      if (k.ends_with(":meta")) continue;
-                      uint64_t parsed_id = 0;
-                      if (parse_hex_id_sv(v, parsed_id)) {
-                          frontier.push_back(parsed_id);
-                      }
-                  }
+                  append_index_prefix_ids(*engine_->get_store(), "idx:" + entity_name + ":n:", 10000, frontier);
               }
           }
           if (frontier.empty() &&
               (root_alias_.empty() || root_alias_ == "__root" ||
                engine_->get_settings().fallback_to_full_scan_on_index_miss)) {
-              auto keys = engine_->get_store()->get_prefix_keys_all_shards(
-                  "n:{", "", engine_->get_settings().prefix_scan_limit);
+              auto keys = engine_->get_store()->get_prefix_keys_all_shards("n:{", "", scan_limit);
               frontier.reserve(keys.size());
               for (const auto& k : keys) {
-                  if (k.starts_with("n:{") && !k.ends_with(":meta")) {
-                      size_t end_pos = k.find('}', 3);
-                      if (end_pos != std::string::npos && end_pos > 3) {
-                          uint64_t parsed_id = 0;
-                          if (parse_hex_id_sv(std::string_view(k.data() + 3, end_pos - 3), parsed_id)) {
-                              frontier.push_back(parsed_id);
-                          }
-                      }
+                  if (!k.starts_with("n:{") || k.ends_with(":meta")) continue;
+                  size_t end_pos = k.find('}', 3);
+                  uint64_t parsed_id = 0;
+                  if (end_pos != std::string::npos && end_pos > 3 &&
+                      parse_hex_id_sv(std::string_view(k.data() + 3, end_pos - 3), parsed_id)) {
+                      frontier.push_back(parsed_id);
                   }
               }
           }
       }
-
-      if (frontier.size() > 1) {
-          std::sort(frontier.begin(), frontier.end());
-          frontier.erase(std::unique(frontier.begin(), frontier.end()), frontier.end());
-      }
+      sort_unique_ids(frontier);
   }
 
   if (initial_match_ && root_alias_.empty()) {
@@ -1410,241 +1625,11 @@ std::vector<ResultRow> Query::execute() {
   }
 
   if (has_agg || !groups_.empty()) {
-      std::vector<std::string> partition_order;
-      std::unordered_map<std::string, std::vector<ResultRow>> partitions;
-      std::vector<GroupStep> effective_groups = groups_;
-      if (effective_groups.empty() && has_agg) {
-          for (const auto& p : projections_) {
-              if (p.agg == AggOp::None) {
-                  bool exists = false;
-                  for (const auto& eg : effective_groups) {
-                      if (eg.alias == p.alias && eg.property == p.property) {
-                          exists = true;
-                          break;
-                      }
-                  }
-                  if (!exists) {
-                      effective_groups.push_back(GroupStep{p.alias, p.property, "", {}});
-                  }
-              }
-          }
-      }
-      if (effective_groups.empty()) {
-          partition_order.push_back("ALL");
-          partitions["ALL"] = std::move(results);
-      } else {
-          std::vector<std::string> eff_group_keys(effective_groups.size());
-          for (size_t gi = 0; gi < effective_groups.size(); ++gi) {
-              eff_group_keys[gi] = effective_groups[gi].alias + "." + effective_groups[gi].property;
-          }
-          for (auto& row : results) {
-              std::string g_key;
-              for (size_t gi = 0; gi < effective_groups.size(); ++gi) {
-                  const auto& g = effective_groups[gi];
-                  auto it = row.fields.find(eff_group_keys[gi]);
-                  std::string val = (it != row.fields.end() ? it->second : "");
-                  if (!g.func_name.empty()) {
-                      if (icase_eq(g.func_name, "LENGTH")) {
-                          val = std::to_string(val.size());
-                      } else if (icase_eq(g.func_name, "SUBSTRING") || icase_eq(g.func_name, "SUBSTR")) {
-                          if (!g.func_args.empty()) {
-                              int pos = 0;
-                              auto [p0, ec0] = std::from_chars(g.func_args[0].data(), g.func_args[0].data() + g.func_args[0].size(), pos);
-                              if (ec0 == std::errc{}) {
-                                  int start = std::max(0, pos);
-                                  if (start < static_cast<int>(val.size())) {
-                                      if (g.func_args.size() > 1) {
-                                          int len = 0;
-                                          auto [p1, ec1] = std::from_chars(g.func_args[1].data(), g.func_args[1].data() + g.func_args[1].size(), len);
-                                          val = (ec1 == std::errc{} && len > 0) ? val.substr(static_cast<size_t>(start), static_cast<size_t>(len)) : "";
-                                      } else {
-                                          val = val.substr(static_cast<size_t>(start));
-                                      }
-                                  } else {
-                                      val.clear();
-                                  }
-                              }
-                          }
-                      }
-                  }
-                  g_key += val;
-                  g_key.push_back('|');
-              }
-              auto [pit, inserted] = partitions.try_emplace(g_key);
-              if (inserted) {
-                  partition_order.push_back(g_key);
-              }
-              pit->second.push_back(std::move(row));
-          }
-      }
-
-      std::vector<ResultRow> final_res;
-      final_res.reserve(partition_order.size());
-      for (const auto& pk : partition_order) {
-          auto& part = partitions[pk];
-          ResultRow agg_row;
-          for (const auto& g : effective_groups) {
-              std::string gk = g.alias + "." + g.property;
-              if (!part.empty()) {
-                  auto it = part[0].fields.find(gk);
-                  if (it != part[0].fields.end()) {
-                      agg_row.fields[gk] = it->second;
-                  }
-              }
-          }
-          agg_row.projected_values.resize(projections_.size());
-          if (!flat_rows_) {
-              agg_row.projected_names = invariant_proj_names;
-          }
-          for (size_t i = 0; i < projections_.size(); ++i) {
-              const auto& p = projections_[i];
-              const std::string& k = idx_names[i];
-              const std::string& full_name = invariant_proj_names[i];
-              std::string computed_val;
-
-              if (p.agg == AggOp::None) {
-                  if (!part.empty()) {
-                      auto it = part[0].fields.find(full_name);
-                      if (it == part[0].fields.end()) it = part[0].fields.find(k);
-                      if (it != part[0].fields.end()) computed_val = it->second;
-                  }
-              } else if (p.agg == AggOp::Count) {
-                  if (p.distinct) {
-                      std::unordered_set<std::string_view> dist_vals;
-                      for (const auto& r : part) {
-                          auto it = r.fields.find(full_name);
-                          if (it == r.fields.end()) it = r.fields.find(k);
-                          if (it != r.fields.end() && !it->second.empty()) dist_vals.insert(it->second);
-                      }
-                      computed_val = std::to_string(dist_vals.size());
-                  } else {
-                      computed_val = std::to_string(part.size());
-                  }
-              } else {
-                  std::vector<double> vals;
-                  vals.reserve(part.size());
-                  for (const auto& r : part) {
-                      auto it = r.fields.find(full_name);
-                      if (it == r.fields.end()) it = r.fields.find(k);
-                      if (it != r.fields.end() && !it->second.empty()) {
-                          double dv = 0.0;
-                          auto [ptr, ec] = std::from_chars(it->second.data(), it->second.data() + it->second.size(), dv);
-                          if (ec == std::errc{} && ptr == it->second.data() + it->second.size()) {
-                              vals.push_back(dv);
-                          }
-                      }
-                  }
-                  if (p.distinct && vals.size() > 1) {
-                      std::sort(vals.begin(), vals.end());
-                      vals.erase(std::unique(vals.begin(), vals.end()), vals.end());
-                  }
-                  if (vals.empty()) {
-                      computed_val = "0";
-                  } else {
-                      double acc = 0.0;
-                      if (p.agg == AggOp::Min) {
-                          acc = *std::min_element(vals.begin(), vals.end());
-                      } else if (p.agg == AggOp::Max) {
-                          acc = *std::max_element(vals.begin(), vals.end());
-                      } else {
-                          for (double v : vals) acc += v;
-                          if (p.agg == AggOp::Avg) acc /= static_cast<double>(vals.size());
-                      }
-                      if (acc == static_cast<double>(static_cast<int64_t>(acc))) {
-                          computed_val = std::to_string(static_cast<int64_t>(acc));
-                      } else {
-                          computed_val = std::to_string(acc);
-                      }
-                  }
-              }
-
-              agg_row.projected_values[i] = computed_val;
-              if (should_populate_fields) {
-                  agg_row.fields["_col_" + std::to_string(i)] = full_name;
-                  agg_row.fields[k] = computed_val;
-                  agg_row.fields[full_name] = std::move(computed_val);
-              }
-          }
-          final_res.push_back(std::move(agg_row));
-      }
-      results = std::move(final_res);
+      results = apply_group_by_and_aggregations(
+          std::move(results), invariant_proj_names, idx_names, has_agg, should_populate_fields);
   }
 
-  if (distinct_ && results.size() > 1) {
-      std::unordered_set<std::string> seen;
-      seen.reserve(results.size());
-      std::vector<ResultRow> unique_res;
-      unique_res.reserve(results.size());
-      for (auto& row : results) {
-          std::string key;
-          for (size_t i = 0; i < projections_.size(); ++i) {
-              if (i < row.projected_values.size() && !row.projected_values[i].empty()) {
-                  key.append(row.projected_values[i]);
-              } else if (i < idx_names.size()) {
-                  auto it = row.fields.find(idx_names[i]);
-                  if (it != row.fields.end()) key.append(it->second);
-              }
-              key.push_back('\x1F');
-          }
-          if (seen.insert(std::move(key)).second) {
-              unique_res.push_back(std::move(row));
-          }
-      }
-      results = std::move(unique_res);
-  }
-
-  const size_t start_ofs = offset_.value_or(0);
-  if (start_ofs >= results.size()) {
-      results.clear();
-      return results;
-  }
-
-  if (!sorts_.empty()) {
-      std::vector<size_t> order(results.size());
-      std::iota(order.begin(), order.end(), 0);
-
-      auto row_cmp = [&](size_t ia, size_t ib) -> bool {
-          const ResultRow& a = results[ia];
-          const ResultRow& b = results[ib];
-          for (size_t si = 0; si < sorts_.size(); ++si) {
-              const auto& k = sort_field_keys[si];
-              auto it_a = a.fields.find(k);
-              auto it_b = b.fields.find(k);
-              std::string_view va = (it_a != a.fields.end()) ? std::string_view(it_a->second) : std::string_view{};
-              std::string_view vb = (it_b != b.fields.end()) ? std::string_view(it_b->second) : std::string_view{};
-              if (va != vb) {
-                  return sorts_[si].ascending ? (va < vb) : (va > vb);
-              }
-          }
-          for (size_t i = 0; i < projections_.size(); ++i) {
-              std::string_view va = (i < a.projected_values.size()) ? std::string_view(a.projected_values[i]) : std::string_view{};
-              std::string_view vb = (i < b.projected_values.size()) ? std::string_view(b.projected_values[i]) : std::string_view{};
-              if (va != vb) return va < vb;
-          }
-          return ia < ib;
-      };
-
-      const size_t end_ofs = limit_ ? std::min(results.size(), start_ofs + *limit_) : results.size();
-      if (end_ofs < results.size()) {
-          std::partial_sort(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(end_ofs), order.end(), row_cmp);
-      } else {
-          std::sort(order.begin(), order.end(), row_cmp);
-      }
-
-      std::vector<ResultRow> sorted_res;
-      sorted_res.reserve(end_ofs - start_ofs);
-      for (size_t p = start_ofs; p < end_ofs; ++p) {
-          sorted_res.push_back(std::move(results[order[p]]));
-      }
-      results = std::move(sorted_res);
-  } else {
-      if (start_ofs > 0) {
-          results.erase(results.begin(), results.begin() + static_cast<std::ptrdiff_t>(start_ofs));
-      }
-      if (limit_ && results.size() > *limit_) {
-          results.resize(*limit_);
-      }
-  }
+  apply_distinct_sort_limit(results, idx_names, sort_field_keys);
 
   if (!flat_rows_ && !results.empty() && results[0].projected_names.empty() && !invariant_proj_names.empty()) {
       results[0].projected_names = std::move(invariant_proj_names);

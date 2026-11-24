@@ -195,6 +195,22 @@ private:
   std::optional<size_t> limit_;
   std::optional<size_t> offset_;
   std::string current_source_alias_;
+
+  static std::string eval_group_key_value(const GroupStep &g, std::string val);
+  static std::string compute_numeric_agg(const ReturnStep &p,
+                                         const std::vector<ResultRow> &part,
+                                         const std::string &full_name,
+                                         const std::string &idx_key);
+  std::vector<ResultRow> apply_group_by_and_aggregations(
+      std::vector<ResultRow> results,
+      const std::vector<std::string> &invariant_proj_names,
+      const std::vector<std::string> &idx_names,
+      bool has_agg,
+      bool should_populate_fields) const;
+  void apply_distinct_sort_limit(
+      std::vector<ResultRow> &results,
+      const std::vector<std::string> &idx_names,
+      const std::vector<std::string> &sort_field_keys) const;
 };
 
 } // namespace l3kvg

@@ -797,6 +797,254 @@ void Engine::del_edge(uint64_t src_id, std::string_view label,
   }
 }
 
+namespace {
+
+struct StagedKvEntry {
+    bool is_delete{false};
+    std::string value;
+};
+
+struct StagedKvBatch {
+    std::vector<std::string> keys;
+    std::vector<StagedKvEntry> entries;
+    std::unordered_map<std::string, size_t> index;
+
+    void reserve(size_t n) {
+        keys.reserve(n);
+        entries.reserve(n);
+        index.reserve(n);
+    }
+
+    void stage_put(std::string_view key, std::string_view val) {
+        std::string kstr(key);
+        if (auto it = index.find(kstr); it != index.end()) {
+            auto& entry = entries[it->second];
+            entry.is_delete = false;
+            entry.value.assign(val.data(), val.size());
+        } else {
+            const size_t idx = entries.size();
+            keys.push_back(kstr);
+            index.emplace(std::move(kstr), idx);
+            entries.push_back({false, std::string(val)});
+        }
+    }
+
+    void stage_del(std::string_view key) {
+        std::string kstr(key);
+        if (auto it = index.find(kstr); it != index.end()) {
+            auto& entry = entries[it->second];
+            entry.is_delete = true;
+            entry.value.clear();
+        } else {
+            const size_t idx = entries.size();
+            keys.push_back(kstr);
+            index.emplace(std::move(kstr), idx);
+            entries.push_back({true, {}});
+        }
+    }
+
+    bool is_live_staged(const std::string& k) const {
+        auto it = index.find(k);
+        return it != index.end() && !entries[it->second].is_delete;
+    }
+};
+
+enum class StagedEdgeKind : uint8_t { AddEdge, DelEdge, DelNode };
+
+struct StagedEdgeOp {
+    StagedEdgeKind kind;
+    uint64_t src;
+    uint64_t dst;
+    uint16_t label_id;
+    float weight;
+    uint64_t timestamp;
+    bool has_props;
+};
+
+lite3cpp::Buffer decode_staged_node_buffer(const StagedKvEntry& staged) {
+    lite3cpp::Buffer nbuf;
+    if (staged.is_delete) {
+        nbuf.init_object();
+    } else if (l3kv::is_json_payload(staged.value)) {
+        try {
+            nbuf = lite3cpp::lite3_json::from_json_string(staged.value);
+        } catch (...) {
+            nbuf.init_object();
+        }
+    } else if (staged.value.size() >= sizeof(lite3cpp::PackedNodeLayout)) {
+        nbuf = lite3cpp::Buffer(reinterpret_cast<const uint8_t*>(staged.value.data()), staged.value.size());
+    } else {
+        nbuf.init_object();
+    }
+    return nbuf;
+}
+
+lite3cpp::Buffer build_edge_props_buffer(std::string_view value, bool has_props) {
+    using namespace lite3cpp::literals;
+    lite3cpp::Buffer ebuf;
+    ebuf.init_object();
+    if (!has_props) return ebuf;
+
+    const uint8_t* ptr = reinterpret_cast<const uint8_t*>(value.data());
+    const bool is_packed = value.size() >= sizeof(lite3cpp::PackedNodeLayout) && (ptr[0] == 0x06 || ptr[0] == 0x07);
+    try {
+        lite3cpp::Buffer props_buf = is_packed
+            ? lite3cpp::Buffer::from_view(ptr, value.size())
+            : lite3cpp::lite3_json::from_json_string(value);
+        size_t props_ofs = ebuf.set_obj(0, "props"_hk);
+        copy_batch_edge_props(props_buf, 0, ebuf, props_ofs);
+    } catch (...) {
+        ebuf.set_str(0, "props"_hk, value);
+    }
+    return ebuf;
+}
+
+void commit_staged_kv_batch(l3kv::Engine& store, const StagedKvBatch& kv) {
+    using namespace lite3cpp::literals;
+    if (kv.entries.empty()) return;
+
+    const auto now = store.get_clock().now();
+    std::string meta_put_bytes;
+    std::string meta_del_bytes;
+    {
+        lite3cpp::Buffer mbuf(160);
+        mbuf.init_object();
+        mbuf.set_i64(0, "ts"_hk, now.wall_time);
+        mbuf.set_i64(0, "l"_hk, now.logical);
+        mbuf.set_i64(0, "n"_hk, now.node_id);
+        meta_put_bytes.assign(reinterpret_cast<const char*>(mbuf.data()), mbuf.size());
+        mbuf.set_bool(0, "tombstone"_hk, true);
+        meta_del_bytes.assign(reinterpret_cast<const char*>(mbuf.data()), mbuf.size());
+    }
+    const std::string_view meta_put_sv(meta_put_bytes);
+    const std::string_view meta_del_sv(meta_del_bytes);
+
+    std::vector<std::string> meta_keys;
+    meta_keys.reserve(kv.entries.size());
+    for (const auto& k : kv.keys) {
+        meta_keys.emplace_back(KeyBuilder::meta_key(k));
+    }
+
+    std::vector<l3kv::BatchOp> wal_batch;
+    wal_batch.reserve(kv.entries.size() * 2);
+    std::map<size_t, l3kv::Engine::ShardMutation> shard_works;
+
+    for (size_t i = 0; i < kv.entries.size(); ++i) {
+        const std::string& key = kv.keys[i];
+        const std::string& mkey = meta_keys[i];
+        const auto& entry = kv.entries[i];
+
+        const size_t k_shard = store.get_routing_shard(key);
+        const size_t m_shard = store.get_routing_shard(mkey);
+
+        if (entry.is_delete) {
+            wal_batch.push_back({l3kv::WalOp::DELETE_, key, ""});
+            wal_batch.push_back({l3kv::WalOp::PUT, mkey, meta_del_sv});
+            shard_works[k_shard].dels.push_back(key);
+            shard_works[m_shard].puts.emplace_back(mkey, meta_del_bytes);
+        } else {
+            wal_batch.push_back({l3kv::WalOp::PUT, key, entry.value});
+            wal_batch.push_back({l3kv::WalOp::PUT, mkey, meta_put_sv});
+            shard_works[k_shard].puts.emplace_back(key, entry.value);
+            shard_works[m_shard].puts.emplace_back(mkey, meta_put_bytes);
+        }
+    }
+
+    store.apply_batch_mutations(wal_batch, std::move(shard_works));
+}
+
+template <size_t N>
+std::vector<AdjacencyStore::IncidentEdgeRecord> apply_staged_edge_ops(
+    const std::vector<StagedEdgeOp>& ops,
+    AdjacencyStore& adj,
+    BinaryEdgeWAL* edge_wal,
+    std::shared_mutex& edge_global_mu,
+    std::array<std::mutex, N>& edge_op_locks,
+    const std::function<size_t(uint64_t, uint64_t)>& stripe_fn,
+    std::vector<uint64_t>& nodes_to_invalidate) {
+    std::vector<AdjacencyStore::IncidentEdgeRecord> extra_prop_dels;
+    if (ops.empty()) return extra_prop_dels;
+
+    bool has_del_node = false;
+    std::array<size_t, 64> stripes_buf;
+    size_t num_stripes = 0;
+    std::vector<size_t> extra_stripes;
+    for (const auto& op : ops) {
+        if (op.kind == StagedEdgeKind::DelNode) {
+            has_del_node = true;
+            break;
+        }
+        size_t st = stripe_fn(op.src, op.dst);
+        if (num_stripes < stripes_buf.size()) {
+            stripes_buf[num_stripes++] = st;
+        } else {
+            if (extra_stripes.empty()) {
+                extra_stripes.assign(stripes_buf.begin(), stripes_buf.end());
+            }
+            extra_stripes.push_back(st);
+        }
+    }
+
+    std::unique_lock<std::shared_mutex> global_uniq;
+    std::shared_lock<std::shared_mutex> global_shared;
+    std::vector<std::unique_lock<std::mutex>> op_locks;
+    if (has_del_node) {
+        global_uniq = std::unique_lock<std::shared_mutex>(edge_global_mu);
+    } else {
+        global_shared = std::shared_lock<std::shared_mutex>(edge_global_mu);
+        if (!extra_stripes.empty()) {
+            std::sort(extra_stripes.begin(), extra_stripes.end());
+            extra_stripes.erase(std::unique(extra_stripes.begin(), extra_stripes.end()), extra_stripes.end());
+            op_locks.reserve(extra_stripes.size());
+            for (size_t st : extra_stripes) op_locks.emplace_back(edge_op_locks[st]);
+        } else {
+            std::sort(stripes_buf.begin(), stripes_buf.begin() + num_stripes);
+            num_stripes = static_cast<size_t>(
+                std::unique(stripes_buf.begin(), stripes_buf.begin() + num_stripes) - stripes_buf.begin());
+            op_locks.reserve(num_stripes);
+            for (size_t i = 0; i < num_stripes; ++i) op_locks.emplace_back(edge_op_locks[stripes_buf[i]]);
+        }
+    }
+
+    std::vector<EdgeMutationOp> wal_ops;
+    if (edge_wal) wal_ops.reserve(ops.size());
+
+    for (const auto& op : ops) {
+        if (op.kind == StagedEdgeKind::AddEdge) {
+            uint16_t flags = PackedEdge::FLAG_ACTIVE | (op.has_props ? PackedEdge::FLAG_HAS_PROPERTIES : 0);
+            bool inserted = adj.add_edge(op.src, op.dst, op.label_id, op.weight, flags, 0, op.timestamp);
+            if (edge_wal && (inserted || op.has_props)) {
+                wal_ops.push_back(EdgeMutationOp{op.src, op.dst, op.timestamp, op.label_id, flags, op.weight});
+            }
+        } else if (op.kind == StagedEdgeKind::DelEdge) {
+            uint16_t rflags = 0;
+            float rweight = op.weight;
+            bool deleted = adj.del_edge(op.src, op.dst, op.label_id, op.weight, &rflags, &rweight);
+            if (edge_wal && deleted) {
+                wal_ops.push_back(EdgeMutationOp{op.src, op.dst, op.timestamp, op.label_id, EdgeMutationOp::OP_DELETE, rweight});
+            }
+        } else if (op.kind == StagedEdgeKind::DelNode) {
+            for (const auto& rec : adj.remove_vertex(op.src)) {
+                nodes_to_invalidate.push_back(rec.src_id);
+                nodes_to_invalidate.push_back(rec.dst_id);
+                if (edge_wal) {
+                    wal_ops.push_back(EdgeMutationOp{rec.src_id, rec.dst_id, op.timestamp, rec.label_id, EdgeMutationOp::OP_DELETE, rec.weight});
+                }
+                if ((rec.flags & PackedEdge::FLAG_HAS_PROPERTIES) != 0) {
+                    extra_prop_dels.push_back(rec);
+                }
+            }
+        }
+    }
+
+    if (edge_wal && !wal_ops.empty()) {
+        edge_wal->append_batch(wal_ops);
+    }
+    return extra_prop_dels;
+}
+
+} // namespace
+
 bool Engine::apply_batch(const lite3cpp::Buffer& buffer, uint32_t principal_id) {
     using namespace lite3cpp::literals;
     if (buffer.size() < sizeof(lite3cpp::PackedNodeLayout)) return true;
@@ -826,47 +1074,20 @@ bool Engine::apply_batch(const lite3cpp::Buffer& buffer, uint32_t principal_id) 
 
         std::array<std::unique_lock<std::mutex>, 64> rmw_locks;
         size_t num_rmw_locks = 0;
-        {
-            uint64_t mask = node_stripe_mask;
-            while (mask != 0) {
-                const unsigned s = static_cast<unsigned>(std::countr_zero(mask));
-                rmw_locks[num_rmw_locks++] = std::unique_lock<std::mutex>(node_rmw_locks_[s]);
-                mask &= (mask - 1);
-            }
+        for (uint64_t mask = node_stripe_mask; mask != 0; mask &= (mask - 1)) {
+            const unsigned s = static_cast<unsigned>(std::countr_zero(mask));
+            rmw_locks[num_rmw_locks++] = std::unique_lock<std::mutex>(node_rmw_locks_[s]);
         }
 
         std::vector<uint64_t> nodes_to_invalidate;
         nodes_to_invalidate.reserve(items.size());
-
-        const auto now = store_->get_clock().now();
         const auto edge_hlc = hlc_.now();
-
-        // Pre-build metadata blobs once per batch
-        std::string meta_put_bytes;
-        std::string meta_del_bytes;
-        {
-            lite3cpp::Buffer mbuf(160);
-            mbuf.init_object();
-            mbuf.set_i64(0, "ts"_hk, now.wall_time);
-            mbuf.set_i64(0, "l"_hk, now.logical);
-            mbuf.set_i64(0, "n"_hk, now.node_id);
-            meta_put_bytes.assign(reinterpret_cast<const char*>(mbuf.data()), mbuf.size());
-            mbuf.set_bool(0, "tombstone"_hk, true);
-            meta_del_bytes.assign(reinterpret_cast<const char*>(mbuf.data()), mbuf.size());
-        }
-        const std::string_view meta_put_sv(meta_put_bytes);
-        const std::string_view meta_del_sv(meta_del_bytes);
-
-        auto has_write_perm = [&](std::string_view key) -> bool {
-            if (principal_id == INTERNAL_UID || principal_id == ADMIN_UID || principal_id == 0) {
-                return true;
-            }
-            auto perm = store_->credentials().check_permission(principal_id, key);
-            return (perm & l3kv::Permission::WRITE) || (perm & l3kv::Permission::ADMIN);
-        };
+        const bool is_privileged = (principal_id == INTERNAL_UID || principal_id == ADMIN_UID || principal_id == 0);
 
         auto require_write_perm = [&](std::string_view key) {
-            if (!has_write_perm(key)) {
+            if (is_privileged) return;
+            auto perm = store_->credentials().check_permission(principal_id, key);
+            if (!(perm & l3kv::Permission::WRITE) && !(perm & l3kv::Permission::ADMIN)) {
                 throw std::runtime_error("Unauthorized: Access Denied for key " + std::string(key));
             }
         };
@@ -876,121 +1097,63 @@ bool Engine::apply_batch(const lite3cpp::Buffer& buffer, uint32_t principal_id) 
             return v != nullptr && v->buf_.size() > 0;
         };
 
-        // Unified per-key final state staging (resolves same-batch Put->Del & Del->Put ordering cleanly)
-        struct StagedKvEntry {
-            bool is_delete{false};
-            std::string value;
-        };
-        std::vector<std::string> staged_kv_keys;
-        staged_kv_keys.reserve(items.size() * 2);
-        std::vector<StagedKvEntry> staged_kv_entries;
-        staged_kv_entries.reserve(items.size() * 2);
-        std::unordered_map<std::string, size_t> staged_kv_index;
-        staged_kv_index.reserve(items.size() * 2);
-
+        StagedKvBatch kv;
+        kv.reserve(items.size() * 2);
         auto stage_kv_put = [&](std::string_view key, std::string_view val) {
             require_write_perm(key);
-            std::string kstr(key);
-            if (auto it = staged_kv_index.find(kstr); it != staged_kv_index.end()) {
-                auto& entry = staged_kv_entries[it->second];
-                entry.is_delete = false;
-                entry.value.assign(val.data(), val.size());
-            } else {
-                const size_t idx = staged_kv_entries.size();
-                staged_kv_keys.push_back(kstr);
-                staged_kv_index.emplace(std::move(kstr), idx);
-                staged_kv_entries.push_back({false, std::string(val)});
-            }
+            kv.stage_put(key, val);
         };
-
         auto stage_kv_del = [&](std::string_view key) {
             require_write_perm(key);
-            std::string kstr(key);
-            if (auto it = staged_kv_index.find(kstr); it != staged_kv_index.end()) {
-                auto& entry = staged_kv_entries[it->second];
-                entry.is_delete = true;
-                entry.value.clear();
-            } else {
-                const size_t idx = staged_kv_entries.size();
-                staged_kv_keys.push_back(kstr);
-                staged_kv_index.emplace(std::move(kstr), idx);
-                staged_kv_entries.push_back({true, {}});
-            }
+            kv.stage_del(key);
         };
 
-        enum class StagedEdgeKind : uint8_t { AddEdge, DelEdge, DelNode };
-        struct StagedEdgeOp {
-            StagedEdgeKind kind;
-            uint64_t src;
-            uint64_t dst;
-            uint16_t label_id;
-            float weight;
-            uint64_t timestamp;
-            bool has_props;
-        };
         std::vector<StagedEdgeOp> staged_edge_ops;
         staged_edge_ops.reserve(items.size());
 
+        auto stage_del_edge_pair = [&](uint64_t src, uint16_t lid, float weight, uint64_t dst) {
+            std::string_view lbl = label_registry_.get_label(lid);
+            if (!lbl.empty()) {
+                stage_kv_del(KeyBuilder::edge_out_key(src, lbl, weight, dst));
+                stage_kv_del(KeyBuilder::edge_in_key(dst, lbl, src));
+            }
+        };
+
         for (const MutationItem& item : items) {
             switch (item.op) {
-                case MutationOp::PutRaw: {
+                case MutationOp::PutRaw:
                     if (item.key.starts_with("e:out:") || item.key.starts_with("e:in:")) {
                         has_legacy_kv_edges_.store(true, std::memory_order_relaxed);
                     }
                     stage_kv_put(item.key, item.value);
                     break;
-                }
                 case MutationOp::CasRaw: {
                     require_write_perm(item.key);
                     auto res = store_->cas_put(std::string(item.key), std::string(item.value),
                                                item.expected_hash, principal_id, item.ttl_ms);
-                    if (!res.ok) {
-                        return false;
-                    }
+                    if (!res.ok) return false;
                     break;
                 }
-                case MutationOp::DelRaw: {
+                case MutationOp::DelRaw:
                     stage_kv_del(item.key);
                     break;
-                }
-                case MutationOp::PutNode: {
+                case MutationOp::PutNode:
                     nodes_to_invalidate.push_back(item.src);
-                    std::string_view nkey = KeyBuilder::node_key(item.src);
-                    stage_kv_put(nkey, item.value);
+                    stage_kv_put(KeyBuilder::node_key(item.src), item.value);
                     break;
-                }
                 case MutationOp::IncNodeInt: {
                     nodes_to_invalidate.push_back(item.src);
                     std::string nkey(KeyBuilder::node_key(item.src));
                     require_write_perm(nkey);
-
                     lite3cpp::Buffer nbuf;
-                    auto nit = staged_kv_index.find(nkey);
-                    if (nit != staged_kv_index.end()) {
-                        const auto& staged = staged_kv_entries[nit->second];
-                        if (staged.is_delete) {
-                            // Node was deleted earlier in this batch: start fresh from empty object
-                            nbuf.init_object();
-                        } else if (l3kv::is_json_payload(staged.value)) {
-                            try {
-                                nbuf = lite3cpp::lite3_json::from_json_string(staged.value);
-                            } catch (...) {
-                                nbuf.init_object();
-                            }
-                        } else if (staged.value.size() >= sizeof(lite3cpp::PackedNodeLayout)) {
-                            nbuf = lite3cpp::Buffer(reinterpret_cast<const uint8_t*>(staged.value.data()), staged.value.size());
-                        } else {
-                            nbuf.init_object();
-                        }
+                    if (auto nit = kv.index.find(nkey); nit != kv.index.end()) {
+                        nbuf = decode_staged_node_buffer(kv.entries[nit->second]);
+                    } else if (auto blob = store_->get_blob(nkey, principal_id);
+                               blob && blob->buf_.size() >= sizeof(lite3cpp::PackedNodeLayout)) {
+                        nbuf = blob->buf_;
                     } else {
-                        auto blob = store_->get_blob(nkey, principal_id);
-                        if (blob && blob->buf_.size() >= sizeof(lite3cpp::PackedNodeLayout)) {
-                            nbuf = blob->buf_;
-                        } else {
-                            nbuf.init_object();
-                        }
+                        nbuf.init_object();
                     }
-
                     apply_inc_node_int_to_buffer(nbuf, item.key, item.int_delta);
                     stage_kv_put(nkey, std::string_view(reinterpret_cast<const char*>(nbuf.data()), nbuf.size()));
                     break;
@@ -1001,85 +1164,37 @@ bool Engine::apply_batch(const lite3cpp::Buffer& buffer, uint32_t principal_id) 
                     nodes_to_invalidate.push_back(item.src);
                     stage_kv_del(nkey);
 
-                    // Clean up any existing property-bearing incident edge keys in KV batch
-                    auto out_snap = adjacency_store_.get_outgoing_edges_snapshot(item.src);
-                    for (const auto& pe : out_snap) {
-                        if (pe.has_properties() || resolver_.has_remote_clusters()) {
-                            std::string_view lbl = label_registry_.get_label(pe.label_id);
-                            if (!lbl.empty()) {
-                                stage_kv_del(KeyBuilder::edge_out_key(item.src, lbl, pe.weight, pe.target_id));
-                                stage_kv_del(KeyBuilder::edge_in_key(pe.target_id, lbl, item.src));
-                            }
-                        }
+                    const bool has_remote = resolver_.has_remote_clusters();
+                    for (const auto& pe : adjacency_store_.get_outgoing_edges_snapshot(item.src)) {
+                        if (pe.has_properties() || has_remote) stage_del_edge_pair(item.src, pe.label_id, pe.weight, pe.target_id);
                     }
-                    auto in_snap = adjacency_store_.get_incoming_edges_snapshot(item.src);
-                    for (const auto& pe : in_snap) {
-                        if (pe.has_properties() || resolver_.has_remote_clusters()) {
-                            std::string_view lbl = label_registry_.get_label(pe.label_id);
-                            if (!lbl.empty()) {
-                                stage_kv_del(KeyBuilder::edge_out_key(pe.target_id, lbl, pe.weight, item.src));
-                                stage_kv_del(KeyBuilder::edge_in_key(item.src, lbl, pe.target_id));
-                            }
-                        }
+                    for (const auto& pe : adjacency_store_.get_incoming_edges_snapshot(item.src)) {
+                        if (pe.has_properties() || has_remote) stage_del_edge_pair(pe.target_id, pe.label_id, pe.weight, item.src);
                     }
-                    // Also clean up any property-bearing edges incident to item.src staged earlier in this batch
                     for (const auto& prev_op : staged_edge_ops) {
-                        if (prev_op.kind == StagedEdgeKind::AddEdge &&
-                            (prev_op.has_props || resolver_.has_remote_clusters()) &&
+                        if (prev_op.kind == StagedEdgeKind::AddEdge && (prev_op.has_props || has_remote) &&
                             (prev_op.src == item.src || prev_op.dst == item.src)) {
-                            std::string_view lbl = label_registry_.get_label(prev_op.label_id);
-                            if (!lbl.empty()) {
-                                stage_kv_del(KeyBuilder::edge_out_key(prev_op.src, lbl, prev_op.weight, prev_op.dst));
-                                stage_kv_del(KeyBuilder::edge_in_key(prev_op.dst, lbl, prev_op.src));
-                            }
+                            stage_del_edge_pair(prev_op.src, prev_op.label_id, prev_op.weight, prev_op.dst);
                         }
                     }
-
                     staged_edge_ops.push_back({StagedEdgeKind::DelNode, item.src, 0, 0, 0.0f, edge_hlc.wall_time, false});
                     break;
                 }
                 case MutationOp::AddEdge: {
-                    const bool is_privileged = (principal_id == INTERNAL_UID || principal_id == ADMIN_UID || principal_id == 0);
                     const bool has_props = !item.value.empty() && item.value != "{}";
                     if (!is_privileged) {
                         require_write_perm(KeyBuilder::edge_out_key(item.src, item.label, item.weight, item.dst));
                         require_write_perm(KeyBuilder::edge_in_key(item.dst, item.label, item.src));
                     }
-
                     nodes_to_invalidate.push_back(item.src);
                     nodes_to_invalidate.push_back(item.dst);
                     uint16_t lid = label_registry_.get_or_register(item.label);
                     staged_edge_ops.push_back({StagedEdgeKind::AddEdge, item.src, item.dst, lid, static_cast<float>(item.weight), edge_hlc.wall_time, has_props});
-
                     if (has_props || resolver_.has_remote_clusters()) {
-                        std::string out_key(KeyBuilder::edge_out_key(item.src, item.label, item.weight, item.dst));
-                        std::string in_key(KeyBuilder::edge_in_key(item.dst, item.label, item.src));
-
-                        lite3cpp::Buffer ebuf;
-                        ebuf.init_object();
-                        if (has_props) {
-                            const uint8_t* ptr = reinterpret_cast<const uint8_t*>(item.value.data());
-                            if (item.value.size() >= sizeof(lite3cpp::PackedNodeLayout) && (ptr[0] == 0x06 || ptr[0] == 0x07)) {
-                                try {
-                                    lite3cpp::Buffer props_buf = lite3cpp::Buffer::from_view(ptr, item.value.size());
-                                    size_t props_ofs = ebuf.set_obj(0, "props"_hk);
-                                    copy_batch_edge_props(props_buf, 0, ebuf, props_ofs);
-                                } catch (...) {
-                                    ebuf.set_str(0, "props"_hk, item.value);
-                                }
-                            } else {
-                                try {
-                                    lite3cpp::Buffer props_buf = lite3cpp::lite3_json::from_json_string(item.value);
-                                    size_t props_ofs = ebuf.set_obj(0, "props"_hk);
-                                    copy_batch_edge_props(props_buf, 0, ebuf, props_ofs);
-                                } catch (...) {
-                                    ebuf.set_str(0, "props"_hk, item.value);
-                                }
-                            }
-                        }
+                        lite3cpp::Buffer ebuf = build_edge_props_buffer(item.value, has_props);
                         std::string_view epayload_sv(reinterpret_cast<const char*>(ebuf.data()), ebuf.size());
-                        stage_kv_put(out_key, epayload_sv);
-                        stage_kv_put(in_key, epayload_sv);
+                        stage_kv_put(KeyBuilder::edge_out_key(item.src, item.label, item.weight, item.dst), epayload_sv);
+                        stage_kv_put(KeyBuilder::edge_in_key(item.dst, item.label, item.src), epayload_sv);
                     }
                     break;
                 }
@@ -1088,16 +1203,13 @@ bool Engine::apply_batch(const lite3cpp::Buffer& buffer, uint32_t principal_id) 
                     std::string_view in_key_sv = KeyBuilder::edge_in_key(item.dst, item.label, item.src);
                     require_write_perm(out_key_sv);
                     require_write_perm(in_key_sv);
-
                     nodes_to_invalidate.push_back(item.src);
                     nodes_to_invalidate.push_back(item.dst);
                     uint16_t lid = label_registry_.get_or_register(item.label);
                     staged_edge_ops.push_back({StagedEdgeKind::DelEdge, item.src, item.dst, lid, static_cast<float>(item.weight), edge_hlc.wall_time, false});
-
                     if (resolver_.has_remote_clusters() ||
-                        (!staged_kv_index.empty() && (staged_kv_index.contains(std::string(out_key_sv)) || staged_kv_index.contains(std::string(in_key_sv)))) ||
-                        store_has_live_key(out_key_sv) ||
-                        store_has_live_key(in_key_sv)) {
+                        (!kv.index.empty() && (kv.index.contains(std::string(out_key_sv)) || kv.index.contains(std::string(in_key_sv)))) ||
+                        store_has_live_key(out_key_sv) || store_has_live_key(in_key_sv)) {
                         stage_kv_del(out_key_sv);
                         stage_kv_del(in_key_sv);
                     }
@@ -1106,151 +1218,30 @@ bool Engine::apply_batch(const lite3cpp::Buffer& buffer, uint32_t principal_id) 
             }
         }
 
-        if (!staged_kv_entries.empty()) {
-            std::vector<std::string> meta_keys;
-            meta_keys.reserve(staged_kv_entries.size());
-            for (const auto& k : staged_kv_keys) {
-                meta_keys.emplace_back(KeyBuilder::meta_key(k));
-            }
+        commit_staged_kv_batch(*store_, kv);
 
-            std::vector<l3kv::BatchOp> wal_batch;
-            wal_batch.reserve(staged_kv_entries.size() * 2);
-            std::map<size_t, l3kv::Engine::ShardMutation> shard_works;
-
-            for (size_t i = 0; i < staged_kv_entries.size(); ++i) {
-                const std::string& key = staged_kv_keys[i];
-                const std::string& mkey = meta_keys[i];
-                const auto& entry = staged_kv_entries[i];
-
-                const size_t k_shard = store_->get_routing_shard(key);
-                const size_t m_shard = store_->get_routing_shard(mkey);
-
-                if (entry.is_delete) {
-                    wal_batch.push_back({l3kv::WalOp::DELETE_, key, ""});
-                    wal_batch.push_back({l3kv::WalOp::PUT, mkey, meta_del_sv});
-                    shard_works[k_shard].dels.push_back(key);
-                    shard_works[m_shard].puts.emplace_back(mkey, meta_del_bytes);
-                } else {
-                    wal_batch.push_back({l3kv::WalOp::PUT, key, entry.value});
-                    wal_batch.push_back({l3kv::WalOp::PUT, mkey, meta_put_sv});
-                    shard_works[k_shard].puts.emplace_back(key, entry.value);
-                    shard_works[m_shard].puts.emplace_back(mkey, meta_put_bytes);
-                }
-            }
-
-            store_->apply_batch_mutations(wal_batch, std::move(shard_works));
-        }
-
-        // Release striped node RMW locks now that KV read-modify-write is committed
         for (size_t i = 0; i < num_rmw_locks; ++i) {
             rmw_locks[num_rmw_locks - 1 - i].unlock();
         }
 
-        std::vector<AdjacencyStore::IncidentEdgeRecord> extra_prop_dels;
-        if (!staged_edge_ops.empty()) {
-            bool has_del_node = false;
-            std::array<size_t, 64> stripes_buf;
-            size_t num_stripes = 0;
-            std::vector<size_t> extra_stripes;
-            for (const auto& op : staged_edge_ops) {
-                if (op.kind == StagedEdgeKind::DelNode) {
-                    has_del_node = true;
-                    break;
-                }
-                size_t st = edge_stripe(op.src, op.dst);
-                if (num_stripes < stripes_buf.size()) {
-                    stripes_buf[num_stripes++] = st;
-                } else {
-                    if (extra_stripes.empty()) {
-                        extra_stripes.assign(stripes_buf.begin(), stripes_buf.end());
-                    }
-                    extra_stripes.push_back(st);
-                }
-            }
-
-            std::unique_lock<std::shared_mutex> global_uniq;
-            std::shared_lock<std::shared_mutex> global_shared;
-            std::vector<std::unique_lock<std::mutex>> op_locks;
-            if (has_del_node) {
-                global_uniq = std::unique_lock<std::shared_mutex>(edge_global_mu_);
-            } else {
-                global_shared = std::shared_lock<std::shared_mutex>(edge_global_mu_);
-                if (!extra_stripes.empty()) {
-                    std::sort(extra_stripes.begin(), extra_stripes.end());
-                    extra_stripes.erase(std::unique(extra_stripes.begin(), extra_stripes.end()), extra_stripes.end());
-                    op_locks.reserve(extra_stripes.size());
-                    for (size_t st : extra_stripes) {
-                        op_locks.emplace_back(edge_op_locks_[st]);
-                    }
-                } else {
-                    std::sort(stripes_buf.begin(), stripes_buf.begin() + num_stripes);
-                    num_stripes = static_cast<size_t>(
-                        std::unique(stripes_buf.begin(), stripes_buf.begin() + num_stripes) - stripes_buf.begin());
-                    op_locks.reserve(num_stripes);
-                    for (size_t i = 0; i < num_stripes; ++i) {
-                        op_locks.emplace_back(edge_op_locks_[stripes_buf[i]]);
-                    }
-                }
-            }
-
-            std::vector<EdgeMutationOp> wal_ops;
-            if (edge_wal_) {
-                wal_ops.reserve(staged_edge_ops.size());
-            }
-
-            for (const auto& op : staged_edge_ops) {
-                if (op.kind == StagedEdgeKind::AddEdge) {
-                    uint16_t flags = PackedEdge::FLAG_ACTIVE | (op.has_props ? PackedEdge::FLAG_HAS_PROPERTIES : 0);
-                    bool inserted = adjacency_store_.add_edge(op.src, op.dst, op.label_id, op.weight, flags, 0, op.timestamp);
-                    if (edge_wal_ && (inserted || op.has_props)) {
-                        wal_ops.push_back(EdgeMutationOp{op.src, op.dst, op.timestamp, op.label_id, flags, op.weight});
-                    }
-                } else if (op.kind == StagedEdgeKind::DelEdge) {
-                    uint16_t rflags = 0;
-                    float rweight = op.weight;
-                    bool deleted = adjacency_store_.del_edge(op.src, op.dst, op.label_id, op.weight, &rflags, &rweight);
-                    if (edge_wal_ && deleted) {
-                        wal_ops.push_back(EdgeMutationOp{op.src, op.dst, op.timestamp, op.label_id, EdgeMutationOp::OP_DELETE, rweight});
-                    }
-                } else if (op.kind == StagedEdgeKind::DelNode) {
-                    auto removed = adjacency_store_.remove_vertex(op.src);
-                    for (const auto& rec : removed) {
-                        nodes_to_invalidate.push_back(rec.src_id);
-                        nodes_to_invalidate.push_back(rec.dst_id);
-                        if (edge_wal_) {
-                            wal_ops.push_back(EdgeMutationOp{rec.src_id, rec.dst_id, op.timestamp, rec.label_id, EdgeMutationOp::OP_DELETE, rec.weight});
-                        }
-                        if ((rec.flags & PackedEdge::FLAG_HAS_PROPERTIES) != 0) {
-                            extra_prop_dels.push_back(rec);
-                        }
-                    }
-                }
-            }
-
-            if (edge_wal_ && !wal_ops.empty()) {
-                edge_wal_->append_batch(wal_ops);
-            }
-        }
+        auto extra_prop_dels = apply_staged_edge_ops(
+            staged_edge_ops, adjacency_store_, edge_wal_.get(), edge_global_mu_, edge_op_locks_,
+            [this](uint64_t a, uint64_t b) { return edge_stripe(a, b); }, nodes_to_invalidate);
 
         for (const auto& rec : extra_prop_dels) {
             std::string_view lbl = label_registry_.get_label(rec.label_id);
-            if (!lbl.empty()) {
-                std::string out_key(KeyBuilder::edge_out_key(rec.src_id, lbl, rec.weight, rec.dst_id));
-                std::string in_key(KeyBuilder::edge_in_key(rec.dst_id, lbl, rec.src_id));
-                auto is_readded = [&](const std::string& k) {
-                    auto it = staged_kv_index.find(k);
-                    return it != staged_kv_index.end() && !staged_kv_entries[it->second].is_delete;
-                };
-                if (!is_readded(out_key) && store_has_live_key(out_key)) store_->del(out_key, principal_id);
-                if (!is_readded(in_key) && store_has_live_key(in_key)) store_->del(in_key, principal_id);
-            }
+            if (lbl.empty()) continue;
+            std::string out_key(KeyBuilder::edge_out_key(rec.src_id, lbl, rec.weight, rec.dst_id));
+            std::string in_key(KeyBuilder::edge_in_key(rec.dst_id, lbl, rec.src_id));
+            if (!kv.is_live_staged(out_key) && store_has_live_key(out_key)) store_->del(out_key, principal_id);
+            if (!kv.is_live_staged(in_key) && store_has_live_key(in_key)) store_->del(in_key, principal_id);
         }
 
         for (uint64_t nid : nodes_to_invalidate) {
             invalidate_node_cache(nid);
         }
         return true;
-    } catch (const std::exception& e) {
+    } catch (const std::exception&) {
         return false;
     }
 }
