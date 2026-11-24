@@ -7,6 +7,9 @@ endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+option(L3KVG_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
 
 # Include L3KV, which transitively includes lite3-cpp and now ZeroMQ via FetchContent
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../L3KV ${CMAKE_CURRENT_BINARY_DIR}/L3KV)
@@ -55,6 +58,11 @@ if(MSVC)
     target_compile_options(l3kvg_engine PRIVATE /bigobj)
 else()
     target_compile_options(l3kvg_engine PUBLIC $<$<CONFIG:Release,RelWithDebInfo>:-O3>)
+    target_compile_options(l3kvg_engine PRIVATE -Wall -Wextra)
+    if(L3KVG_ENABLE_SANITIZERS)
+        target_compile_options(l3kvg_engine PUBLIC -fsanitize=address,undefined -fno-omit-frame-pointer)
+        target_link_options(l3kvg_engine PUBLIC -fsanitize=address,undefined)
+    endif()
 endif()
 
 target_link_libraries(l3kvg_engine PUBLIC

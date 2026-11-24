@@ -162,7 +162,7 @@ void apply_inc_node_int_to_buffer(lite3cpp::Buffer& nbuf, std::string_view key, 
 static std::atomic<uint64_t> s_next_engine_instance_id{1};
 
 Engine::Engine(const std::string &db_path, uint32_t node_id, std::shared_ptr<lite3::ConsistentHash> ring, size_t thread_pool_size, Settings settings)
-    : resolver_(std::move(ring), node_id), settings_(std::move(settings)), engine_instance_id_(s_next_engine_instance_id.fetch_add(1, std::memory_order_relaxed)), hlc_(node_id), db_path_(db_path) {
+    : db_path_(db_path), resolver_(std::move(ring), node_id), settings_(std::move(settings)), engine_instance_id_(s_next_engine_instance_id.fetch_add(1, std::memory_order_relaxed)), hlc_(node_id) {
   settings_.node_id = node_id;
   std::string store_wal_path = db_path;
   std::string wal_path;
@@ -1145,7 +1145,6 @@ bool Engine::apply_batch(const lite3cpp::Buffer& buffer, uint32_t principal_id) 
         for (size_t i = 0; i < num_rmw_locks; ++i) {
             rmw_locks[num_rmw_locks - 1 - i].unlock();
         }
-        num_rmw_locks = 0;
 
         std::vector<AdjacencyStore::IncidentEdgeRecord> extra_prop_dels;
         if (!staged_edge_ops.empty()) {

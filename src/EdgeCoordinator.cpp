@@ -225,7 +225,6 @@ std::future<void> EdgeCoordinator::atomic_del_edge(uint64_t src_id, const std::s
 
     auto handle_del = [&](lite3::NodeID owner, const std::string& key) {
         if (owner == local_id) {
-            size_t shard_idx = store_->get_routing_shard(key);
             if (replication_cb_) {
                 replication_cb_(key, "");
             }
