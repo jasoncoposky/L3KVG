@@ -10,6 +10,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(L3KVG_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
+option(L3KVG_ENABLE_TSAN "Enable ThreadSanitizer" OFF)
 
 # Include L3KV, which transitively includes lite3-cpp and now ZeroMQ via FetchContent
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../L3KV ${CMAKE_CURRENT_BINARY_DIR}/L3KV)
@@ -62,6 +63,9 @@ else()
     if(L3KVG_ENABLE_SANITIZERS)
         target_compile_options(l3kvg_engine PUBLIC -fsanitize=address,undefined -fno-omit-frame-pointer)
         target_link_options(l3kvg_engine PUBLIC -fsanitize=address,undefined)
+    elseif(L3KVG_ENABLE_TSAN)
+        target_compile_options(l3kvg_engine PUBLIC -fsanitize=thread -fno-omit-frame-pointer)
+        target_link_options(l3kvg_engine PUBLIC -fsanitize=thread)
     endif()
 endif()
 
@@ -202,6 +206,20 @@ add_test(NAME test_secure_mesh COMMAND test_secure_mesh)
 add_executable(test_server_concurrency tests/test_server_concurrency.cpp)
 target_link_libraries(test_server_concurrency PRIVATE l3kvg_engine gtest_main Threads::Threads $<$<BOOL:${WIN32}>:ws2_32>)
 add_test(NAME test_server_concurrency COMMAND test_server_concurrency)
+
+set_tests_properties(
+    test_federation_integration
+    test_federation_complex
+    test_circuit_breaker
+    test_replication_routing
+    test_replication_broadcast
+    test_replication_loop
+    test_replication_conflict
+    test_ultimate_mesh
+    test_secure_mesh
+    test_server_concurrency
+    PROPERTIES RESOURCE_LOCK l3kv_net_ports
+)
 
 add_executable(l3kvg_server src/server/main.cpp)
 target_link_libraries(l3kvg_server PRIVATE l3kvg_engine Threads::Threads $<$<BOOL:${WIN32}>:ws2_32> $<$<BOOL:${WIN32}>:wsock32> $<$<BOOL:${WIN32}>:crypt32>)

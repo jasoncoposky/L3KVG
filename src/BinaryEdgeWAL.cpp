@@ -7,6 +7,7 @@
 #include <cstring>
 #include <filesystem>
 #include <stdexcept>
+#include <system_error>
 #include <vector>
 
 #if defined(_WIN32)
@@ -40,7 +41,7 @@ BinaryEdgeWAL::BinaryEdgeWAL(const std::string& path)
 #endif
 
     if (fd_ < 0) {
-        throw std::runtime_error("Failed to open WAL file " + path_ + ": " + std::string(std::strerror(errno)));
+        throw std::runtime_error("Failed to open WAL file " + path_ + ": " + std::generic_category().message(errno));
     }
     buffer_.resize(65536);
     io_buffer_.resize(65536);
@@ -94,7 +95,7 @@ void BinaryEdgeWAL::write_all_unlocked(const char* data, size_t total_bytes) {
             if (errno == EINTR) {
                 continue;
             }
-            throw std::runtime_error("Write to WAL failed: " + std::string(std::strerror(errno)));
+            throw std::runtime_error("Write to WAL failed: " + std::generic_category().message(errno));
         }
         if (res == 0) {
             throw std::runtime_error("Write to WAL returned 0 bytes");
@@ -111,7 +112,7 @@ void BinaryEdgeWAL::flush_unlocked() {
         }
 #if defined(__linux__)
         if (::fdatasync(fd_) != 0) {
-            throw std::runtime_error("fdatasync failed: " + std::string(std::strerror(errno)));
+            throw std::runtime_error("fdatasync failed: " + std::generic_category().message(errno));
         }
 #elif defined(_WIN32)
         if (::_commit(fd_) != 0) {
@@ -119,7 +120,7 @@ void BinaryEdgeWAL::flush_unlocked() {
         }
 #else
         if (::fsync(fd_) != 0) {
-            throw std::runtime_error("fsync failed: " + std::string(std::strerror(errno)));
+            throw std::runtime_error("fsync failed: " + std::generic_category().message(errno));
         }
 #endif
     }
@@ -326,7 +327,7 @@ size_t BinaryEdgeWAL::recover(AdjacencyStore& store) {
                 if (errno == EINTR) {
                     continue;
                 }
-                throw std::runtime_error("Failed to seek in binary edge WAL during recovery: " + std::string(std::strerror(errno)));
+                throw std::runtime_error("Failed to seek in binary edge WAL during recovery: " + std::generic_category().message(errno));
             }
             int bytes_read = ::_read(read_fd, buffer.data() + bytes_in_chunk, static_cast<unsigned int>(CHUNK_SIZE - bytes_in_chunk));
 #else
@@ -339,7 +340,7 @@ size_t BinaryEdgeWAL::recover(AdjacencyStore& store) {
                 if (errno == EINTR) {
                     continue; // Interrupted by signal, retry
                 }
-                throw std::runtime_error("Failed to read from binary edge WAL during recovery: " + std::string(std::strerror(errno)));
+                throw std::runtime_error("Failed to read from binary edge WAL during recovery: " + std::generic_category().message(errno));
             }
             bytes_in_chunk += static_cast<size_t>(bytes_read);
         }
